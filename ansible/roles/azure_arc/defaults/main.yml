@@ -1,0 +1,22 @@
+azure_arc_install_script_url: https://aka.ms/azcmagent
+azure_arc_install_script_path: /tmp/Install_linux_azcmagent.sh
+azure_arc_agent_binary_path: /opt/azcmagent/bin/azcmagent
+
+azure_arc_subscription_id: ""
+azure_arc_tenant_id: ""
+azure_arc_resource_group: ""
+azure_arc_location: ""
+azure_arc_service_principal_id: ""
+azure_arc_service_principal_secret: ""
+
+azure_arc_resource_name: "{{ inventory_hostname }}"
+azure_arc_cloud: AzureCloud
+azure_arc_tags: environment=homelab,platform=proxmox,managedBy=ansible,ArcSQLServerExtensionDeployment=Disabled
+
+# Azure Arc docs currently list these Ubuntu releases as supported. Keep this
+# exact list so interim or newer Ubuntu releases are not onboarded accidentally.
+azure_arc_supported_ubuntu_versions:
+  - "18.04"
+  - "20.04"
+  - "22.04"
+  - "24.04"

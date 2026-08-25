@@ -1,0 +1,16 @@
+[Unit]
+Description=notification-digest daily brief (timer)
+
+[Timer]
+# Trailing IANA timezone keeps 20:00 Europe/Budapest correct across DST
+# without manual UTC math -- systemd's OnCalendar= supports it natively.
+OnCalendar={{ myapps_digest_daily_on_calendar }}
+Persistent=true
+# Capped well below digest.timer's 600s: a missed window digest drifting ten
+# minutes is a non-event, but a daily brief is a once-a-day deliverable the
+# owner expects to read that evening -- keep its jitter tighter.
+RandomizedDelaySec={{ myapps_digest_daily_randomized_delay_sec }}
+Unit=digest-daily.service
+
+[Install]
+WantedBy=timers.target

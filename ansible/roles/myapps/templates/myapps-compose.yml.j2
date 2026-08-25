@@ -1,0 +1,210 @@
+services:
+{% if myapps_netcheck_enabled | default(true) | bool %}
+  netcheck:
+    image: {{ myapps_netcheck_image }}
+    container_name: netcheck
+    restart: unless-stopped
+    ports:
+      - "{{ myapps_netcheck_port }}:8787"
+    security_opt:
+      - no-new-privileges:true
+    # netcheck serves its embedded web UI + API on :8787 as the distroless
+    # `nonroot` user. TCP/UDP/DNS/TLS/HTTP/WHOIS checks work as-is; raw-socket
+    # probes (ICMP traceroute/ping) may be limited without extra capabilities.
+{% endif %}
+{% if myapps_chromium_enabled | default(false) | bool %}
+  chromium:
+    image: {{ myapps_chromium_image }}
+    container_name: chromium
+    # Long-lived, unlike digest/jobs-refresh: the owner logs into this
+    # session once from a phone and it needs to stay up for later
+    # automation to reuse the persisted profile.
+    restart: unless-stopped
+    # CUSTOM_USER/PASSWORD/PUID/PGID/TZ/CHROME_CLI live in chromium.env (a
+    # 0600 no_log file), mirroring digest.env -- keeps the PASSWORD out of
+    # this 0644 world-readable compose file.
+    env_file:
+      - chromium.env
+    volumes:
+      # Persistent profile (cookies, logins) -- local disk only, never
+      # backed up offsite. See myapps_chromium_profile_dir in defaults.
+      - "{{ myapps_chromium_profile_dir }}:/config"
+    ports:
+      # Web UI only. The CDP debug port (9222, set via CHROME_CLI) is
+      # deliberately NOT published here -- it stays loopback-only inside
+      # the container, for a later Playwright MCP server to attach to.
+      - "{{ myapps_chromium_port }}:3000"
+    # Chromium's default 64MB /dev/shm crashes tabs; the image's own docs
+    # call out 1gb as sufficient (needed for any modern site, e.g. YouTube).
+    shm_size: "1gb"
+    security_opt:
+      - no-new-privileges:true
+{% if myapps_playwright_mcp_enabled | default(false) | bool %}
+  playwright-mcp:
+    image: {{ myapps_playwright_mcp_image }}
+    container_name: playwright-mcp
+    # Attaches to chromium's CDP port (9222, loopback-only -- see the
+    # chromium service's `ports:` comment above) rather than launching its
+    # own browser: two processes can't share one Chrome profile directory
+    # (Chrome locks it), and chromium's profile must stay untouched. Joining
+    # its network namespace is what makes that loopback port reachable from
+    # here -- and is also why this service declares no `ports:` of its own:
+    # with network_mode: service:*, Compose forbids it (there is no netns of
+    # its own to publish from). Whatever myapps_playwright_mcp_port binds to
+    # appears on the chromium container's address instead, so on the shared
+    # compose network this is reached as chromium:{{ myapps_playwright_mcp_port }},
+    # not playwright-mcp:{{ myapps_playwright_mcp_port }}.
+    network_mode: "service:chromium"
+    depends_on:
+      - chromium
+    # No CHROME_CLI-style headless/browser/no-sandbox flags needed here --
+    # the image's own ENTRYPOINT already sets those; --cdp-endpoint makes it
+    # attach over CDP instead of launching a browser, so they're moot.
+    command:
+      - "--cdp-endpoint={{ myapps_playwright_mcp_cdp_endpoint }}"
+      - "--port={{ myapps_playwright_mcp_port }}"
+      - "--host=0.0.0.0"
+      # --host above only controls which interfaces it LISTENS on; this
+      # controls which Host headers it ACCEPTS (DNS-rebinding protection).
+      # jobs-refresh reaches this under the `chromium` service name (this
+      # container answers on chromium's address via network_mode above, not
+      # its own), which the default "host it's bound to" check rejects with
+      # HTTP 403 -- see myapps_playwright_mcp_allowed_hosts in defaults for
+      # how that was diagnosed and verified.
+      - "--allowed-hosts={{ myapps_playwright_mcp_allowed_hosts }}"
+{% if myapps_playwright_mcp_blocked_origins | default('') | trim %}
+      # Refuses the two portals retired on 2026-08-07, so a regression in the
+      # browse step's instructions fails at the browser instead of silently
+      # re-scraping a retired source. SEMICOLON-separated -- unlike
+      # --allowed-hosts directly above, which is comma-separated. An
+      # allowlist was rejected: playwright-mcp supports wildcards for the
+      # port only, never the hostname, so allowlisting LinkedIn would mean
+      # enumerating its licdn.com asset subdomains exactly and breaking the
+      # page the moment one is missed. See myapps_playwright_mcp_blocked_origins
+      # in defaults for the full reasoning and the unverified-over-CDP caveat.
+      - "--blocked-origins={{ myapps_playwright_mcp_blocked_origins }}"
+{% endif %}
+      # Requests a desktop-sized viewport (a phone-sized one silently broke
+      # a real site -- see myapps_playwright_mcp_viewport_size in defaults).
+      # Whether this has any effect when attached via --cdp-endpoint rather
+      # than a launched browser is UNVERIFIED (see the same comment) -- set
+      # regardless since it costs nothing if ignored; chromium's own
+      # --window-size/SELKIES_MANUAL_WIDTH/HEIGHT are what actually fix the
+      # CDP-attached case.
+      - "--viewport-size={{ myapps_playwright_mcp_viewport_size }}"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+{% endif %}
+{% endif %}
+{% if myapps_digest_enabled | default(false) | bool %}
+  digest:
+    image: {{ myapps_digest_image }}
+    container_name: digest
+    # One-shot job: keep it out of `docker compose up -d` / `--remove-orphans`.
+    # digest.timer runs it explicitly with `docker compose run --rm digest`.
+    profiles: ["oneshot"]
+    # All runtime config (including TG_*/SMTP_* secrets) lives in digest.env,
+    # a 0600 no_log file (mirrors dashboard/observability_stack) — never in
+    # this 0644 compose file, which is world-readable and shown by --diff.
+    env_file:
+      - digest.env
+    volumes:
+      - "{{ myapps_digest_state_dir }}:/data"
+    security_opt:
+      - no-new-privileges:true
+{% endif %}
+{% if myapps_garmin_health_enabled | default(false) | bool %}
+  garmin-health:
+    image: {{ myapps_garmin_health_image }}
+    container_name: garmin-health
+    # One-shot job: keep it out of `docker compose up -d` / `--remove-orphans`.
+    # garmin-sync.timer and garmin-report.timer run it explicitly with
+    # `docker compose run --rm garmin-health <sync|report>`, and the image's
+    # ENTRYPOINT (python -m pipeline) turns that argument into the subcommand.
+    profiles: ["oneshot"]
+    # All runtime config (including the TELEGRAM_* secrets) lives in
+    # garmin-health.env, a 0600 no_log file -- never in this 0644 compose
+    # file, which is world-readable and shown by --diff.
+    env_file:
+      - garmin-health.env
+    volumes:
+      # One mount for everything: immutable raw dumps, the rebuilt SQLite db,
+      # the monthly reports, and BOTH persisted login dirs (garth OAuth tokens
+      # and the Claude CLI's auth). The image runs as uid 1000 and the role
+      # chowns this path to match.
+      - "{{ myapps_garmin_health_state_dir }}:/data"
+    security_opt:
+      - no-new-privileges:true
+{% endif %}
+{% if myapps_withings_sync_enabled | default(false) | bool %}
+  withings-sync:
+    image: {{ myapps_withings_sync_image }}
+    container_name: withings-sync
+    # One-shot job: withings-sync.timer runs it explicitly with
+    # `docker compose run --rm withings-sync`; `up -d` must ignore it.
+    profiles: ["oneshot"]
+    # The CLI arguments live here, not in the unit, so the one-time
+    # interactive login (`docker compose run --rm withings-sync`) and the
+    # nightly unit are the same invocation and share the same token files.
+    command: ["--config-folder", "/config"]
+    environment:
+      - TZ={{ myapps_withings_sync_timezone }}
+      # Destination selector, not a credential — see the var's comment in
+      # defaults. Login is tokenstore-first; there is no password here.
+      - GARMIN_USERNAME={{ myapps_withings_sync_garmin_username }}
+    volumes:
+      # Two token files only: .withings_user.json (Withings OAuth refresh
+      # token) and garmin_tokens.json (Garmin session). Both come from the
+      # one-time interactive login and cannot be re-created unattended, so
+      # the path sits under /srv/appdata where restic already backs it up.
+      # The image runs as uid 1000; the role chowns the host path to match.
+      - "{{ myapps_withings_sync_state_dir }}:/config"
+    security_opt:
+      - no-new-privileges:true
+{% endif %}
+{% if myapps_jobs_refresh_enabled | default(false) | bool %}
+  jobs-refresh:
+    image: {{ myapps_jobs_refresh_image }}
+    container_name: jobs-refresh
+    # One-shot job: keep it out of `docker compose up -d` / `--remove-orphans`
+    # and never give it `restart: unless-stopped` -- jobs-refresh.timer runs
+    # it explicitly with `docker compose run --rm jobs-refresh`.
+    profiles: ["oneshot"]
+    # Non-root: matches the image's own USER (see jobs-refresh.Dockerfile.j2)
+    # -- Claude CLI's bypassPermissions mode refuses to run under root, and
+    # this container holds a write-capable git deploy key. The bind-mounted
+    # host paths below are chowned to this same uid:gid by the role.
+    user: "{{ myapps_jobs_refresh_container_uid }}:{{ myapps_jobs_refresh_container_gid }}"
+    env_file:
+      - jobs-refresh.env
+    volumes:
+      # Bootstrap script, read-only: rendered onto the host by this role
+      # (not baked into the image), so mechanics tweaks are a redeploy, not
+      # a rebuild. This is the image's CMD.
+      - "{{ myapps_jobs_refresh_bootstrap_script }}:/usr/local/bin/jobs-refresh-bootstrap.sh:ro"
+      # jobs-dashboard is written and pushed -- stays read-write.
+      - "{{ myapps_jobs_refresh_repo_dir }}:/data/jobs-dashboard"
+      # employee-cv is only ever *read* (two files) by the job, but this
+      # mount is NOT :ro: the container does its own git sparse-checkout
+      # into this same host path (see jobs-refresh.Dockerfile.j2), and a
+      # read-only bind mount would break that checkout/pull. Read-only
+      # enforcement happens one layer up instead, via the read-only
+      # employee-cv deploy key below (it physically cannot push).
+      - "{{ myapps_jobs_refresh_employee_cv_dir }}:/data/employee-cv"
+      - "{{ myapps_jobs_refresh_claude_home_dir }}:/data/claude-home"
+      # SSH deploy keys, read-only: least privilege per repo (dashboard
+      # write-capable, employee-cv read-only). Neither key is generated or
+      # managed by Ansible -- see myapps_jobs_refresh_ssh_key_*_path.
+      - "{{ myapps_jobs_refresh_ssh_key_dashboard_path }}:{{ myapps_jobs_refresh_ssh_key_dashboard_container_path }}:ro"
+      - "{{ myapps_jobs_refresh_ssh_key_employee_cv_path }}:{{ myapps_jobs_refresh_ssh_key_employee_cv_container_path }}:ro"
+{% if myapps_jobs_refresh_browser_enabled | default(false) | bool %}
+      # MCP config pointing refresh-run.sh's Claude CLI at playwright-mcp
+      # (see JOBS_REFRESH_MCP_CONFIG in jobs-refresh.env.j2). No secrets in
+      # it -- just a service-name URL -- so :ro is enough, no key handling
+      # like the SSH mounts above.
+      - "{{ myapps_jobs_refresh_mcp_config_path }}:{{ myapps_jobs_refresh_mcp_config_container_path }}:ro"
+{% endif %}
+    security_opt:
+      - no-new-privileges:true
+{% endif %}

@@ -1,0 +1,10 @@
+[Unit]
+Description=garmin-health monthly report failure notification
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists={{ myapps_notify_script }}
+
+[Service]
+Type=oneshot
+# See garmin-sync-notify.service.j2 for why this overrides the env file.
+ExecStart={{ myapps_notify_script }} garmin-report.service {{ myapps_garmin_health_notify_env_file }}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Traefik Reverse Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ traefik_user }}
+Group={{ traefik_group }}
+WorkingDirectory={{ traefik_data_dir }}
+{% if traefik_enable_tls | default(false) %}
+EnvironmentFile={{ traefik_config_dir }}/cloudflare.env
+{% endif %}
+ExecStart={{ traefik_install_dir }}/traefik --configFile={{ traefik_config_dir }}/traefik.yml
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

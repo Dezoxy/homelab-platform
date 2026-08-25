@@ -1,0 +1,143 @@
+---
+# code-server -- VS Code as a web application, reached through Traefik +
+# Cloudflare Access from any device.
+#
+# Deliberately NOT a remote desktop. This role's original header made that
+# argument and it was proven the hard way on 2026-08-25: a Windows 11 VM plus
+# Guacamole was built to get an editor in the browser, needed 8 GB RESERVED on
+# a 31.8 GB host, pushed the node into swap, and was retired the same day.
+# code-server renders real DOM rather than streaming pixels, so a tablet or
+# phone gets a genuinely usable editor -- for about 1 GB of a CEILING that
+# costs the host nothing when idle.
+#
+# It runs on 01-code-lxc, its own guest, rather than on 01-myapps-vm: LXC
+# memory is a ceiling, VM memory is a reservation, and myapps also runs the
+# digest/garmin/jobs-refresh/withings job units that a runaway extension should
+# not be able to starve.
+
+code_server_enabled: true
+
+# Pinned .deb from the upstream release. Renovate tracks code_server_version
+# via a custom manager in renovate.json.
+code_server_version: "4.134.0"
+code_server_deb_url: >-
+  https://github.com/coder/code-server/releases/download/v{{ code_server_version }}/code-server_{{ code_server_version }}_amd64.deb
+
+code_server_user: toomhorvath
+code_server_bin: /usr/bin/code-server
+code_server_env_file: /etc/default/code-server
+
+# Bound on all interfaces because Traefik lives on a different host
+# (01-reverse-proxy-lxc, 192.168.1.4) and has to reach it over the LAN.
+# Nothing publishes this port publicly -- the only route in is the Tunnel.
+code_server_bind_addr: "0.0.0.0"
+code_server_port: 8080
+
+# State on the appdata bind mount, not the container rootfs: settings,
+# installed extensions and open-editor state then survive a rebuild AND land in
+# 01-backup-lxc's restic run for free.
+#
+# /srv/appdata/code, not the old /srv/appdata/agent -- that tree was pruned
+# when 01-agent-lxc was retired in #793, so there is nothing to inherit.
+code_server_state_dir: /srv/appdata/code/code-server
+code_server_user_data_dir: "{{ code_server_state_dir }}/user-data"
+code_server_extensions_dir: "{{ code_server_state_dir }}/extensions"
+
+# Password auth stays ON even though Cloudflare Access already gates the
+# hostname. Access protects the public route; this protects the port from
+# anything already inside the LAN. Injected from Key Vault
+# (CODE_SERVER_PASSWORD, folder=agent); never defaulted.
+code_server_password: ""
+
+# --- Workspace and tooling -----------------------------------------------------
+# git is not optional here: VS Code's built-in Git extension HIDES its entire UI
+# -- including "Clone Repository" on the welcome screen -- when it cannot find a
+# git binary. The editor looks like it simply lacks the feature.
+#
+# The rest are what a clone actually needs: openssh-client for git-over-SSH,
+# ca-certificates for HTTPS remotes, and less because git pipes into a pager.
+code_server_packages:
+  - git
+  - openssh-client
+  - ca-certificates
+  - curl
+  - less
+
+# Where repositories live. On the appdata bind mount, NOT $HOME.
+#
+# $HOME is /home/toomhorvath on the container rootfs, so a clone there is lost
+# on a rebuild and never reaches restic. Here, uncommitted work and untracked
+# files -- the parts a git remote does not hold -- are backed up.
+code_server_projects_dir: "{{ appdata_mount }}/projects"
+
+# Opened by default when code-server starts, so a fresh session lands in the
+# workspace rather than an empty window.
+code_server_open_folder: "{{ code_server_projects_dir }}"
+
+# Git identity. Without these the first `git commit` fails outright with
+# "Please tell me who you are", which is a poor way to discover the editor is
+# only half set up.
+#
+# The noreply address deliberately, because that is what this repo's existing
+# commits already use -- matching it keeps authorship consistent and keeps the
+# real address out of public history.
+code_server_git_user_name: toomhorvath
+code_server_git_user_email: "176568786+Dezoxy@users.noreply.github.com"
+
+# git config lives on the bind mount for the same reason everything else does:
+# a rebuild would otherwise silently reset the identity.
+code_server_git_config_file: "{{ appdata_mount }}/gitconfig"
+
+# --- git over SSH --------------------------------------------------------------
+# Without a config entry, `git pull` fails on a fresh container even when the key
+# is sitting right there: OpenSSH only offers identities with DEFAULT filenames
+# (id_rsa, id_ed25519, ...), and ~/.ssh/toomhorvath is not one of them. The error
+# is "Permission denied (publickey)", which reads like a missing or unauthorised
+# key rather than a key that was never offered.
+#
+# These files live on the container rootfs, not the appdata mount -- which breaks
+# this role's usual rule. That rule exists to protect state a PERSON creates:
+# extensions, settings, clones. This is config Ansible generates, so a rebuild
+# regenerating it is the intended behaviour, not data loss.
+code_server_ssh_dir: "/home/{{ code_server_user }}/.ssh"
+
+# The private key itself is NOT written here, deliberately. Ansible would have to
+# carry it to do that, and the point of the Key Vault path (`make ssh-keys`) is
+# that the key never travels through a playbook. This role only makes the key
+# usable once it exists.
+code_server_git_ssh_identity: "{{ code_server_ssh_dir }}/toomhorvath"
+
+# host_key is PINNED, not scanned. `ssh-keyscan` at deploy time is
+# trust-on-first-use against whatever answers on the network; this value was
+# checked against GitHub's published fingerprint
+# (SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU) before being written here.
+#
+# The trade-off, plainly: if GitHub rotates this key, cloning breaks until this
+# line is updated. That is the correct direction to fail.
+code_server_ssh_hosts:
+  - host: github.com
+    user: git
+    identity: "{{ code_server_ssh_dir }}/toomhorvath"
+    host_key: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+
+# --- Extensions ---------------------------------------------------------------
+# Two mechanisms, because one is not enough.
+#
+# code-server resolves extension IDs against Open VSX, NOT Microsoft's
+# marketplace, so anything published there installs by id and is fully
+# reproducible from this repo.
+code_server_extensions: []
+
+# Anything Open VSX does not carry needs its .vsix file. Those live in a
+# directory on the appdata bind mount rather than in git: they are megabytes of
+# binary (the repo's check-added-large-files hook caps at 500 KB, rightly), and
+# they frequently have no stable upstream URL to pin.
+#
+# The trade-off, stated plainly: extensions installed this way are reproducible
+# from BACKUP but not from source. Drop a .vsix in this directory and the next
+# deploy installs it; restic already covers the directory, so a rebuild restores
+# both the file and the installed extension.
+code_server_vsix_dir: "{{ code_server_state_dir }}/vsix"
+
+code_server_disable_telemetry: true
+code_server_disable_update_check: true

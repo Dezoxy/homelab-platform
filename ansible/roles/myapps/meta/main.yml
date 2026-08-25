@@ -1,0 +1,10 @@
+---
+galaxy_info:
+  role_name: myapps
+  author: toomhorvath
+  description: "Deploys self-hosted apps (netcheck first) via Docker Compose."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies:
+  - role: docker

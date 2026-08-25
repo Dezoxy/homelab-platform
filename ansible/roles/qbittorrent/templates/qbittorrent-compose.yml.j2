@@ -1,0 +1,27 @@
+services:
+  qbittorrent:
+    image: {{ qbittorrent_image }}
+    container_name: qbittorrent
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ qbittorrent_webui_port }}:{{ qbittorrent_webui_port }}"
+      - "{{ qbittorrent_torrent_port }}:{{ qbittorrent_torrent_port }}"
+      - "{{ qbittorrent_torrent_port }}:{{ qbittorrent_torrent_port }}/udp"
+    environment:
+      - TZ={{ qbittorrent_timezone }}
+      - PUID={{ qbittorrent_puid }}
+      - PGID={{ qbittorrent_pgid }}
+      - WEBUI_PORT={{ qbittorrent_webui_port }}
+      - TORRENTING_PORT={{ qbittorrent_torrent_port }}
+    volumes:
+      - {{ qbittorrent_config_dir }}:/config
+      - {{ qbittorrent_incomplete_dir }}:/incomplete
+      - {{ qbittorrent_completed_dir }}:/downloads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:{{ qbittorrent_webui_port }}/ >/dev/null 2>&1; elif command -v curl >/dev/null 2>&1; then curl -fsS http://localhost:{{ qbittorrent_webui_port }}/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s

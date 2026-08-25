@@ -1,0 +1,258 @@
+services:
+  lingarr:
+    image: {{ homelab_images.lingarr }}
+    container_name: lingarr
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "9876:9876"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      LOG_LEVEL: error
+      ASPNETCORE_HTTP_PORTS: "9876"
+      # Required since 1.3.0: multi-database support removed the implicit SQLite
+      # default, so the container exits on startup unless DB_CONNECTION is set.
+      # SQLite still uses local.db in the mounted config volume below.
+      DB_CONNECTION: sqlite
+    volumes:
+      - "{{ lingarr_config_dir | default('/srv/appdata/lingarr/config') }}:/app/config"
+      - /srv/media:/media
+      - /srv/media/movies:/movies
+      - /srv/media/series:/series
+    restart: unless-stopped
+    # Intentionally no Docker healthcheck here yet: Lingarr's runtime image is based on
+    # dotnet/aspnet and may not include wget/curl in all tags.
+    networks:
+      - edge
+
+  prowlarr:
+    image: {{ homelab_images.prowlarr }}
+    container_name: prowlarr
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "9696:9696"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "{{ prowlarr_config_dir | default('/srv/appdata/prowlarr') }}:/config"
+      - /srv/media/downloads:/downloads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:9696/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:9696/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  radarr:
+    image: {{ homelab_images.radarr }}
+    container_name: radarr
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "7878:7878"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "{{ radarr_config_dir | default('/srv/appdata/radarr') }}:/config"
+      - /srv/media:/media
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:7878/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:7878/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  sonarr:
+    image: {{ homelab_images.sonarr }}
+    container_name: sonarr
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "8989:8989"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "{{ sonarr_config_dir | default('/srv/appdata/sonarr') }}:/config"
+      - /srv/media:/media
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8989/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8989/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  bazarr:
+    image: {{ homelab_images.bazarr }}
+    container_name: bazarr
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "6767:6767"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      BAZARR_LINGARR_TRANSLATION_TIMEOUT_SECONDS: "{{ bazarr_lingarr_translation_timeout_seconds }}"
+    volumes:
+      - "{{ bazarr_config_dir | default('/srv/appdata/bazarr') }}:/config"
+      - "{{ bazarr_custom_init_dir }}/90-bazarr-lingarr-timeout:/custom-cont-init.d/90-bazarr-lingarr-timeout:ro"
+      - /srv/media:/media
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:6767/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:6767/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  tautulli:
+    image: {{ homelab_images.tautulli }}
+    container_name: tautulli
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "8181:8181"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "{{ tautulli_config_dir | default('/srv/appdata/tautulli') }}:/config"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8181/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8181/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  seerr:
+    image: {{ homelab_images.seerr }}
+    container_name: seerr
+    init: true
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "5055:5055"
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "{{ seerr_config_dir | default('/srv/appdata/overseerr') }}:/app/config"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:5055/ >/dev/null 2>&1; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:5055/ >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - edge
+
+  plex:
+    image: {{ homelab_images.plex }}
+    container_name: plex
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "32400:32400/tcp"
+      - "5353:5353/udp"
+      - "32410:32410/udp"
+      - "32412:32412/udp"
+      - "32413:32413/udp"
+      - "32414:32414/udp"
+    shm_size: '2gb'
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"   # video
+      - "993"  # render
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      VERSION: {{ plex_server_version | default('docker') | to_json }}
+    volumes:
+      - /srv/appdata/plex:/config
+      - "{{ plex_databases_dir | default('/srv/appdata/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases') }}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+      - "{{ plex_codecs_dir | default('/srv/appdata/plex/Library/Application Support/Plex Media Server/Codecs') }}:/config/Library/Application Support/Plex Media Server/Codecs"
+      - "{{ plex_cache_dir | default('/srv/appdata/plex/Library/Application Support/Plex Media Server/Cache') }}:/config/Library/Application Support/Plex Media Server/Cache"
+      - {{ plex_transcode_dir | default('/var/lib/homelab/plex-transcode') }}:/transcode
+      - /srv/media/movies:/movies
+      - /srv/media/series:/series
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:32400/identity | grep -q '<MediaContainer'; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:32400/identity | grep -q '<MediaContainer'; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    networks:
+      - edge
+{% if (kometa_enabled | default(false)) | bool %}
+
+  kometa:
+    image: {{ homelab_images.kometa }}
+    container_name: kometa
+    depends_on:
+      - plex
+    environment:
+      TZ: "${TZ:-Europe/Budapest}"
+      KOMETA_TIMES: "{{ kometa_schedule_times | default('05:00') }}"
+{% if (kometa_run_on_start | default(false)) | bool %}
+      KOMETA_RUN: "true"
+{% endif %}
+    volumes:
+      # Config dir is on local ext4: Kometa's SQLite cache runs in WAL mode,
+      # which VirtIO-FS cannot serve. Original-artwork backups are plain image
+      # files, so they stay on the shared mount and are layered back in here.
+      - {{ (kometa_config_path | default('/var/lib/homelab/kometa/config.yml')) | dirname }}:/config
+      - {{ kometa_overlays_dir | default('/srv/appdata/kometa/overlays') }}:/config/overlays
+    restart: unless-stopped
+    networks:
+      - edge
+{% endif %}
+
+networks:
+  edge:
+    external: true

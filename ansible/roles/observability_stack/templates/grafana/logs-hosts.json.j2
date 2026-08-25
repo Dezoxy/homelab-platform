@@ -1,0 +1,75 @@
+{
+  "annotations": { "list": [{ "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" }] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 0,
+      "type": "text",
+      "title": "Connected Coverage",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "This dashboard reads `systemd-journal` across the homelab. The `Alloy / Docker Warnings + Errors` panel only shows matches from `alloy.service` and `docker.service`.\n\nInventory hosts wired to this dashboard: `01-backup-lxc`, `01-dns-lxc`, `01-edge-lxc`, `01-media-vm`, `01-observability-lxc`, `01-reverse-proxy-lxc`, `01-tailscale-lxc`, `01-torrent-lxc`."
+      }
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Systemd Journal Lines / 5m by Host",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
+      "targets": [{ "expr": "sum by (host) (count_over_time({job=\"systemd-journal\"}[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Alloy Service Log Lines / 5m by Host",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
+      "targets": [{ "expr": "sum by (host) (count_over_time({job=\"systemd-journal\",unit=\"alloy.service\"}[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Journal Warnings + Errors / 5m by Host",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 13 },
+      "targets": [{ "expr": "sum by (host) (count_over_time(({job=\"systemd-journal\"} |~ \"(?i)(\\\\bwarn(ing)?\\\\b|\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(warn|error|fatal)\\\\b|\\\\[(warn|warning|error|critical)\\\\]|\\\\|(Warn|Error)\\\\||\\\\b(WRN|ERR)\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Alloy / Docker Warnings + Errors",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+      "targets": [{ "expr": "{job=\"systemd-journal\",unit=~\"alloy.service|docker.service\"} |~ \"(?i)(\\\\bwarn(ing)?\\\\b|\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(warn|error|fatal)\\\\b|\\\\[(warn|warning|error|critical)\\\\]|\\\\|(Warn|Error)\\\\||\\\\b(WRN|ERR)\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Systemd Journal Warnings + Errors (All Hosts)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 30 },
+      "targets": [{ "expr": "{job=\"systemd-journal\"} |~ \"(?i)(\\\\bwarn(ing)?\\\\b|\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(warn|error|fatal)\\\\b|\\\\[(warn|warning|error|critical)\\\\]|\\\\|(Warn|Error)\\\\||\\\\b(WRN|ERR)\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["homelab", "logs", "hosts", "provisioned"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "title": "Logs - Hosts & Alloy",
+  "uid": "logs-hosts",
+  "version": 1,
+  "weekStart": ""
+}

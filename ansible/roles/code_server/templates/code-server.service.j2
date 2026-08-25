@@ -1,0 +1,33 @@
+[Unit]
+Description=code-server (VS Code in the browser)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User={{ code_server_user }}
+EnvironmentFile={{ code_server_env_file }}
+# A login shell so the integrated terminal inherits the same PATH and profile
+# scripts the CLIs rely on -- /etc/profile.d/codex.sh in particular. Without
+# it, `codex` is missing from the terminal and the whole point of putting
+# code-server on this host is lost.
+ExecStart={{ code_server_bin }} \
+  --bind-addr {{ code_server_bind_addr }}:{{ code_server_port }} \
+  --user-data-dir {{ code_server_user_data_dir }} \
+  --extensions-dir {{ code_server_extensions_dir }} \
+  --auth password \
+{% if code_server_disable_telemetry %}
+  --disable-telemetry \
+{% endif %}
+{% if code_server_disable_update_check %}
+  --disable-update-check \
+{% endif %}
+  --disable-getting-started-override \
+{% if code_server_open_folder %}
+  {{ code_server_open_folder }}
+{% endif %}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

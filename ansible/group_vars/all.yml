@@ -1,0 +1,162 @@
+# Virtualization types that mean "this guest is a container, not a VM".
+# Canonical list: rootfs expansion and the AppArmor mask below both key off it,
+# and they must not be allowed to drift apart.
+container_virtualization_types:
+  - lxc
+  - openvz
+  - container
+  - docker
+  - containerd
+  - podman
+  - systemd-nspawn
+
+# Root filesystem expansion defaults for VM guests.
+# The preflight playbook auto-skips containerized hosts (LXC, Docker, etc.).
+rootfs_expand_enabled: true
+rootfs_expand_container_virtualization_types: "{{ container_virtualization_types }}"
+rootfs_expand_packages:
+  - cloud-guest-utils
+  - lvm2
+  - gdisk
+
+# Packages that should exist on every managed VM and LXC guest.
+common_guest_packages:
+  - mc
+  - glances
+
+# Ubuntu package mirror for all managed guests.
+#
+# Why this is pinned rather than left at the image default: a full-fleet
+# `make deploy-all` spends most of its wall-clock in `apt update`, because every
+# guest pulls ~166 MB of indexes (universe Packages alone is 76 MB uncompressed)
+# and cache_valid_time only suppresses that for an hour. archive.ubuntu.com
+# throttled to ~11 KB/s mid-deploy, turning one refresh into a 15-minute task.
+#
+# Re-measured 2026-08-25 with scripts/dev/bench_apt_mirrors.sh, three runs per
+# mirror, from three guests -- an LXC, a second LXC, and a VM -- because the
+# docker role carried a contradictory measurement and the two overwrote each
+# other on every deploy. Average MB/s:
+#
+#                        reverse-proxy-lxc  observability-lxc  myapps-vm
+#   hu.archive.ubuntu.com       49.1              77.6           56.3
+#   de.archive.ubuntu.com        4.3               -              -
+#   archive.ubuntu.com           3.8               -              -
+#   nl.archive.ubuntu.com        3.9               4.4            5.9
+#
+# hu wins by 10-20x on every host tested, so this stays. The docker role's old
+# de.archive default claimed the opposite (May 2026: hu ~1 MB/s, de ~14 MB/s);
+# that no longer reproduces in either direction.
+#
+# This file is now the SINGLE owner of the guest apt mirror:
+# docker_manage_ubuntu_sources is false, so roles/docker defers here.
+# Re-measure with scripts/dev/bench_apt_mirrors.sh before changing this.
+apt_mirror_url: http://hu.archive.ubuntu.com/ubuntu/
+
+# Security updates deliberately stay on the canonical host: country mirrors sync
+# on a lag, and the -security indexes are small enough that mirror speed is
+# irrelevant here. Point this at apt_mirror_url only if you accept that lag.
+apt_security_mirror_url: http://security.ubuntu.com/ubuntu/
+
+apt_sources_components: main restricted universe multiverse
+
+# Set false on a host that needs to keep its image-provided sources.
+apt_sources_manage: true
+
+# Proxmox uses the committed root key. Guest runs override this path with a
+# temporary trust file containing host keys attested through pinned pve.
+ansible_known_hosts_file: >-
+  {{
+    lookup('ansible.builtin.env', 'ANSIBLE_KNOWN_HOSTS_FILE')
+    | default(inventory_dir ~ '/ssh_known_hosts', true)
+  }}
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=yes
+  -o UserKnownHostsFile={{ ansible_known_hosts_file }}
+
+# Units needrestart must never auto-restart after a package upgrade.
+#
+# needrestart runs from apt's DPkg::Post-Invoke hook (/etc/apt/apt.conf.d/
+# 99needrestart) and restarts whatever it finds running against upgraded
+# libraries. For a Type=oneshot job unit that is wrong twice over:
+#
+#   1. `systemctl restart` on a oneshot BLOCKS until ExecStart finishes, and the
+#      apt hook is synchronous -- so apt holds the dpkg frontend lock for the
+#      whole job. digest.service allows 1800s + 3600s of lock wait, a 90-minute
+#      worst case. Measured 2026-08-24: a 12:00 digest run held the lock for 9
+#      minutes and made `make update-all` fail on 01-myapps-vm with
+#      "Unable to acquire the dpkg frontend lock".
+#   2. Restarting a batch job re-runs it off-schedule. That same restart killed
+#      the in-flight run, started a second one against the same state.db, and
+#      the two raced. The loser aborted on an integrity guard
+#      ("digest stamping affected 1 of 164 items") and fired a spurious failure
+#      notification. No data was lost -- the guard held -- but nothing about it
+#      was intended.
+#
+# Value 0 means "never restart", matching the polarity of the entries the
+# package ships for dbus and the display managers. Long-running DAEMONS are
+# deliberately absent: a libc or openssl upgrade should still restart those
+# automatically, which is the entire point of needrestart. Only unattended job
+# units belong here.
+#
+# The restart MODE ($nrconf{restart}) is deliberately not set: the distro
+# default already auto-restarts under the hook's `-m u`, and overriding it
+# fleet-wide would change daemon behaviour we are not trying to change.
+#
+# Prefix regexes rather than exact names, so a new sibling unit (digest-foo,
+# garmin-bar) inherits the policy instead of silently reintroducing the bug.
+needrestart_never_restart_units:
+  - '^digest(-.*)?\.service$'
+  - '^garmin-(sync|report)(-notify)?\.service$'
+  - '^jobs-refresh(-notify)?\.service$'
+  - '^withings-sync(-notify)?\.service$'
+  - '^restic-appdata-backup(-notify)?\.service$'
+  - '^homelab-local-state-backup\.service$'
+  - '^unifi-os-backup-mirror\.service$'
+  - '^staging-fstrim\.service$'
+  - '^cloudflare-ddns\.service$'
+  - '^subnet-route-snat\.service$'
+  - '^(myapps|homelab|observability|qbittorrent)-compose\.service$'
+
+# Packages with no purpose on a virtualised guest, purged by
+# playbooks/bootstrap/00-system-updates.yml.
+#
+# openipmi drives a BMC over the IPMI kernel modules. No KVM guest or LXC has
+# one, so its LSB init script failed on every boot across the whole fleet and
+# left systemd permanently `degraded` -- which hides a real failure behind
+# noise that everyone learns to ignore.
+#
+# NOTE: ipmitool Recommends openipmi (it does not Depend on it -- verified), so
+# apt can pull openipmi back in the next time ipmitool itself is upgraded. The
+# purge below reconverges on every deploy. ipmitool is deliberately kept: it
+# talks to a remote BMC over LAN, which works fine from a guest.
+guest_purge_packages:
+  - openipmi
+
+# Upgrades that `make update-all` stops and asks about before proceeding.
+#
+# Matched against `apt list --upgradable` output, which starts each line with
+# the package name, so these are all anchored prefixes.
+#
+# Why these three families:
+#   docker/containerd/runc  restarting the daemon touches every container
+#   linux-image/linux-generic  needs a reboot to take effect
+#   libc6/libc-bin/openssl/libssl  makes needrestart restart a lot of daemons
+#
+# NOTE the single backslash in '\.': this is a single-quoted YAML scalar, which
+# passes backslashes through untouched. Writing '\\.' here -- correct in a
+# DOUBLE-quoted scalar -- reaches the regex engine as a literal backslash and
+# silently matches nothing.
+#   proxmox-kernel/pve-*/qemu-server/zfs/ceph  the hypervisor's own moving parts:
+#     a PVE kernel or ZFS upgrade needs a host reboot, which takes every guest
+#     with it, and pve-manager restarts the web UI and cluster daemons.
+#     Harmless on guests, which have none of these packages installed.
+#
+#     The ZFS entries cover the LIBRARIES too (libzfs/libzpool/libnvpair/
+#     libuutil), not just zfsutils. Measured 2026-08-24: Debian's
+#     stable-security offered libzpool6linux 2.3.9-0+deb13u1 against a
+#     Proxmox-built 2.3.4-pve1, and an earlier '^zfsutils|^zfs-' pattern let it
+#     through unprompted. It was harmless there -- an orphaned soname-6 library
+#     on a host with no pools, while the live stack is 2.4.3-pve1 -- but a
+#     Debian package displacing Proxmox's ZFS on a host that DOES import pools
+#     is precisely what this prompt exists to catch.
+update_disruptive_regex: '^(docker-ce|docker\.io|containerd|runc|linux-image-|linux-generic|libc6|libc-bin|openssl|libssl|proxmox-kernel-|pve-manager|pve-qemu-kvm|libpve-|pve-container|qemu-server|zfs|libzfs|libzpool|libnvpair|libuutil|ceph)'

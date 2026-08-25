@@ -1,0 +1,1 @@
+- import_playbook: 00-system-updates.yml

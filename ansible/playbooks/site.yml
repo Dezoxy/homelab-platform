@@ -1,0 +1,15 @@
+---
+- name: Reject retired site-wide deployment entry point
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Explain supported target-scoped deployment paths
+      ansible.builtin.fail:
+        msg: >-
+          ansible/playbooks/site.yml is retired because service playbooks now
+          include their target-scoped deployment sequencing. Use
+          'make deploy TARGET=<host> MODE=config|infra|full' for one host or
+          'make deploy-all MODE=config|infra|full' for sequential local fleet
+          deployment. Use the Platform / Deploy GitHub Actions workflow for CI
+          deployment.

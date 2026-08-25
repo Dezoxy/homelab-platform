@@ -1,0 +1,125 @@
+{% set traefik_tls_enabled = traefik_enable_tls | default(false) %}
+{% set traefik_enable_web_entrypoint_with_tls = traefik_enable_web_entrypoint_with_tls | default(true) %}
+http:
+  routers:
+{% for route in traefik_routes %}
+{# A route can answer on several hostnames (the same app dual-homed on more than
+   one domain). `hosts` is the general form; `host` stays supported for routes
+   with a single hostname. Same OR-ed Host() rule the dashboard router uses. #}
+{% set route_hosts = route.hosts | default([route.host]) %}
+{% set route_rule %}{% for h in route_hosts %}Host(`{{ h }}`){% if not loop.last %} || {% endif %}{% endfor %}{% endset %}
+{% if traefik_tls_enabled %}
+    {{ route.name }}:
+      rule: "{{ route_rule }}"
+      entryPoints:
+        - websecure
+{% if traefik_tls_wildcard_domain | default('') | length > 0 %}
+{% if loop.first %}
+      tls:
+        certResolver: "{{ traefik_acme_resolver }}"
+        domains:
+          - main: "{{ traefik_tls_root_domain | default(traefik_tls_wildcard_domain | regex_replace('^\\*\\.', '')) }}"
+            sans:
+              - "{{ traefik_tls_wildcard_domain }}"
+{% for extra in traefik_tls_extra_domains | default([]) %}
+          - main: "{{ extra.main }}"
+            sans:
+{% for san in extra.sans %}
+              - "{{ san }}"
+{% endfor %}
+{% endfor %}
+{% else %}
+      tls: {}
+{% endif %}
+{% else %}
+      tls:
+        certResolver: "{{ traefik_acme_resolver }}"
+{% endif %}
+      service: {{ route.name }}
+{% if traefik_enable_web_entrypoint_with_tls %}
+    {{ route.name }}-web:
+      rule: "{{ route_rule }}"
+      entryPoints:
+        - web
+      service: {{ route.name }}
+{% endif %}
+{% else %}
+    {{ route.name }}:
+      rule: "{{ route_rule }}"
+      entryPoints:
+        - web
+      service: {{ route.name }}
+{% endif %}
+{% endfor %}
+{% if traefik_enable_dashboard %}
+{% set traefik_dashboard_hosts_effective = traefik_dashboard_hosts | default([]) %}
+{% if (traefik_dashboard_hosts_effective | length == 0) and (traefik_dashboard_host | default('') | length > 0) %}
+{% set traefik_dashboard_hosts_effective = [traefik_dashboard_host] %}
+{% endif %}
+{% if traefik_dashboard_hosts_effective | length > 0 %}
+    traefik:
+      rule: "{% for host in traefik_dashboard_hosts_effective %}Host(`{{ host }}`){% if not loop.last %} || {% endif %}{% endfor %}"
+      entryPoints:
+{% if traefik_tls_enabled %}
+        - websecure
+      middlewares:
+        - traefik-dashboard-root
+        - traefik-dashboard-slash
+{% if traefik_tls_wildcard_domain | default('') | length > 0 %}
+      tls: {}
+{% else %}
+      tls:
+        certResolver: "{{ traefik_acme_resolver }}"
+{% endif %}
+      service: api@internal
+{% if traefik_enable_web_entrypoint_with_tls %}
+    traefik-web:
+      rule: "{% for host in traefik_dashboard_hosts_effective %}Host(`{{ host }}`){% if not loop.last %} || {% endif %}{% endfor %}"
+      entryPoints:
+        - web
+      middlewares:
+        - traefik-dashboard-root
+        - traefik-dashboard-slash
+      service: api@internal
+{% endif %}
+{% else %}
+        - web
+      middlewares:
+        - traefik-dashboard-root
+        - traefik-dashboard-slash
+      service: api@internal
+{% endif %}
+{% endif %}
+{% endif %}
+
+{% if traefik_enable_dashboard %}
+  middlewares:
+    traefik-dashboard-root:
+      redirectRegex:
+        regex: "^(https?://[^/]+)/$"
+        replacement: "${1}/dashboard/"
+        permanent: true
+    traefik-dashboard-slash:
+      redirectRegex:
+        regex: "^(https?://[^/]+)/dashboard$"
+        replacement: "${1}/dashboard/"
+        permanent: true
+{% endif %}
+
+  services:
+{% for route in traefik_routes %}
+    {{ route.name }}:
+      loadBalancer:
+        servers:
+          - url: "{{ route.url }}"
+{% if route.insecure_skip_verify | default(false) %}
+        serversTransport: "{{ traefik_insecure_transport_name }}"
+{% endif %}
+{% endfor %}
+
+{% set insecure_routes = traefik_routes | selectattr("insecure_skip_verify", "defined") | selectattr("insecure_skip_verify") | list %}
+{% if insecure_routes | length > 0 %}
+  serversTransports:
+    {{ traefik_insecure_transport_name }}:
+      insecureSkipVerify: true
+{% endif %}

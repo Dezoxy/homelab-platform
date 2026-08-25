@@ -1,0 +1,261 @@
+---
+- name: Derive code-server file paths
+  ansible.builtin.set_fact:
+    code_server_env_file: "{{ code_server_env_file | default('/etc/default/code-server') }}"
+  when: code_server_enabled | bool
+
+- name: Require a code-server password
+  ansible.builtin.assert:
+    that:
+      - (code_server_password | default('') | trim) | length > 0
+    fail_msg: >-
+      code_server_enabled is true but no password is set. Store one as the
+      code-server-password Key Vault secret (folder=agent, envvar=
+      CODE_SERVER_PASSWORD), or pass -e code_server_password=... at deploy.
+      This is a second factor behind Cloudflare Access, not the only gate --
+      but the port is reachable from anywhere on the LAN, so it is not
+      decorative either.
+  when: code_server_enabled | bool
+
+- name: Install workspace tooling
+  ansible.builtin.apt:
+    name: "{{ code_server_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: code_server_enabled | bool
+
+- name: Ensure the projects directory exists on the appdata mount
+  ansible.builtin.file:
+    path: "{{ code_server_projects_dir }}"
+    state: directory
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0755"
+  when: code_server_enabled | bool
+
+# Written once and then left alone: `state: present` here would fight any
+# per-repo settings added by hand in the editor. This seeds identity only.
+- name: Configure git identity
+  community.general.git_config:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    scope: file
+    file: "{{ code_server_git_config_file }}"
+  loop:
+    - { name: user.name, value: "{{ code_server_git_user_name }}" }
+    - { name: user.email, value: "{{ code_server_git_user_email }}" }
+    - { name: init.defaultBranch, value: main }
+  loop_control:
+    label: "{{ item.name }}"
+  when: code_server_enabled | bool
+
+- name: Point the editor user at that gitconfig
+  ansible.builtin.file:
+    src: "{{ code_server_git_config_file }}"
+    dest: "/home/{{ code_server_user }}/.gitconfig"
+    state: link
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    force: true
+  when: code_server_enabled | bool
+
+- name: Ensure the editor user's ssh directory exists
+  ansible.builtin.file:
+    path: "{{ code_server_ssh_dir }}"
+    state: directory
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0700"
+  when: code_server_enabled | bool
+
+- name: Configure git-over-SSH remotes
+  ansible.builtin.template:
+    src: ssh_config.j2
+    dest: "{{ code_server_ssh_dir }}/config"
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0600"
+  when: code_server_enabled | bool
+
+- name: Pin host keys for those remotes
+  ansible.builtin.known_hosts:
+    path: "{{ code_server_ssh_dir }}/known_hosts"
+    name: "{{ item.host }}"
+    key: "{{ item.host_key }}"
+    state: present
+  loop: "{{ code_server_ssh_hosts }}"
+  loop_control:
+    label: "{{ item.host }}"
+  when: code_server_enabled | bool
+
+# known_hosts runs as root and creates the file root-owned, which ssh then
+# cannot write when it learns a new host -- it fails the connection rather than
+# degrading quietly. Reassert ownership rather than leaving that landmine.
+- name: Let the editor user own its known_hosts
+  ansible.builtin.file:
+    path: "{{ code_server_ssh_dir }}/known_hosts"
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0644"
+  when: code_server_enabled | bool
+
+- name: Install code-server from the pinned upstream .deb
+  ansible.builtin.apt:
+    deb: "{{ code_server_deb_url }}"
+    state: present
+  register: code_server_install
+  when: code_server_enabled | bool
+
+# Owned by the CLI user so the editor, its extensions and the integrated
+# terminal all share one identity -- and so the CLIs' existing auth state under
+# /srv/appdata/agent is readable without any permission juggling.
+- name: Ensure code-server state directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0750"
+  loop:
+    - "{{ code_server_state_dir }}"
+    - "{{ code_server_user_data_dir }}"
+    - "{{ code_server_extensions_dir }}"
+  when: code_server_enabled | bool
+
+- name: Install code-server environment file
+  ansible.builtin.template:
+    src: code-server.env.j2
+    dest: "{{ code_server_env_file }}"
+    owner: root
+    group: "{{ code_server_user }}"
+    mode: "0640"
+  no_log: true
+  notify: Restart code-server
+  when: code_server_enabled | bool
+
+- name: Install code-server systemd unit
+  ansible.builtin.template:
+    src: code-server.service.j2
+    dest: /etc/systemd/system/code-server.service
+    mode: "0644"
+  notify: Restart code-server
+  when: code_server_enabled | bool
+
+- name: Enable and start code-server
+  ansible.builtin.systemd_service:
+    name: code-server
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: code_server_enabled | bool
+
+# Fails the deploy rather than leaving a service that systemd reports as
+# running but which never bound its port -- the state you would otherwise
+# discover from a 502 in the browser.
+# --- Extensions ---------------------------------------------------------------
+# Every code-server CLI call below MUST carry the same --extensions-dir and
+# --user-data-dir the systemd unit uses. Without them the CLI defaults to
+# ~/.local/share/code-server and reports "successfully installed" into a
+# directory the running service never reads -- a clean success message and an
+# extension that silently never appears.
+- name: Ensure the vsix drop directory exists
+  ansible.builtin.file:
+    path: "{{ code_server_vsix_dir }}"
+    state: directory
+    owner: "{{ code_server_user }}"
+    group: "{{ code_server_user }}"
+    mode: "0755"
+  when: code_server_enabled | bool
+
+- name: List installed extensions
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ code_server_user }}"
+      - --
+      - "{{ code_server_bin }}"
+      - --list-extensions
+      - --extensions-dir
+      - "{{ code_server_extensions_dir }}"
+      - --user-data-dir
+      - "{{ code_server_user_data_dir }}"
+  register: code_server_installed_extensions
+  changed_when: false
+  when: code_server_enabled | bool
+
+- name: Install missing Open VSX extensions
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ code_server_user }}"
+      - --
+      - "{{ code_server_bin }}"
+      - --install-extension
+      - "{{ item }}"
+      - --extensions-dir
+      - "{{ code_server_extensions_dir }}"
+      - --user-data-dir
+      - "{{ code_server_user_data_dir }}"
+  loop: >-
+    {{
+      code_server_extensions
+      | reject('in', code_server_installed_extensions.stdout_lines | default([]))
+      | list
+    }}
+  changed_when: true
+  notify: restart code-server
+  when: code_server_enabled | bool
+
+- name: Find dropped .vsix files
+  ansible.builtin.find:
+    paths: "{{ code_server_vsix_dir }}"
+    patterns: "*.vsix"
+  register: code_server_vsix_files
+  when: code_server_enabled | bool
+
+# A .vsix is named publisher.name-version.vsix, so the extension id is the
+# filename with the trailing -<version> and suffix removed. Deriving it is what
+# makes this idempotent: without it every deploy would reinstall every file.
+- name: Install .vsix files that are not already installed
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ code_server_user }}"
+      - --
+      - "{{ code_server_bin }}"
+      - --install-extension
+      - "{{ item.path }}"
+      - --extensions-dir
+      - "{{ code_server_extensions_dir }}"
+      - --user-data-dir
+      - "{{ code_server_user_data_dir }}"
+  loop: >-
+    {{
+      code_server_vsix_files.files | default([])
+      | rejectattr('path', 'search', vsix_installed_pattern)
+      | list
+    }}
+  loop_control:
+    label: "{{ item.path | basename }}"
+  vars:
+    vsix_installed_pattern: >-
+      {{
+        '(' ~ (
+          (code_server_installed_extensions.stdout_lines | default(['__none__']))
+          | map('regex_escape') | join('|')
+        ) ~ ')-[0-9]'
+      }}
+  changed_when: true
+  notify: restart code-server
+  when: code_server_enabled | bool
+
+- name: Wait for code-server to accept connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ code_server_port }}"
+    timeout: 60
+  when: code_server_enabled | bool

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run fstrim on torrent staging mount every 3 days
+
+[Timer]
+OnActiveSec=3d
+OnUnitActiveSec=3d
+Persistent=true
+RandomizedDelaySec=1h
+AccuracySec=1h
+Unit=staging-fstrim.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,95 @@
+{
+  "annotations": { "list": [{ "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" }] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 0,
+      "type": "text",
+      "title": "Connected Coverage",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "This dashboard reads `systemd-journal`, `docker`, and `media-app-file-logs`, and excludes `01-observability-lxc` from the inbox.\n\nConnected systemd hosts: `01-backup-lxc`, `01-dns-lxc`, `01-edge-lxc`, `01-media-vm`, `01-reverse-proxy-lxc`, `01-tailscale-lxc`, `01-torrent-lxc`.\n\nConnected file-log apps: `bazarr`, `plex`, `prowlarr`, `qbittorrent`, `radarr`, `seerr`, `sonarr`, `tautulli`.\n\nThe Docker-specific panels only populate when matching warning/error lines come from container stdout/stderr with `container` or `compose_service` labels."
+      }
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Error Lines / 5m by Host (All App Logs)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
+      "targets": [{ "expr": "sum by (host) (count_over_time(({job=~\"docker|media-app-file-logs|systemd-journal\",host!=\"01-observability-lxc\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Docker Error Lines / 5m by Container",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
+      "targets": [{ "expr": "topk(20, sum by (host, container) (count_over_time(({job=\"docker\",host!=\"01-observability-lxc\",container=~\".+\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m])))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "App Docker Error Lines / 5m by Compose Service",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "targets": [{ "expr": "topk(20, sum by (host, compose_service) (count_over_time(({job=\"docker\",host!=\"01-observability-lxc\",compose_service=~\".+\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m])))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "App Systemd Error Lines / 5m by Unit",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "targets": [{ "expr": "topk(20, sum by (host, unit) (count_over_time(({job=\"systemd-journal\",host!=\"01-observability-lxc\",unit!=\"\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m])))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "App File-Log Error Lines / 5m by App",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 21 },
+      "targets": [{ "expr": "sum by (host, app) (count_over_time(({job=\"media-app-file-logs\",host!=\"01-observability-lxc\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 6,
+      "type": "logs",
+      "title": "App Errors (Excludes Observability Host)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 28 },
+      "targets": [{ "expr": "{job=~\"docker|media-app-file-logs|systemd-journal\",host!=\"01-observability-lxc\"} |~ \"(?i)(\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(error|fatal)\\\\b|\\\\[(error|critical)\\\\]|\\\\|Error\\\\||\\\\bERR\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "App Warnings + Errors (Excludes Observability Host)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 40 },
+      "targets": [{ "expr": "{job=~\"docker|media-app-file-logs|systemd-journal\",host!=\"01-observability-lxc\"} |~ \"(?i)(\\\\bwarn(ing)?\\\\b|\\\\berror\\\\b|\\\\bexception\\\\b|\\\\btraceback\\\\b|\\\\bcritical\\\\b|\\\\bfatal:|\\\\bpanic:|\\\\bfailure\\\\b|\\\\bfailed (to|with|for|by)\\\\b|\\\\bunable to\\\\b|\\\\blevel=(warn|error|fatal)\\\\b|\\\\[(warn|warning|error|critical)\\\\]|\\\\|(Warn|Error)\\\\||\\\\b(WRN|ERR)\\\\b|\\\\bE[0-9]{4}\\\\b)\" !~ \"(?i)(\\\"error\\\"\\\\s*:\\\\s*false|error=false)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["homelab", "logs", "errors", "provisioned"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "title": "Logs - App Error Inbox",
+  "uid": "logs-errors",
+  "version": 1,
+  "weekStart": ""
+}

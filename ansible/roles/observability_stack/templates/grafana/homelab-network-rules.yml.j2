@@ -1,0 +1,451 @@
+{# Query -> Reduce -> Threshold, not a classic condition. classic_conditions
+   folds a multi-series query into ONE alert instance and discards the
+   per-series labels, so a rule that queries `sum by (service)` still notifies
+   without a service label -- the Telegram message reads "B0=17.458, B1=21.504"
+   and you have to go re-run the query by hand to learn which backends broke
+   (2026-08-25). Reduce emits one number per series and Threshold compares each
+   independently, so Grafana raises one instance per series and default.message
+   renders its labels. group_by in homelab-policies.yml keys on alertname, so
+   several failing series still arrive as a single grouped notification rather
+   than one message each.
+   Reduce runs in dropNN mode: a series that reduces to NaN (histogram_quantile
+   over an empty bucket set, say) is dropped rather than poisoning the
+   comparison, which surfaces as NoData and lands on each rule's no_data_state.
+   Thresholds stay in the caller's hands; only the plumbing changed. #}
+{% macro threshold_rule(uid, title, expr, threshold, evaluator, for_duration, summary, description, severity, scope, component, no_data_state='OK', exec_err_state='Alerting', dashboard_uid=None, panel_id=None, query_from=300, extra_labels=None) %}
+      - uid: {{ uid | to_json }}
+        title: {{ title | to_json }}
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: {{ query_from }}
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: {{ expr | to_json }}
+              instant: true
+              intervalMs: 1000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: false
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              datasource:
+                type: __expr__
+                uid: "__expr__"
+              expression: A
+              hide: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings:
+                mode: dropNN
+              type: reduce
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - {{ threshold }}
+                    type: {{ evaluator | to_json }}
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "__expr__"
+              expression: B
+              hide: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: C
+              type: threshold
+        noDataState: {{ no_data_state | to_json }}
+        execErrState: {{ exec_err_state | to_json }}
+        for: {{ for_duration | to_json }}
+        annotations:
+          summary: {{ summary | to_json }}
+          description: {{ description | to_json }}
+{% if dashboard_uid %}
+          __dashboardUid__: {{ dashboard_uid | to_json }}
+{% endif %}
+{% if panel_id %}
+          __panelId__: {{ panel_id | to_json }}
+{% endif %}
+        labels:
+          severity: {{ severity | to_json }}
+          scope: {{ scope | to_json }}
+          component: {{ component | to_json }}
+{% for label_key, label_value in (extra_labels | default({}, true)).items() %}
+          {{ label_key }}: {{ label_value | to_json }}
+{% endfor %}
+{% endmacro %}
+apiVersion: 1
+
+{% if observability_grafana_retired_alert_rule_uids | default([]) | length > 0 %}
+deleteRules:
+{% for retired_rule_uid in observability_grafana_retired_alert_rule_uids %}
+  - orgId: 1
+    uid: {{ retired_rule_uid | to_json }}
+{% endfor %}
+
+{% endif %}
+groups:
+  - orgId: 1
+    name: homelab-network-health
+    folder: Homelab
+    interval: 1m
+    rules:
+{{ threshold_rule(
+  'homelab_dns_latency_high',
+  'Homelab DNS upstream latency high',
+  'histogram_quantile(0.95, sum(rate(adguard_processing_time_seconds_bucket[5m])) by (le))',
+  0.12,
+  'gt',
+  '10m',
+  'AdGuard DNS p95 processing latency stayed above 120 ms for 10 minutes.',
+  'Investigate the Ingress & DNS dashboard for AdGuard processing latency, query volume, exporter health, upstream gauges, and Cloudflared tunnel health.',
+  'warning',
+  'homelab_network',
+  'adguard',
+  dashboard_uid='ingress-dns',
+  panel_id='14'
+) }}
+{{ threshold_rule(
+  'homelab_cloudflared_ha_low',
+  'Homelab cloudflared HA connections low',
+  'cloudflared_tunnel_ha_connections',
+  4,
+  'lt',
+  '2m',
+  'Cloudflared has been below the expected 4 HA connections for at least 2 minutes.',
+  'This usually points to an outbound WAN or Cloudflare tunnel path issue rather than AdGuard itself.',
+  'critical',
+  'homelab_network',
+  'cloudflared',
+  no_data_state='Alerting',
+  dashboard_uid='ingress-dns',
+  panel_id='22'
+) }}
+{{ threshold_rule(
+  'homelab_cloudflared_reg_failures',
+  'Homelab cloudflared registration failures',
+  'sum(increase(cloudflared_rpc_client_failures{job="cloudflared",handler="registration"}[15m]))',
+  5,
+  'gt',
+  '5m',
+  'Cloudflared has logged repeated registration failures in the last 15 minutes.',
+  'Investigate the edge host, WAN path, and Cloudflare tunnel registration health before HA connections collapse.',
+  'warning',
+  'homelab_network',
+  'cloudflared',
+  query_from=900
+) }}
+{# Traefik outlives its backends across a pve reboot: the proxy is serving again
+   within seconds while the VMs are still coming up on staged autostart, so every
+   route 502s for ~10 minutes and this rule pages for a fleet that is merely
+   booting (2026-08-25: host rebooted 14:20, 502s ran 14:19-14:31, radarr and
+   sonarr both crossed the threshold). The guard drops the whole series set while
+   any monitored guest reports under 15 minutes of uptime, covering the staged
+   autostart window with margin. LXCs read btime from the host kernel, so a pve
+   reboot pulls every guest's uptime down at once and arms the guard, while a
+   single backend crashing leaves it disarmed. It fails open on purpose: if
+   node-exporter is gone the right-hand side is empty and the rule behaves as it
+   did before. Suppression lands as NoData, which no_data_state maps to OK. #}
+{{ threshold_rule(
+  'homelab_traefik_5xx_spike',
+  'Homelab Traefik 5xx spike',
+  'sum by (service) (increase(traefik_service_requests_total{job="traefik",code=~"5..",protocol!="websocket",service!=""}[10m])) unless on() (min(time() - node_boot_time_seconds{job="node-exporter"}) < 900)',
+  10,
+  'gt',
+  '5m',
+  'Traefik is returning repeated 5xx responses for a backend service.',
+  'Check the affected backend service, container logs, and recent deploys behind the reverse proxy.',
+  'warning',
+  'homelab_network',
+  'traefik',
+  query_from=600
+) }}
+
+  - orgId: 1
+    name: homelab-host-health
+    folder: Homelab
+    interval: 1m
+    rules:
+{{ threshold_rule(
+  'homelab_node_exporter_target_down',
+  'Homelab node exporter target down',
+  'up{job="node-exporter"}',
+  1,
+  'lt',
+  '5m',
+  'Prometheus has failed to scrape node_exporter from a host for at least 5 minutes.',
+  'This usually means the host is down, node_exporter is down, or network reachability is broken.',
+  'warning',
+  'homelab_host',
+  'node-exporter'
+) }}
+{{ threshold_rule(
+  'homelab_filesystem_space_warning',
+  'Homelab filesystem space low',
+  '100 * (1 - (node_filesystem_avail_bytes{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"} / node_filesystem_size_bytes{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"}))',
+  95,
+  'gt',
+  '15m',
+  'A host filesystem has exceeded 95% used capacity for 15 minutes.',
+  'Free space is getting tight on a real filesystem mount. Clean up data or expand storage before services start failing.',
+  'warning',
+  'homelab_host',
+  'filesystem',
+  dashboard_uid='homelab-overview',
+  panel_id='7'
+) }}
+{{ threshold_rule(
+  'homelab_filesystem_space_critical',
+  'Homelab filesystem space critically low',
+  '100 * (1 - (node_filesystem_avail_bytes{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"} / node_filesystem_size_bytes{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"}))',
+  99,
+  'gt',
+  '10m',
+  'A host filesystem has exceeded 99% used capacity for 10 minutes.',
+  'This filesystem is close to full and can cause writes, upgrades, and containers to fail.',
+  'critical',
+  'homelab_host',
+  'filesystem',
+  dashboard_uid='homelab-overview',
+  panel_id='7'
+) }}
+{{ threshold_rule(
+  'homelab_filesystem_inodes_warning',
+  'Homelab filesystem inode pressure',
+  '100 * (1 - (node_filesystem_files_free{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"} / node_filesystem_files{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"}))',
+  85,
+  'gt',
+  '15m',
+  'A host filesystem has exceeded 85% inode usage for 15 minutes.',
+  'This usually points to a small-file explosion such as logs, cache, or media metadata.',
+  'warning',
+  'homelab_host',
+  'filesystem'
+) }}
+{{ threshold_rule(
+  'homelab_filesystem_inodes_critical',
+  'Homelab filesystem inodes critically low',
+  '100 * (1 - (node_filesystem_files_free{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"} / node_filesystem_files{job="node-exporter",mountpoint!~"/boot($|/efi$)|/run($|/.*)",fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2?|devtmpfs|autofs|mqueue"}))',
+  95,
+  'gt',
+  '10m',
+  'A host filesystem has exceeded 95% inode usage for 10 minutes.',
+  'The filesystem is close to inode exhaustion and new file creation can start failing even when bytes remain free.',
+  'critical',
+  'homelab_host',
+  'filesystem'
+) }}
+
+  - orgId: 1
+    name: homelab-service-health
+    folder: Homelab
+    interval: 1m
+    rules:
+{{ threshold_rule(
+  'homelab_cloudflared_metrics_target_down',
+  'Homelab cloudflared metrics target down',
+  'up{job="cloudflared"}',
+  1,
+  'lt',
+  '2m',
+  'Prometheus cannot scrape the cloudflared metrics endpoint.',
+  'This usually means the edge service is down or the metrics endpoint is unreachable.',
+  'critical',
+  'homelab_service',
+  'cloudflared',
+  no_data_state='Alerting'
+) }}
+{{ threshold_rule(
+  'homelab_traefik_metrics_target_down',
+  'Homelab Traefik metrics target down',
+  'up{job="traefik"}',
+  1,
+  'lt',
+  '2m',
+  'Prometheus cannot scrape Traefik metrics from the reverse proxy host.',
+  'Treat this as reverse-proxy degradation until proven otherwise.',
+  'critical',
+  'homelab_service',
+  'traefik',
+  no_data_state='Alerting'
+) }}
+{% if observability_adguard_exporter_enabled | default(false) %}
+{{ threshold_rule(
+  'homelab_adguard_exporter_target_down',
+  'Homelab AdGuard exporter target down',
+  'up{job="adguard"}',
+  1,
+  'lt',
+  '5m',
+  'Prometheus cannot scrape AdGuard exporter metrics for at least 5 minutes.',
+  'This may be an exporter-only problem or an AdGuard reachability problem. Check the DNS host and exporter container.',
+  'warning',
+  'homelab_service',
+  'adguard',
+  no_data_state='Alerting'
+) }}
+{% endif %}
+{% if observability_blackbox_exporter_enabled | default(false) %}
+{{ threshold_rule(
+  'homelab_blackbox_probe_down',
+  'Homelab HTTP probe down',
+  'probe_success{job="blackbox"}',
+  1,
+  'lt',
+  '5m',
+  'A blackbox HTTP probe has been failing for at least 5 minutes.',
+  'Check the target service, its Traefik route, and the Cloudflare tunnel path for the host in the instance label.',
+  'warning',
+  'homelab_service',
+  'blackbox',
+  no_data_state='Alerting'
+) }}
+{# Renewal failures are silent: Traefik retries from 30 days out and logs the
+   error, but nothing surfaces it until the cert actually lapses and every
+   probe fails at once (2026-08-23). Alerting on remaining lifetime turns a
+   month of failed renewals into a warning on day one of the failure.
+   Threshold sits below Let's Encrypt's 30-day renewal window so a healthy
+   cert never trips it, and leaves 21 days of runway when it does.
+   no_data_state stays OK on purpose: a hard TLS failure drops the metric
+   entirely, and homelab_blackbox_probe_down already covers that case. #}
+{{ threshold_rule(
+  'homelab_blackbox_cert_expiring',
+  'Homelab TLS certificate expiring',
+  '(probe_ssl_earliest_cert_expiry{job="blackbox"} - time()) / 86400',
+  21,
+  'lt',
+  '1h',
+  'A TLS certificate served to the blackbox probes expires in under 21 days.',
+  'ACME renewal has most likely been failing for days. Check `journalctl -u traefik | grep -i acme` on 01-reverse-proxy-lxc; the usual causes are a DNS-01 propagation check pointed at the LAN resolver, or a Cloudflare token that cannot write a zone listed in traefik_tls_extra_domains.',
+  'warning',
+  'homelab_service',
+  'blackbox',
+  no_data_state='OK'
+) }}
+{% endif %}
+
+  - orgId: 1
+    name: homelab-container-health
+    folder: Homelab
+    interval: 1m
+    rules:
+{{ threshold_rule(
+  'homelab_cadvisor_target_down',
+  'Homelab cAdvisor target down',
+  'up{job="cadvisor"}',
+  1,
+  'lt',
+  '5m',
+  'Prometheus cannot scrape cAdvisor metrics from a Docker host.',
+  'Container-level alerting is degraded on at least one Docker host. Check the cAdvisor service and Docker itself.',
+  'warning',
+  'homelab_container',
+  'cadvisor',
+  no_data_state='Alerting'
+) }}
+{{ threshold_rule(
+  'homelab_container_restart_storm',
+  'Homelab container restart storm',
+  'sum by (container_label_com_docker_compose_project, container_label_com_docker_compose_service) (changes(container_start_time_seconds{job="cadvisor",image!="",container_label_com_docker_compose_service!=""}[15m]))',
+  1,
+  'gt',
+  '5m',
+  'A compose service has restarted more than once in the last 15 minutes.',
+  'This usually means a crash loop, bad config, or an unhealthy dependency. Check recent logs and deploy changes.',
+  'warning',
+  'homelab_container',
+  'cadvisor',
+  query_from=900
+) }}
+{{ threshold_rule(
+  'homelab_container_oom_events',
+  'Homelab container OOM events',
+  'sum by (container_label_com_docker_compose_project, container_label_com_docker_compose_service) (increase(container_oom_events_total{job="cadvisor",image!="",container_label_com_docker_compose_service!=""}[15m]))',
+  0,
+  'gt',
+  '2m',
+  'A compose service has hit an out-of-memory event in the last 15 minutes.',
+  'Increase limits, reduce memory pressure, or fix the offending workload before it becomes a restart loop.',
+  'critical',
+  'homelab_container',
+  'cadvisor',
+  query_from=900
+) }}
+
+  - orgId: 1
+    name: homelab-backup-health
+    folder: Homelab
+    interval: 1m
+    rules:
+{{ threshold_rule(
+  'homelab_restic_backup_stale_warning',
+  'Homelab restic appdata backup stale',
+  'time() - homelab_restic_backup_last_success_unixtime{job="node-exporter",instance="' ~ observability_backup_node_exporter_target ~ '",backup_set="appdata",target="b2"}',
+  129600,
+  'gt',
+  '15m',
+  'The primary appdata restic backup has not completed successfully within 36 hours.',
+  'Investigate the backup host, repository credentials, and recent timer/service runs before you lose recovery coverage.',
+  'warning',
+  'homelab_backup',
+  'restic',
+  no_data_state='Alerting'
+) }}
+{{ threshold_rule(
+  'homelab_restic_backup_stale_critical',
+  'Homelab restic appdata backup critically stale',
+  'time() - homelab_restic_backup_last_success_unixtime{job="node-exporter",instance="' ~ observability_backup_node_exporter_target ~ '",backup_set="appdata",target="b2"}',
+  172800,
+  'gt',
+  '15m',
+  'The primary appdata restic backup has not completed successfully within 48 hours.',
+  'Recovery coverage for appdata is now critically stale. Fix the backup path before making further risky changes.',
+  'critical',
+  'homelab_backup',
+  'restic',
+  no_data_state='Alerting'
+) }}
+{{ threshold_rule(
+  'homelab_backup_textfile_scrape_error',
+  'Homelab backup textfile collector scrape error',
+  'node_textfile_scrape_error{job="node-exporter",instance="' ~ observability_backup_node_exporter_target ~ '"}',
+  0,
+  'gt',
+  '5m',
+  'node_exporter textfile collector is reporting a scrape error on the backup host.',
+  'The restic backup metrics may be malformed or unreadable. Check the generated .prom files and node_exporter logs.',
+  'warning',
+  'homelab_backup',
+  'node-exporter',
+  no_data_state='Alerting'
+) }}

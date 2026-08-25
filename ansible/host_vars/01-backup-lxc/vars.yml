@@ -1,0 +1,45 @@
+# AWS secondary restic target is currently disabled.
+# restic_appdata_secondary_env_file: /etc/restic/appdata-aws.env
+restic_appdata_secondary_enabled: false
+restic_appdata_exclude_file: /etc/restic/appdata.excludes
+
+backup_smb_enabled: true
+backup_smb_share_path: /srv/appdata/macbook-backup
+backup_smb_time_machine_max_size: 500G
+# Set via CI secret or local env; do not commit the password here.
+backup_smb_password: ""
+
+# Backend tuning (S3-compatible). Backblaze B2 often benefits from more parallel connections.
+restic_appdata_s3_connections: 8
+
+# restic --exclude-file patterns (one per line). Keep this tight; excluding too much can break restores.
+restic_appdata_excludes:
+  # Plex cache can be large and is safe to rebuild.
+  - /srv/appdata/plex/Library/Application Support/Plex Media Server/Cache
+  - /srv/appdata/plex/Library/Application Support/Plex Media Server/Codecs
+  - /srv/appdata/plex-transcode
+  # Observability data (large/ephemeral). Keep Grafana config/db, exclude time-series and chunks/blocks.
+  - /srv/appdata/observability/prometheus/data
+  - /srv/appdata/observability/loki/data
+  - /srv/appdata/observability/tempo/data
+  # *arr log databases are disposable and use transient SQLite sidecars that can disappear mid-backup.
+  - /srv/appdata/prowlarr/logs.db*
+  - /srv/appdata/radarr/logs.db*
+  - /srv/appdata/sonarr/logs.db*
+  # Time Machine is already the backup target; keep the sparsebundle out of B2/appdata restic.
+  - /srv/appdata/macbook-backup
+  # code-server extensions: ~1.6 GB that is already reproducible from source.
+  # The 33 marketplace ids are declared in host_vars/01-code-lxc and reinstall
+  # from Open VSX, and the .vsix files they cannot cover live in ../vsix, which
+  # IS backed up -- so roles/code_server rebuilds this directory from things
+  # that survive. Restoring it as well would only duplicate that.
+  #
+  # ONLY the extensions directory. Deliberately still backed up, because none
+  # of it is reproducible from the repo:
+  #   /srv/appdata/code/code-server/user-data  settings, state, open editors
+  #   /srv/appdata/code/code-server/vsix       .vsix files with no upstream
+  #   /srv/appdata/code/claude, /srv/appdata/code/codex   CLI auth state
+  - /srv/appdata/code/code-server/extensions
+
+# Do not enable the timer until /etc/restic/appdata.env is filled in.
+restic_appdata_backup_enabled: true

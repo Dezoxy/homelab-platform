@@ -1,0 +1,448 @@
+---
+- name: Derive compose paths from qbittorrent_compose_dir
+  ansible.builtin.set_fact:
+    qbittorrent_compose_file: "{{ qbittorrent_compose_file | default(qbittorrent_compose_dir ~ '/compose.yml') }}"
+
+- name: Install Docker
+  ansible.builtin.import_role:
+    name: docker
+
+- name: Ensure required mountpoint directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0775"
+  loop:
+    - "{{ qbittorrent_config_dir }}"
+    - "{{ qbittorrent_completed_dir }}"
+    - "{{ qbittorrent_staging_mount }}"
+
+- name: Check required mount targets (avoid writing to root filesystem)
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, TARGET, -T, "{{ item }}"]
+  register: qbittorrent_mount_targets
+  loop:
+    - "{{ qbittorrent_config_dir }}"
+    - "{{ qbittorrent_completed_dir }}"
+    - "{{ qbittorrent_staging_mount }}"
+  changed_when: false
+  when: not (qbittorrent_skip_mount_check | default(false))
+
+- name: Fail when required storage mounts are missing
+  ansible.builtin.fail:
+    msg: >-
+      Path {{ item.item }} resolves to "/" inside the container, which means it is on the root filesystem.
+      This will corrupt your host if qBittorrent writes torrent data to root.
+      Fix: ensure Proxmox mount_point/bind mounts are configured so these paths land on real storage:
+      - {{ qbittorrent_config_dir }} (appdata)
+      - {{ qbittorrent_completed_dir }} (downloads)
+      - {{ qbittorrent_staging_mount }} (staging SSD)
+  when:
+    - not (qbittorrent_skip_mount_check | default(false))
+    - (item.stdout | trim) == "/"
+  loop: "{{ qbittorrent_mount_targets.results | default([]) }}"
+
+- name: Create qbittorrent data directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ qbittorrent_puid }}"
+    group: "{{ qbittorrent_pgid }}"
+    mode: "0775"
+  loop:
+    - "{{ qbittorrent_config_dir }}"
+    - "{{ qbittorrent_incomplete_dir }}"
+    - "{{ qbittorrent_completed_dir }}"
+
+- name: Ensure qbittorrent compose directory
+  ansible.builtin.file:
+    path: "{{ qbittorrent_compose_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install qbittorrent compose file
+  ansible.builtin.template:
+    src: qbittorrent-compose.yml.j2
+    dest: "{{ qbittorrent_compose_file }}"
+    mode: "0644"
+  register: qbittorrent_compose_copy
+
+- name: Install qbittorrent systemd unit
+  ansible.builtin.template:
+    src: qbittorrent-compose.service.j2
+    dest: /etc/systemd/system/qbittorrent.service
+    mode: "0644"
+  register: qbittorrent_unit_copy
+
+- name: Install staging fstrim systemd service
+  ansible.builtin.template:
+    src: staging-fstrim.service.j2
+    dest: "{{ staging_fstrim_service_path }}"
+    mode: "0644"
+  register: staging_fstrim_service_copy
+
+- name: Install staging fstrim systemd timer
+  ansible.builtin.template:
+    src: staging-fstrim.timer.j2
+    dest: "{{ staging_fstrim_timer_path }}"
+    mode: "0644"
+  register: staging_fstrim_timer_copy
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start staging fstrim timer
+  ansible.builtin.systemd:
+    name: staging-fstrim.timer
+    enabled: true
+    state: >-
+      {{
+        'restarted'
+        if ((staging_fstrim_service_copy is defined and staging_fstrim_service_copy is changed)
+            or (staging_fstrim_timer_copy is defined and staging_fstrim_timer_copy is changed))
+        else 'started'
+      }}
+    daemon_reload: true
+  when: qbittorrent_manage_services | bool
+
+- name: Enable and start qbittorrent service
+  ansible.builtin.systemd:
+    name: qbittorrent
+    enabled: true
+    state: >-
+      {{
+        'restarted'
+        if ((qbittorrent_compose_copy is defined and qbittorrent_compose_copy is changed)
+            or (qbittorrent_unit_copy is defined and qbittorrent_unit_copy is changed))
+        else 'started'
+      }}
+  when: qbittorrent_manage_services | bool
+
+- name: Pull qbittorrent images (update when available)
+  ansible.builtin.command:
+    cmd: "/usr/bin/docker compose -f {{ qbittorrent_compose_file }} pull"
+  args:
+    chdir: "{{ qbittorrent_compose_dir }}"
+  register: qbittorrent_compose_pull
+  changed_when: false
+  when: (qbittorrent_update_images | default(true)) | bool
+
+- name: Apply qbittorrent image updates (recreate containers if needed)
+  ansible.builtin.command:
+    cmd: "/usr/bin/docker compose -f {{ qbittorrent_compose_file }} up -d --remove-orphans"
+  args:
+    chdir: "{{ qbittorrent_compose_dir }}"
+  register: qbittorrent_compose_up
+  changed_when: >-
+    (
+      'Recreated' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+      or 'Recreating' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+      or 'Created' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+      or 'Creating' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+      or 'Removing' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+      or 'Removed' in ((qbittorrent_compose_up.stdout | default('')) + (qbittorrent_compose_up.stderr | default('')))
+    )
+  when: (qbittorrent_update_images | default(true)) | bool
+
+- name: Check staging fstrim timer is enabled
+  ansible.builtin.command: systemctl is-enabled staging-fstrim.timer
+  register: staging_fstrim_is_enabled
+  changed_when: false
+  when: qbittorrent_manage_services | bool
+
+- name: List staging fstrim timer details
+  ansible.builtin.command: systemctl list-timers --all staging-fstrim.timer
+  register: staging_fstrim_list_timers
+  changed_when: false
+  when: qbittorrent_manage_services | bool
+
+- name: Show staging fstrim timer status
+  ansible.builtin.command: systemctl status staging-fstrim.timer
+  register: staging_fstrim_status
+  changed_when: false
+  when: qbittorrent_manage_services | bool
+
+# --- qBittorrent config file management ---
+# qBittorrent rewrites qBittorrent.conf completely on shutdown, so we must
+# stop the container before editing and restart after. We only do this when
+# at least one setting differs from what is already on disk.
+
+- name: Stat qBittorrent config file
+  ansible.builtin.stat:
+    path: "{{ qbittorrent_conf_path }}"
+  register: qbittorrent_conf_stat
+  when: (qbittorrent_conf_settings | length) > 0
+
+- name: Dry-run config changes to detect drift
+  community.general.ini_file:
+    path: "{{ qbittorrent_conf_path }}"
+    section: Preferences
+    option: "{{ item.key }}"
+    value: "{{ item.value }}"
+    no_extra_spaces: true
+  check_mode: true
+  loop: "{{ qbittorrent_conf_settings }}"
+  register: qbittorrent_conf_check
+  when:
+    - (qbittorrent_conf_settings | length) > 0
+    - qbittorrent_conf_stat.stat.exists | default(false)
+
+- name: Stop qBittorrent before applying config changes
+  ansible.builtin.systemd:
+    name: qbittorrent
+    state: stopped
+  when:
+    - (qbittorrent_conf_settings | length) > 0
+    - qbittorrent_conf_stat.stat.exists | default(false)
+    - qbittorrent_conf_check.results | default([]) | selectattr('changed') | list | length > 0
+
+- name: Apply qBittorrent config settings
+  community.general.ini_file:
+    path: "{{ qbittorrent_conf_path }}"
+    section: Preferences
+    option: "{{ item.key }}"
+    value: "{{ item.value }}"
+    no_extra_spaces: true
+  loop: "{{ qbittorrent_conf_settings }}"
+  register: qbittorrent_conf_apply
+  when:
+    - (qbittorrent_conf_settings | length) > 0
+    - qbittorrent_conf_stat.stat.exists | default(false)
+
+- name: Start qBittorrent after config changes
+  ansible.builtin.systemd:
+    name: qbittorrent
+    state: started
+  when:
+    - (qbittorrent_conf_settings | length) > 0
+    - qbittorrent_conf_stat.stat.exists | default(false)
+    - qbittorrent_conf_apply.results | default([]) | selectattr('changed') | list | length > 0
+
+# --- qBittorrent Web API management ---
+# Preferences can be changed live via the Web API. Categories should be managed
+# here because qBittorrent stores them as an opaque Qt variant in the config file.
+
+- name: Determine whether qBittorrent Web API management is needed
+  ansible.builtin.set_fact:
+    qbittorrent_api_management_needed: >-
+      {{
+        (qbittorrent_api_preferences | default({}) | length > 0)
+        or (qbittorrent_categories | default([]) | length > 0)
+      }}
+  changed_when: false
+  tags:
+    - qbittorrent_api
+
+- name: Manage qBittorrent live settings through Web API
+  when: qbittorrent_api_management_needed | bool
+  tags:
+    - qbittorrent_api
+  block:
+    - name: Fail when qBittorrent API credentials are missing
+      ansible.builtin.fail:
+        msg: >-
+          qBittorrent Web API management is configured, but
+          qbittorrent_api_username/qbittorrent_api_password are empty. Set
+          QBITTORRENT_USERNAME and QBITTORRENT_PASSWORD for deploys, or pass
+          the Ansible variables explicitly.
+      when: >-
+        (qbittorrent_api_username | default('') | trim | length) == 0
+        or (qbittorrent_api_password | default('') | trim | length) == 0
+
+    - name: Log in to qBittorrent Web API
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/auth/login"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ qbittorrent_api_username }}"
+          password: "{{ qbittorrent_api_password }}"
+        return_content: true
+        status_code: [200, 204]
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      register: qbittorrent_api_login
+      changed_when: false
+      # qBittorrent's login response isn't version-stable: pre-5.x/wrapper <v2.0
+      # returns 200 with body "Ok.", newer builds return 204 with an empty body.
+      # A set session cookie is the one constant proof of a successful login.
+      failed_when: (qbittorrent_api_login.cookies_string | default('') | trim | length) == 0
+      no_log: "{{ qbittorrent_api_no_log }}"
+      # Authenticating changes no settings, and everything below needs the
+      # cookie. uri skips under --check, so the read that follows resolved
+      # `.cookies_string` against a skipped register and failed the dry run.
+      # setPreferences below is a POST that DOES change things and is
+      # deliberately left to skip in check mode as normal.
+      check_mode: false
+
+    - name: Read qBittorrent Web API preferences
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/app/preferences"
+        method: GET
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        return_content: true
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      register: qbittorrent_api_current_preferences
+      changed_when: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      # A GET of current preferences -- read-only, and check mode needs it to
+      # report which settings would change.
+      check_mode: false
+      when: (qbittorrent_api_preferences | default({}) | length) > 0
+
+    - name: Parse qBittorrent Web API preferences
+      ansible.builtin.set_fact:
+        qbittorrent_api_current_preferences_json: >-
+          {{
+            qbittorrent_api_current_preferences.json
+            | default(qbittorrent_api_current_preferences.content | from_json)
+          }}
+        qbittorrent_api_preference_drift: []
+      changed_when: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when: (qbittorrent_api_preferences | default({}) | length) > 0
+
+    - name: Detect qBittorrent Web API preference drift
+      ansible.builtin.set_fact:
+        qbittorrent_api_preference_drift: "{{ qbittorrent_api_preference_drift + [item.key] }}"
+      loop: "{{ qbittorrent_api_preferences | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when:
+        - (qbittorrent_api_preferences | default({}) | length) > 0
+        - (qbittorrent_api_current_preferences_json[item.key] | default('__qbittorrent_missing__')) != item.value
+
+    - name: Apply qBittorrent Web API preferences
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/app/setPreferences"
+        method: POST
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        body_format: form-urlencoded
+        body:
+          json: "{{ qbittorrent_api_preferences | to_json }}"
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      changed_when: true
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when:
+        - (qbittorrent_api_preferences | default({}) | length) > 0
+        - (qbittorrent_api_preference_drift | length) > 0
+
+    - name: Read qBittorrent categories
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/torrents/categories"
+        method: GET
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        return_content: true
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      register: qbittorrent_api_current_categories
+      changed_when: false
+      # Read-only GET; check mode needs it to report what would change.
+      check_mode: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when: (qbittorrent_categories | default([]) | length) > 0
+
+    - name: Parse qBittorrent categories
+      ansible.builtin.set_fact:
+        qbittorrent_api_current_categories_json: >-
+          {{
+            qbittorrent_api_current_categories.json
+            | default(qbittorrent_api_current_categories.content | from_json)
+          }}
+      changed_when: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when: (qbittorrent_categories | default([]) | length) > 0
+
+    - name: Create missing qBittorrent categories
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/torrents/createCategory"
+        method: POST
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        body_format: form-urlencoded
+        body:
+          category: "{{ item.name }}"
+          savePath: "{{ item.save_path | default('') }}"
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      loop: "{{ qbittorrent_categories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when:
+        - (qbittorrent_categories | default([]) | length) > 0
+        - item.name not in qbittorrent_api_current_categories_json
+
+    - name: Edit qBittorrent category save paths
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/torrents/editCategory"
+        method: POST
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        body_format: form-urlencoded
+        body:
+          category: "{{ item.name }}"
+          savePath: "{{ desired_save_path }}"
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      loop: "{{ qbittorrent_categories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        desired_save_path: "{{ item.save_path | default('') }}"
+        current_category: "{{ qbittorrent_api_current_categories_json[item.name] | default({}) }}"
+        current_save_path: "{{ current_category.get('savePath', '') }}"
+        # qBittorrent returns JSON null (not "") for an unset download_path override,
+        # and dict.get()'s default only applies when the key is absent, not when its
+        # value is null — normalize null to '' explicitly.
+        current_download_path: "{{ current_category.get('download_path', '') | default('', true) }}"
+      changed_when: true
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when:
+        - (qbittorrent_categories | default([]) | length) > 0
+        - item.name in qbittorrent_api_current_categories_json
+        - current_save_path != desired_save_path or (desired_save_path == '' and current_download_path != '')
+
+    - name: Read qBittorrent categories after management
+      ansible.builtin.uri:
+        url: "{{ qbittorrent_api_url }}/api/v2/torrents/categories"
+        method: GET
+        headers:
+          Cookie: "{{ qbittorrent_api_login.cookies_string }}"
+        return_content: true
+        status_code: 200
+        timeout: "{{ qbittorrent_api_request_timeout }}"
+      register: qbittorrent_api_verify_categories
+      changed_when: false
+      # Read-only GET; check mode needs it to report what would change.
+      check_mode: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when: (qbittorrent_categories | default([]) | length) > 0
+
+    - name: Verify managed qBittorrent category save paths
+      ansible.builtin.assert:
+        that:
+          - item.name in qbittorrent_api_verify_categories_json
+          - qbittorrent_api_verify_categories_json[item.name].get('savePath', '') == (item.save_path | default(''))
+          - (item.save_path | default('')) != '' or (qbittorrent_api_verify_categories_json[item.name].get('download_path', '') | default('', true)) == ''
+        fail_msg: "qBittorrent category {{ item.name }} does not match the desired save path."
+      loop: "{{ qbittorrent_categories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        qbittorrent_api_verify_categories_json: >-
+          {{
+            qbittorrent_api_verify_categories.json
+            | default(qbittorrent_api_verify_categories.content | from_json)
+          }}
+      changed_when: false
+      no_log: "{{ qbittorrent_api_no_log }}"
+      when: (qbittorrent_categories | default([]) | length) > 0

@@ -1,0 +1,14 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+reverse_proxy_lxc_vmid       = 162
+reverse_proxy_lxc_name       = "01-reverse-proxy-lxc"
+reverse_proxy_lxc_ip_address = "192.168.1.4/24"
+reverse_proxy_lxc_gateway    = "192.168.1.1"
+reverse_proxy_lxc_username   = "toomhorvath"

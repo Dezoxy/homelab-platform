@@ -1,0 +1,50 @@
+entryPoints:
+  web:
+    address: ":{{ traefik_http_port }}"
+{% if traefik_enable_tls | default(false) and traefik_redirect_web_to_websecure | default(false) %}
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+{% endif %}
+  metrics:
+    address: ":{{ traefik_metrics_port }}"
+{% if traefik_enable_tls | default(false) %}
+  websecure:
+    address: ":{{ traefik_https_port }}"
+{% endif %}
+providers:
+  file:
+    directory: "{{ traefik_dynamic_dir }}"
+    watch: true
+{% if traefik_enable_tls | default(false) %}
+certificatesResolvers:
+  {{ traefik_acme_resolver }}:
+    acme:
+      email: "{{ traefik_acme_email }}"
+      storage: "{{ traefik_data_dir }}/acme.json"
+      dnsChallenge:
+        provider: cloudflare
+{% if traefik_acme_dns_resolvers | default([]) | length > 0 %}
+        resolvers:
+{% for acme_resolver in traefik_acme_dns_resolvers %}
+          - {{ acme_resolver | to_json }}
+{% endfor %}
+{% endif %}
+{% endif %}
+api:
+  dashboard: true
+metrics:
+  prometheus:
+    entryPoint: metrics
+tracing:
+  serviceName: "{{ traefik_tracing_service_name }}"
+  sampleRate: {{ traefik_tracing_sample_rate }}
+  otlp:
+    grpc:
+      endpoint: "{{ traefik_otlp_grpc_endpoint }}"
+      insecure: true
+log:
+  level: INFO
+accessLog: {}

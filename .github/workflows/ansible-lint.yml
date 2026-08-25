@@ -1,0 +1,53 @@
+name: CI / Ansible Lint
+on:
+  pull_request:
+    paths:
+      - "ansible/**"
+      - "scripts/ci/build_attested_ssh_known_hosts.py"
+      - "scripts/ci/validate_ssh_known_hosts.py"
+      - "scripts/ci/versions.sh"
+      - ".github/workflows/ansible-lint.yml"
+  # Post-merge safety net: PR checks can be merged past while still pending.
+  push:
+    branches: [main]
+    paths:
+      - "ansible/**"
+      - "scripts/ci/build_attested_ssh_known_hosts.py"
+      - "scripts/ci/validate_ssh_known_hosts.py"
+      - "scripts/ci/versions.sh"
+      - ".github/workflows/ansible-lint.yml"
+  workflow_call: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs, but never cancel a main validation: two quick
+  # merges would otherwise leave the first commit silently unvalidated, which
+  # is the exact gap this push trigger exists to close.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ansible-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate SSH root trust and guest attestation metadata
+        shell: bash
+        run: python3 scripts/ci/validate_ssh_known_hosts.py
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Install Ansible + ansible-lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --quiet "ansible==${ANSIBLE_VERSION}" "ansible-lint==${ANSIBLE_LINT_VERSION}"
+          ansible-galaxy collection install -r ansible/requirements.yml -p ~/.ansible/collections
+
+      - name: Run ansible-lint
+        shell: bash
+        working-directory: ansible
+        run: ansible-lint

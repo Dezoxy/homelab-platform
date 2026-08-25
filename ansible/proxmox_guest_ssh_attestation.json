@@ -1,0 +1,46 @@
+{
+  "01-myapps-vm": {
+    "kind": "vm",
+    "vmid": 151
+  },
+  "01-unifi-vm": {
+    "kind": "vm",
+    "vmid": 152
+  },
+  "01-edge-lxc": {
+    "kind": "lxc",
+    "vmid": 160
+  },
+  "01-dns-lxc": {
+    "kind": "lxc",
+    "vmid": 161
+  },
+  "01-reverse-proxy-lxc": {
+    "kind": "lxc",
+    "vmid": 162
+  },
+  "01-tailscale-lxc": {
+    "kind": "lxc",
+    "vmid": 165
+  },
+  "01-torrent-lxc": {
+    "kind": "lxc",
+    "vmid": 171
+  },
+  "01-backup-lxc": {
+    "kind": "lxc",
+    "vmid": 173
+  },
+  "01-observability-lxc": {
+    "kind": "lxc",
+    "vmid": 174
+  },
+  "01-media-vm": {
+    "kind": "vm",
+    "vmid": 150
+  },
+  "01-code-lxc": {
+    "kind": "lxc",
+    "vmid": 176
+  }
+}

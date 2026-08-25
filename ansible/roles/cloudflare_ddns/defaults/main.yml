@@ -1,0 +1,40 @@
+---
+# Cloudflare DDNS updater.
+#
+# Keeps one grey-clouded A record pointed at this site's WAN IP. Written for
+# unifi-inform.example.net (see docs/unifi.md): the remote UniFi APs resolve
+# that name to reach the controller, so a stale record means all three APs go
+# offline and stay offline until it is corrected — and the first person to
+# notice would be a family member, not a monitor.
+#
+# The record itself is declared in the toom-edge repo (unifi.tf) with
+# lifecycle.ignore_changes on content: Terraform owns the record's existence
+# and grey-cloud/TTL shape, this updater owns its value.
+
+cloudflare_ddns_enabled: true
+
+cloudflare_ddns_bin: /usr/local/bin/cloudflare-ddns.sh
+cloudflare_ddns_env_file: /etc/default/cloudflare-ddns
+cloudflare_ddns_state_dir: /var/lib/cloudflare-ddns
+
+# Zone ID for example.net. Not a secret (it appears in the toom-edge import
+# blocks); the API token is what needs protecting.
+cloudflare_ddns_zone_id: ""
+cloudflare_ddns_record_name: ""
+
+# Injected at runtime from Key Vault (UNIFI_DDNS_CF_API_TOKEN). A DEDICATED
+# token scoped to Zone:DNS:Edit on example.net only -- deliberately not the
+# CLOUDFLARE_DNS_API_TOKEN the Traefik ACME flow uses, so a compromise here
+# cannot rewrite DNS on the primary zone.
+cloudflare_ddns_api_token: ""
+
+# Every 5 minutes. The record's TTL is 60s, so this interval -- not DNS -- is
+# what actually bounds the outage after an IP change.
+cloudflare_ddns_interval: "5min"
+
+# curl-able endpoints that echo the caller's public IP, tried in order. Two
+# independent providers: if the first is down, a single-source setup would
+# either fail closed (no updates, silent drift) or -- worse -- write garbage.
+cloudflare_ddns_ip_sources:
+  - "https://cloudflare.com/cdn-cgi/trace"
+  - "https://api.ipify.org"

@@ -1,0 +1,66 @@
+---
+# Docker configuration for qbittorrent
+docker_group_users:
+  - toomhorvath
+  - runner
+docker_base_packages_extra:
+  - util-linux
+docker_mount_wait_paths:
+  - "{{ qbittorrent_config_dir }}"
+  - "{{ qbittorrent_completed_dir }}"
+  - "{{ qbittorrent_staging_mount }}"
+
+# fstrim systemd paths
+staging_fstrim_service_path: /etc/systemd/system/staging-fstrim.service
+staging_fstrim_timer_path: /etc/systemd/system/staging-fstrim.timer
+staging_fstrim_binary: /usr/sbin/fstrim
+
+# Container image and version
+qbittorrent_image: linuxserver/qbittorrent:version-5.2.3_v2.0.14
+qbittorrent_timezone: Europe/Budapest
+qbittorrent_puid: 1000
+qbittorrent_pgid: 1000
+
+# Networking
+qbittorrent_webui_port: 8080
+qbittorrent_torrent_port: 57324
+
+# Paths
+qbittorrent_compose_dir: /opt/qbittorrent
+qbittorrent_config_dir: /srv/appdata/qbittorrent
+
+# Storage
+qbittorrent_staging_mount: /srv/torrent-staging
+qbittorrent_incomplete_dir: /srv/torrent-staging/incomplete
+qbittorrent_completed_dir: /srv/media/downloads
+
+# Service control
+qbittorrent_update_images: true
+qbittorrent_manage_services: true
+
+# Config file management
+# Path to qBittorrent.conf on the host (written by the container on shutdown).
+qbittorrent_conf_path: "{{ qbittorrent_config_dir }}/qBittorrent/qBittorrent.conf"
+# List of {key, value} pairs to inject into [Preferences].
+# The container is stopped before editing and restarted after, but only when
+# a value actually differs from what is already on disk.
+qbittorrent_conf_settings: []
+
+# Web API management
+# Use this for live qBittorrent state that is awkward or unsafe to edit directly
+# in qBittorrent.conf, especially categories.
+qbittorrent_api_url: "http://127.0.0.1:{{ qbittorrent_webui_port }}"
+qbittorrent_api_username: ""
+qbittorrent_api_password: ""
+qbittorrent_api_no_log: true
+qbittorrent_api_request_timeout: 30
+
+# Dict of qBittorrent Web API preference keys to enforce via
+# /api/v2/app/setPreferences.
+qbittorrent_api_preferences: {}
+
+# List of managed categories:
+#   - name: tv-sonarr
+#     save_path: ""
+# Empty save_path means the category inherits the global save/temp paths.
+qbittorrent_categories: []

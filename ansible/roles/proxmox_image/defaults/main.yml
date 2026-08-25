@@ -1,0 +1,5 @@
+---
+# VM template builds run on the Ansible controller through Packer. Keep this
+# enabled for the real ensure path; disable it for a read-only missing-template
+# check that should stop before a build.
+proxmox_image_build_missing_vm_template: true

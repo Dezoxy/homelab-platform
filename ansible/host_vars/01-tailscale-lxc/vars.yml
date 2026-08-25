@@ -1,0 +1,12 @@
+tailscale_hostname: 01-tailscale-lxc
+tailscale_advertise_routes:
+  - 192.168.1.0/24
+tailscale_advertise_tags:
+  - tag:subnet-router
+tailscale_accept_dns: false
+tailscale_enable_ssh: false
+tailscale_enable_ipv6_forwarding: false
+
+# An auth key is required only if the persistent state does not contain an enrolled node.
+tailscale_require_auth_key: true
+tailscale_auth_key: ""

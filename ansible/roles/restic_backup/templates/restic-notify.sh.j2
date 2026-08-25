@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="{{ restic_notify_env_file }}"
+FAILED_UNIT="${1:-{{ restic_appdata_service_name }}.service}"
+
+if [ -r "${ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  set -a
+  . "${ENV_FILE}"
+  set +a
+fi
+
+NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
+NTFY_TOPIC="${NTFY_TOPIC:-}"
+NTFY_TOKEN="${NTFY_TOKEN:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+hostname="$(hostname -f 2>/dev/null || hostname)"
+ts="$(date -Is 2>/dev/null || date)"
+
+journal="$(journalctl -u "${FAILED_UNIT}" -n 120 --no-pager -o short-iso 2>/dev/null || true)"
+status="$(systemctl status "${FAILED_UNIT}" --no-pager -l 2>/dev/null || true)"
+
+title="restic backup FAILED: ${FAILED_UNIT} on ${hostname}"
+body="$(
+  cat <<EOF
+Time: ${ts}
+Host: ${hostname}
+Unit: ${FAILED_UNIT}
+
+Last logs (journalctl -n 120):
+${journal}
+
+Status (systemctl status):
+${status}
+EOF
+)"
+
+# Telegram hard-limits messages to 4096 characters; keep it comfortably under.
+truncate_telegram() {
+  local max=3900
+  if [ "{% raw %}${#body}{% endraw %}" -le "${max}" ]; then
+    printf '%s' "${body}"
+    return 0
+  fi
+  printf '%s' "${body:0:${max}}\n\n(truncated)"
+}
+
+send_ntfy() {
+  local url="${NTFY_URL%/}/${NTFY_TOPIC}"
+  local -a args
+  args=(curl -fsS -X POST -H "Title: ${title}" -H "Tags: warning,restic")
+  if [ -n "${NTFY_TOKEN}" ]; then
+    args+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+  fi
+  args+=(-d "${body}" "${url}")
+  "${args[@]}" >/dev/null 2>&1 || true
+}
+
+send_telegram() {
+  local api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+  local msg telegram_text
+  msg="$(truncate_telegram)"
+  telegram_text="${title}"$'\\n\\n'"${msg}"
+  curl -fsS -X POST "${api}" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${telegram_text}" \
+    -d "disable_web_page_preview=true" >/dev/null 2>&1 || true
+}
+
+sent=false
+if [ -n "${NTFY_TOPIC}" ]; then
+  send_ntfy
+  sent=true
+fi
+if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+  send_telegram
+  sent=true
+fi
+
+# No notification target configured; nothing to do.
+if [ "${sent}" = false ]; then
+  exit 0
+fi
+
+exit 0

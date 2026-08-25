@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "pin_policy": "Image ids are immutable pins. Add a new image id when the underlying Proxmox template archive, Packer source, or VM template identity changes.",
+  "images": {
+    "ubuntu-2604-lxc-v1": {
+      "kind": "lxc-template",
+      "os": "ubuntu",
+      "release": "26.04",
+      "proxmox_node": "pve",
+      "template_datastore_id": "local",
+      "template_file_name": "ubuntu-26.04-standard_26.04-1_amd64.tar.zst"
+    },
+    "ubuntu-2604-vm-v1": {
+      "kind": "vm-template",
+      "os": "ubuntu",
+      "release": "26.04",
+      "proxmox_node": "pve",
+      "template_vmid": 901,
+      "template_name": "tpl-ubuntu-2604-base",
+      "packer_dir": "infra-images/packer/ubuntu-2604",
+      "packer_vars": {
+        "iso_storage_pool": "local",
+        "iso_url": "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso",
+        "iso_checksum": "sha256:dec49008a71f6098d0bcfc822021f4d042d5f2db279e4d75bdd981304f1ca5d9",
+        "vm_storage_pool": "local-lvm",
+        "bridge": "vmbr0",
+        "ssh_timeout": "20m"
+      }
+    }
+  },
+  "target_policy": "Target bindings pin an immutable image id; move a target to a new pin and rebuild its guest deliberately. NOTE: 01-media-vm is pinned to ubuntu-2604-vm-v1 as its target baseline but currently still runs on the retired 24.04 template (vmid 900, deleted from Proxmox). terraform-plan therefore shows a destroy/recreate for media-vm until it is rebuilt onto 2604 \u2014 accidental apply is blocked by the media-rebuild guard (make rebuild-media).",
+  "targets": {
+    "01-myapps-vm": {
+      "kind": "vm",
+      "image": "ubuntu-2604-vm-v1"
+    },
+    "01-unifi-vm": {
+      "kind": "vm",
+      "image": "ubuntu-2604-vm-v1"
+    },
+    "01-media-vm": {
+      "kind": "vm",
+      "image": "ubuntu-2604-vm-v1"
+    },
+    "01-backup-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-dns-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-edge-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-observability-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-reverse-proxy-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-tailscale-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-torrent-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    },
+    "01-code-lxc": {
+      "kind": "lxc",
+      "image": "ubuntu-2604-lxc-v1"
+    }
+  }
+}

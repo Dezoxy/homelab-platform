@@ -1,0 +1,44 @@
+---
+profile: basic
+
+exclude_paths:
+  - .cache/
+
+# Tell ansible-lint the roles exist so playbook syntax-checks pass.
+# The role directories themselves are still linted as part of the run.
+mock_roles:
+  - adguard_home
+  - cloudflared
+  - dashboard
+  - docker
+  - media_stack
+  - nodejs
+  - observability_agent
+  - observability_stack
+  - agent_cli
+  - proxmox_image
+  - qbittorrent
+  - restic_backup
+  - tailscale
+  - traefik
+  - virtiofs_mounts
+
+# Keep module resolution independent of collection installation during lint runs.
+# Runtime/deploy environments still install the required collections explicitly.
+mock_modules:
+  - ansible.posix.authorized_key
+  - ansible.posix.mount
+  - ansible.posix.sysctl
+
+skip_list:
+  # Line length is enforced by yamllint separately if desired
+  - yaml[line-length]
+  # Some tasks intentionally use shell built-ins without Ansible equivalents
+  - command-instead-of-module
+  # Role vars use short descriptive names rather than the verbose role-prefixed form
+  - var-naming[no-role-prefix]
+  # site.yml uses import_playbook which has no play-level name field
+  - name[play]
+
+warn_list:
+  - experimental

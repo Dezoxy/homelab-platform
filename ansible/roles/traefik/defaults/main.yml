@@ -1,0 +1,65 @@
+---
+base_packages:
+  - ca-certificates
+  - curl
+  - tar
+  - libcap2-bin
+
+traefik_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armv7
+
+traefik_version: latest
+traefik_user: traefik
+traefik_group: traefik
+traefik_install_dir: /usr/local/bin
+
+traefik_config_dir: /etc/traefik
+traefik_dynamic_dir: /etc/traefik/dynamic
+traefik_data_dir: /var/lib/traefik
+
+traefik_insecure_transport_name: insecure-skip-verify
+traefik_enable_dashboard: true
+traefik_dashboard_hosts: []
+
+traefik_http_port: 80
+traefik_https_port: 443
+traefik_metrics_port: 9101
+
+traefik_enable_tls: false
+traefik_enable_web_entrypoint_with_tls: true
+traefik_redirect_web_to_websecure: false
+traefik_acme_email: ""
+traefik_acme_resolver: letsencrypt
+traefik_tls_wildcard_domain: ""
+traefik_tls_root_domain: ""
+# Further cert domains beyond the primary wildcard above, for apps dual-homed on
+# more than one domain. Each entry is {main: <apex>, sans: [<names>]} and is
+# appended to the first router's tls.domains list, so ACME requests them all on
+# one certificate. The DNS-01 token in cloudflare.env must be able to write the
+# zone for every domain listed here, or issuance for that domain fails.
+traefik_tls_extra_domains: []
+
+# Resolvers lego queries to confirm the _acme-challenge TXT record has
+# propagated before it asks Let's Encrypt to validate. These MUST be public
+# resolvers. The LAN resolver (AdGuard, 192.168.1.3) rewrites *.example.com
+# to this reverse proxy, so it answers the challenge name with an A record and
+# never returns the TXT -- the propagation check then times out on every
+# attempt and renewal fails silently until the certificate expires. That is
+# exactly what lapsed the wildcard on 2026-08-23.
+# Deliberately ONE resolver, not a redundant list: lego requires *every*
+# resolver here to return the challenge TXT before it proceeds, so each extra
+# entry can only slow the check down or stall it. Adding 8.8.8.8 as a "backup"
+# on 2026-08-25 did exactly that -- Google still held a negative cache entry
+# for _acme-challenge.example.com from a month of failed attempts and the
+# check timed out while 1.1.1.1 already had the record. Cloudflare hosts both
+# zones, so its own resolver reflects the write almost immediately.
+traefik_acme_dns_resolvers:
+  - 1.1.1.1:53
+
+traefik_otlp_grpc_endpoint: localhost:4317
+traefik_tracing_service_name: traefik
+traefik_tracing_sample_rate: 1.0
+
+traefik_routes: []

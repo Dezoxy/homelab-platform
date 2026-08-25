@@ -1,0 +1,204 @@
+---
+# --- General ---
+media_user: toomhorvath
+
+# --- Storage (VirtIO-FS from Proxmox host) ---
+appdata_mount: /srv/appdata
+media_mount: /srv/media
+
+# Keep SQLite-backed app state on the VM's local ext4 disk. The variables that
+# drive it (homelab_local_state_root, _backup_root, _backup_script,
+# _marker_name, _paths and the schedule) now live in the shared
+# local_state_backup role, which this role imports -- 01-myapps-vm needs the
+# same SQLite-safe mirror script and two copies of it would drift.
+#
+# host_vars/01-media-vm/vars.yml still owns homelab_local_state_paths, which is
+# the part that is genuinely per-host.
+
+# --- cAdvisor ---
+cadvisor_metrics_port: 18080
+
+# --- Process ownership ---
+media_puid: "1000"
+media_pgid: "1000"
+
+# --- Compose ---
+compose_dir: /opt/homelab
+edge_network_name: edge
+# "docker": install whatever Plex Media Server build is baked into the
+# homelab_images.plex tag. Pinning an explicit PMS version here instead
+# silently drifts from that tag on every Renovate bump (Renovate only
+# tracks the image tag, not this variable) — the VM keeps running the old
+# PMS release even after the container is recreated on the new image.
+plex_server_version: docker
+plex_codecs_dir: "{{ homelab_local_state_root }}/plex-codecs"
+plex_cache_dir: "{{ homelab_local_state_root }}/plex-cache"
+plex_transcode_dir: "{{ homelab_local_state_root }}/plex-transcode"
+plex_transcode_dir_mode: "1777"
+plex_transcode_work_dir_mode: "0775"
+subtitle_sanitizer_delay_seconds: 30
+subtitle_sanitizer_auto_backup: true
+subtitle_sanitizer_language_code: hu
+subtitle_sanitizer_self_event_ignore_seconds: 10
+
+# --- Bazarr ---
+bazarr_lingarr_translation_timeout_seconds: 5400
+bazarr_custom_init_dir: "{{ compose_dir }}/bazarr-custom-cont-init.d"
+
+# --- Derived compose/Kometa paths ---
+compose_file: "{{ compose_dir }}/compose.yml"
+compose_env_file: "{{ compose_dir }}/.env"
+compose_manage_file: true
+# Kometa >= 2.4.5 opens its cache with PRAGMA journal_mode=WAL. WAL needs the
+# shared-memory segment and POSIX byte-range locks that VirtIO-FS cannot
+# provide, so every run died instantly with "disk I/O error". Kometa derives
+# the cache path from the config path (config.yml -> config.cache), so the
+# whole config dir has to sit on local ext4. Everything in it is either
+# Ansible-rendered or a regenerable cache, so it needs no backup target.
+kometa_config_path: "{{ homelab_local_state_root }}/kometa/config.yml"
+kometa_config_file: "{{ kometa_config_path }}"
+kometa_config_dir: "{{ kometa_config_path | dirname }}"
+kometa_assets_dir: "{{ kometa_config_path | dirname }}/assets"
+kometa_movies_overlay_file: "{{ kometa_config_path | dirname }}/overlays-hu-movies.yml"
+kometa_tv_overlay_file: "{{ kometa_config_path | dirname }}/overlays-hu-tv.yml"
+# What Kometa keeps on the shared appdata mount. overlays/ is ~12G of original
+# (un-overlaid) artwork backups: plain image files, no SQLite, so it stays put
+# to keep its existing backup coverage and to avoid copying 12G onto the VM
+# disk. It is bind-mounted back into the container at /config/overlays.
+kometa_shared_dir: "{{ appdata_mount }}/kometa"
+kometa_overlays_dir: "{{ kometa_shared_dir }}/overlays"
+# Nightly mirror of the local-ext4 state, and the restore source on a rebuilt
+# VM. Deliberately a sibling of kometa_shared_dir rather than inside it: the
+# mirror runs `rsync --delete`, and the host side of the container's
+# /config/overlays is an empty stub, so mirroring into kometa_shared_dir would
+# delete the live artwork. Registered in homelab_local_state_paths so restic
+# picks it up with the rest of appdata.
+kometa_state_backup_dir: "{{ homelab_local_state_backup_root }}/kometa-state"
+# Restored with force=false, so these never overwrite live local state — they
+# only fill in what a fresh VM is missing. config.yml matters most: it is the
+# only persistent store for the Plex token and TMDb key when Key Vault is not
+# supplying them, and the credential assert fails without it. config.cache
+# saves a full overlay re-apply, and UUID keeps the install identity.
+kometa_restore_files:
+  - config.yml
+  - config.cache
+  - UUID
+
+docker_base_packages_extra:
+  - inotify-tools
+  - git
+  - rsync
+docker_group_users:
+  - "{{ media_user }}"
+docker_mount_wait_paths:
+  - "{{ appdata_mount }}"
+  - "{{ media_mount }}"
+
+docker_daemon_config:
+  dns:
+    - "192.168.1.3"
+    - "1.1.1.1"
+    - "8.8.8.8"
+  # Repeated from the docker role's default: this dict replaces it wholesale,
+  # so omitting live-restore here would silently leave the media stack -- the
+  # containers a dockerd restart is most visible on -- unprotected.
+  live-restore: true
+
+# --- Lingarr ---
+lingarr_config_dir: "{{ homelab_local_state_root }}/lingarr/config"
+lingarr_db_path: "{{ lingarr_config_dir }}/local.db"
+lingarr_settings_overrides: {}
+
+# --- Kometa ---
+kometa_enabled: false
+kometa_schedule_times: "05:00|17:00"
+kometa_run_on_start: false
+kometa_plex_url: http://plex:32400
+kometa_plex_timeout: 60
+kometa_plex_verify_ssl: false
+kometa_plex_db_cache: null
+kometa_plex_clean_bundles: false
+kometa_plex_empty_trash: false
+kometa_plex_optimize: false
+kometa_tmdb_language: en
+kometa_tmdb_region: HU
+kometa_tmdb_cache_expiration: 60
+kometa_settings_run_order:
+  - operations
+  - metadata
+  - collections
+  - overlays
+kometa_settings_asset_folders: true
+kometa_settings_asset_depth: 0
+kometa_settings_create_asset_folders: false
+kometa_settings_prioritize_assets: false
+kometa_settings_dimensional_asset_rename: false
+kometa_settings_download_url_assets: false
+kometa_settings_show_missing_assets: true
+kometa_settings_show_missing_season_assets: false
+kometa_settings_show_missing_episode_assets: false
+kometa_settings_show_asset_not_needed: true
+kometa_settings_sync_mode: append
+kometa_settings_minimum_items: 1
+kometa_settings_item_refresh_delay: 0
+kometa_settings_delete_below_minimum: false
+kometa_settings_delete_not_scheduled: false
+kometa_settings_run_again_delay: 0
+kometa_settings_missing_only_released: false
+kometa_settings_only_filter_missing: false
+kometa_settings_show_unmanaged: true
+kometa_settings_show_unconfigured: true
+kometa_settings_show_filtered: false
+kometa_settings_show_unfiltered: false
+kometa_settings_show_options: false
+kometa_settings_show_missing: true
+kometa_settings_tvdb_language: default
+kometa_settings_playlist_sync_to_users: null
+kometa_settings_playlist_exclude_users: null
+kometa_settings_playlist_report: true
+kometa_settings_verify_ssl: true
+kometa_settings_overlay_artwork_filetype: webp_lossy
+kometa_settings_overlay_artwork_quality: 90
+kometa_hu_movie_language_values:
+  - hu
+kometa_hu_show_language_values:
+  - hu
+kometa_hu_show_threshold_percent: 90
+kometa_hu_season_threshold_percent: 90
+kometa_hu_enable_season_overlays: true
+kometa_hu_enable_episode_overlays: true
+kometa_hu_overlay_audio_text: "SZINKRONOS"
+kometa_hu_overlay_subtitle_text: "FELIRATOS"
+kometa_hu_overlay_none_text: "EREDETI"
+kometa_hu_overlay_horizontal_align: left
+kometa_hu_overlay_horizontal_offset: 28
+kometa_hu_overlay_vertical_align: top
+kometa_hu_overlay_vertical_offset: 28
+kometa_hu_overlay_font_size: 60
+kometa_hu_overlay_font_color: "#FFFFFF"
+kometa_hu_overlay_back_radius: 30
+kometa_hu_overlay_back_padding: 18
+kometa_hu_overlay_hu_back_color: "#0A5D46E0"
+kometa_hu_overlay_sub_back_color: "#1F4E89E0"
+kometa_hu_overlay_no_hu_back_color: "#9C1C1CEE"
+kometa_libraries: []
+
+# --- Container images ---
+homelab_images:
+  lingarr: lingarr/lingarr:1.3.0
+  kometa: kometateam/kometa:v2.4.8
+  prowlarr: lscr.io/linuxserver/prowlarr:2.5.2
+  radarr: lscr.io/linuxserver/radarr:6.3.0
+  sonarr: lscr.io/linuxserver/sonarr:4.0.19
+  bazarr: lscr.io/linuxserver/bazarr:1.6.0
+  tautulli: lscr.io/linuxserver/tautulli:2.17.2
+  seerr: ghcr.io/seerr-team/seerr:v3.4.1
+  plex: lscr.io/linuxserver/plex:1.43.3@sha256:f6c58cb2f5e41cd1397bf2ed4e61ef63bd86e0736841b3ef426fabfe04606293
+
+# --- Compose pull retry settings ---
+homelab_compose_pull_retries: 3
+homelab_compose_pull_retry_delay: 20
+homelab_compose_pull_timeout: 1800
+homelab_compose_up_timeout: 1800
+homelab_update_images: false
+homelab_manage_services: true

@@ -1,0 +1,11 @@
+[Unit]
+Description=withings-sync failure notification
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists={{ myapps_notify_script }}
+
+[Service]
+Type=oneshot
+# Same dedicated health bot as garmin-sync: this is scale data feeding the
+# same pipeline, and the journal tail can include weigh-in dates and values.
+ExecStart={{ myapps_notify_script }} withings-sync.service {{ myapps_garmin_health_notify_env_file }}

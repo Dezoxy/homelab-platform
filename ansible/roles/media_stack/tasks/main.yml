@@ -1,0 +1,615 @@
+---
+- name: Mount VirtIO-FS shares
+  ansible.builtin.import_role:
+    name: virtiofs_mounts
+
+- name: Install Docker
+  ansible.builtin.import_role:
+    name: docker
+
+- name: Assert mount paths are safe
+  ansible.builtin.assert:
+    that:
+      - appdata_mount is match('^/.+')
+      - media_mount is match('^/.+')
+      - appdata_mount != "/"
+      - media_mount != "/"
+    fail_msg: "Invalid mount paths. Refusing to continue with appdata_mount={{ appdata_mount }} media_mount={{ media_mount }}."
+
+- name: Install subtitle sanitizer helper
+  ansible.builtin.copy:
+    src: sanitize-srt
+    dest: /usr/local/bin/sanitize-srt
+    mode: "0755"
+  register: sanitize_srt_copy
+
+- name: Install subtitle watcher helper
+  ansible.builtin.copy:
+    src: watch-subtitles
+    dest: /usr/local/bin/watch-subtitles
+    mode: "0755"
+  register: watch_subtitles_copy
+
+- name: Install Hungarian subtitle fixer helper
+  ansible.builtin.copy:
+    src: fix-hu-subs
+    dest: /usr/local/bin/fix-hu-subs
+    mode: "0755"
+
+- name: Ensure compose directory
+  ansible.builtin.file:
+    path: "{{ compose_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Validate Bazarr Lingarr translation timeout
+  ansible.builtin.assert:
+    that:
+      - bazarr_lingarr_translation_timeout_seconds | int >= 60
+      - bazarr_lingarr_translation_timeout_seconds | int <= 86400
+    fail_msg: >-
+      bazarr_lingarr_translation_timeout_seconds must be between 60 and 86400 seconds.
+
+- name: Ensure Bazarr custom init directory
+  ansible.builtin.file:
+    path: "{{ bazarr_custom_init_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install Bazarr Lingarr timeout custom init script
+  ansible.builtin.copy:
+    src: bazarr-lingarr-timeout
+    dest: "{{ bazarr_custom_init_dir }}/90-bazarr-lingarr-timeout"
+    mode: "0755"
+  register: bazarr_lingarr_timeout_init_copy
+
+- name: Create Kometa config folders
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ kometa_config_dir }}"
+    - "{{ kometa_assets_dir }}"
+    # Lives on the shared mount, not under kometa_config_dir — see defaults.
+    - "{{ kometa_overlays_dir }}"
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Check for Kometa state in the appdata mirror
+  ansible.builtin.stat:
+    path: "{{ kometa_state_backup_dir }}/{{ item }}"
+  loop: "{{ kometa_restore_files }}"
+  register: kometa_mirrored_state
+  when: (kometa_enabled | default(false)) | bool
+
+# No-op once local state exists: force=false never overwrites a live file, so
+# this only restores what a rebuilt VM is missing.
+- name: Restore Kometa state from the appdata mirror
+  ansible.builtin.copy:
+    src: "{{ kometa_state_backup_dir }}/{{ item.item }}"
+    dest: "{{ kometa_config_dir }}/{{ item.item }}"
+    remote_src: true
+    force: false
+    mode: "0644"
+  loop: "{{ kometa_mirrored_state.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not (item.skipped | default(false))
+    - item.stat.exists | default(false)
+
+- name: Check for existing Kometa config file
+  ansible.builtin.stat:
+    path: "{{ kometa_config_file }}"
+  register: kometa_config_file_stat
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Read existing Kometa config file
+  ansible.builtin.slurp:
+    path: "{{ kometa_config_file }}"
+  register: kometa_config_file_content
+  no_log: true
+  when:
+    - (kometa_enabled | default(false)) | bool
+    - kometa_config_file_stat.stat.exists | default(false)
+
+- name: Parse existing Kometa config file
+  ansible.builtin.set_fact:
+    kometa_config_existing: "{{ (kometa_config_file_content.content | default('') | b64decode | from_yaml) if (kometa_config_file_stat.stat.exists | default(false)) else {} }}"
+  no_log: true
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Derive runtime Kometa credentials
+  ansible.builtin.set_fact:
+    kometa_plex_token_runtime: >-
+      {{
+        (kometa_plex_token_effective | default('') | trim)
+        or
+        (
+          (
+            (
+              kometa_config_existing.plex.token
+              if (
+                kometa_config_existing is mapping and
+                kometa_config_existing.plex is defined and
+                kometa_config_existing.plex is mapping and
+                kometa_config_existing.plex.token is defined
+              )
+              else ''
+            )
+            | string
+          ).splitlines()
+          | first
+          | default('')
+          | trim
+        )
+      }}
+    kometa_tmdb_apikey_runtime: >-
+      {{
+        (kometa_tmdb_apikey_effective | default('') | trim)
+        or
+        (
+          (
+            (
+              kometa_config_existing.tmdb.apikey
+              if (
+                kometa_config_existing is mapping and
+                kometa_config_existing.tmdb is defined and
+                kometa_config_existing.tmdb is mapping and
+                kometa_config_existing.tmdb.apikey is defined
+              )
+              else ''
+            )
+            | string
+          ).splitlines()
+          | first
+          | default('')
+          | trim
+        )
+      }}
+  no_log: true
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Validate Kometa configuration
+  ansible.builtin.assert:
+    that:
+      - kometa_plex_url | default('') | trim | length > 0
+      - kometa_plex_token_runtime | default('') | length > 0
+      - kometa_tmdb_apikey_runtime | default('') | length > 0
+      - (kometa_libraries | default([])) | length > 0
+    fail_msg: >-
+      Kometa is enabled, but required settings are missing. Set kometa_plex_url,
+      kometa_plex_token, kometa_tmdb_apikey, and at least one kometa_libraries
+      entry before deployment. GitHub Actions can provide the secrets via
+      KOMETA_PLEX_TOKEN and KOMETA_TMDB_APIKEY.
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Create media folders
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ media_mount }}/downloads"
+    - "{{ media_mount }}/movies"
+    - "{{ media_mount }}/series"
+
+- name: Create Plex transcode folders
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ plex_transcode_dir }}"
+      mode: "{{ plex_transcode_dir_mode | default('1777') }}"
+    - path: "{{ plex_transcode_dir }}/Transcode"
+      mode: "{{ plex_transcode_work_dir_mode | default('0775') }}"
+    - path: "{{ plex_transcode_dir }}/Transcode/Sessions"
+      mode: "{{ plex_transcode_work_dir_mode | default('0775') }}"
+
+# The backup half -- state dirs, the SQLite-safe mirror script, its unit and
+# timer -- lives in the shared local_state_backup role so 01-myapps-vm can use
+# the same script. The RESTORE sequence below stays here: it stops and starts
+# long-running containers around the seed, which is specific to this host.
+- name: Install local state directories and mirror script
+  ansible.builtin.import_role:
+    name: local_state_backup
+    tasks_from: install
+
+- name: Render Kometa config file
+  ansible.builtin.template:
+    src: kometa-config.yml.j2
+    dest: "{{ kometa_config_file }}"
+    mode: "0644"
+    force: true
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Render Kometa movie overlay file
+  ansible.builtin.template:
+    src: kometa-overlays-hu-movies.yml.j2
+    dest: "{{ kometa_movies_overlay_file }}"
+    mode: "0644"
+    force: true
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Render Kometa TV overlay file
+  ansible.builtin.template:
+    src: kometa-overlays-hu-tv.yml.j2
+    dest: "{{ kometa_tv_overlay_file }}"
+    mode: "0644"
+    force: true
+  when: (kometa_enabled | default(false)) | bool
+
+- name: Check docker network
+  ansible.builtin.command: docker network inspect "{{ edge_network_name }}"
+  register: edge_network_check
+  changed_when: false
+  failed_when: false
+
+- name: Create docker network
+  ansible.builtin.command: docker network create "{{ edge_network_name }}"
+  changed_when: true
+  when: edge_network_check.rc != 0
+
+- name: Render homelab compose file
+  ansible.builtin.template:
+    src: "{{ compose_template_src | default('homelab-compose.yml.j2') }}"
+    dest: "{{ compose_file }}"
+    mode: "0644"
+    force: true
+  register: compose_copy
+  when: (compose_manage_file | default(true)) | bool
+
+- name: Check local state migration markers
+  ansible.builtin.stat:
+    path: "{{ item.target }}/{{ homelab_local_state_marker_name }}"
+  loop: "{{ homelab_local_state_paths }}"
+  register: homelab_local_state_markers
+  when: item.target != item.source
+
+- name: Stop services before initial local state migration
+  ansible.builtin.command:
+    cmd: "docker stop {{ item.item.service }}"
+  register: homelab_local_state_stop
+  changed_when: false
+  failed_when: false
+  loop: "{{ homelab_local_state_markers.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - not (item.stat.exists | default(false))
+
+- name: Seed local state from shared appdata
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - -a
+      - --delete
+      - --numeric-ids
+      - "{{ item.item.source }}/"
+      - "{{ item.item.target }}/"
+  changed_when: true
+  loop: "{{ homelab_local_state_markers.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - not (item.stat.exists | default(false))
+
+- name: Check migrated SQLite databases
+  ansible.builtin.shell: |
+    python3 - {{ (item.item.target ~ '/' ~ item.item.db_file) | quote }} <<'PY'
+    import sqlite3
+    import sys
+
+    db_path = sys.argv[1]
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    cur = conn.cursor()
+    result = cur.execute("PRAGMA quick_check;").fetchone()
+    conn.close()
+    if result != ("ok",):
+        raise SystemExit(f"quick_check failed: {result!r}")
+    print("ok")
+    PY
+  register: homelab_local_state_db_checks
+  changed_when: false
+  failed_when: false
+  loop: "{{ homelab_local_state_markers.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - not (item.stat.exists | default(false))
+    - item.item.db_file is defined
+
+- name: Restore corrupted local SQLite state from scheduled backups
+  ansible.builtin.shell: |
+    set -euo pipefail
+    db_path={{ (item.item.item.target ~ '/' ~ item.item.item.db_file) | quote }}
+    backup_glob={{ item.item.item.backup_glob | quote }}
+    latest_backup="$(ls -1 ${backup_glob} 2>/dev/null | sort | tail -1)"
+    if [ -z "${latest_backup}" ]; then
+      echo "No scheduled backup matched ${backup_glob}" >&2
+      exit 1
+    fi
+
+    backup_dir="${db_path}.corrupt-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "${backup_dir}"
+    for path in "${db_path}" "${db_path}-wal" "${db_path}-shm" "${db_path}-journal"; do
+      if [ -e "${path}" ]; then
+        mv "${path}" "${backup_dir}/"
+      fi
+    done
+
+    python3 - "${latest_backup}" {{ item.item.item.target | quote }} <<'PY'
+    import os
+    import sys
+    import zipfile
+
+    latest_backup, target = sys.argv[1], sys.argv[2]
+    with zipfile.ZipFile(latest_backup) as archive:
+        for member in archive.namelist():
+            if member.endswith('/'):
+                continue
+            destination = os.path.join(target, os.path.basename(member))
+            with archive.open(member) as src, open(destination, 'wb') as dst:
+                dst.write(src.read())
+    PY
+  changed_when: true
+  loop: "{{ homelab_local_state_db_checks.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - item.item.item.backup_glob is defined
+    - (item.rc | default(0)) != 0
+
+- name: Verify migrated SQLite databases after any backup restore
+  ansible.builtin.shell: |
+    python3 - {{ (item.item.item.target ~ '/' ~ item.item.item.db_file) | quote }} <<'PY'
+    import sqlite3
+    import sys
+
+    db_path = sys.argv[1]
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    cur = conn.cursor()
+    result = cur.execute("PRAGMA quick_check;").fetchone()
+    conn.close()
+    if result != ("ok",):
+        raise SystemExit(f"quick_check failed: {result!r}")
+    print("ok")
+    PY
+  changed_when: false
+  loop: "{{ homelab_local_state_db_checks.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.rc | default(0)) != 0
+
+- name: Mark local state migrations complete
+  ansible.builtin.copy:
+    dest: "{{ item.item.target }}/{{ homelab_local_state_marker_name }}"
+    content: "ok\n"
+    owner: "{{ item.item.owner }}"
+    group: "{{ item.item.group }}"
+    mode: "0644"
+  loop: "{{ homelab_local_state_markers.results | default([]) }}"
+  when:
+    - not (item.skipped | default(false))
+    - not (item.stat.exists | default(false))
+
+- name: Install homelab compose systemd unit
+  ansible.builtin.template:
+    src: homelab-compose.service.j2
+    dest: /etc/systemd/system/homelab-compose.service
+    mode: "0644"
+
+- name: Install subtitle watcher systemd unit
+  ansible.builtin.template:
+    src: watch-subtitles.service.j2
+    dest: /etc/systemd/system/subtitle-sanitizer-watch.service
+    mode: "0644"
+  register: subtitle_watch_unit_copy
+
+# After the restore block above, never before -- see units.yml for why.
+- name: Install and enable the local state backup units
+  ansible.builtin.import_role:
+    name: local_state_backup
+    tasks_from: units
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Check compose file
+  ansible.builtin.stat:
+    path: "{{ compose_file }}"
+  register: compose_stat
+
+- name: Enable homelab-compose service
+  ansible.builtin.systemd:
+    name: homelab-compose
+    enabled: true
+  when: compose_stat.stat.exists and (homelab_manage_services | bool)
+
+- name: Enable and start subtitle watcher service
+  ansible.builtin.systemd:
+    name: subtitle-sanitizer-watch
+    enabled: true
+    state: started
+  when: homelab_manage_services | bool
+
+- name: Restart subtitle watcher service when unit or scripts changed
+  ansible.builtin.systemd:
+    name: subtitle-sanitizer-watch
+    state: restarted
+  when: >-
+    (homelab_manage_services | bool)
+    and ((subtitle_watch_unit_copy.changed | default(false))
+         or (watch_subtitles_copy.changed | default(false))
+         or (sanitize_srt_copy.changed | default(false)))
+
+- name: Pull homelab images for pinned versions
+  ansible.builtin.command:
+    cmd: "/usr/bin/docker compose -f {{ compose_file }} pull"
+  args:
+    chdir: "{{ compose_dir }}"
+  register: homelab_compose_pull
+  changed_when: false
+  retries: "{{ homelab_compose_pull_retries | default(3) | int }}"
+  delay: "{{ homelab_compose_pull_retry_delay | default(20) | int }}"
+  until: homelab_compose_pull.rc == 0
+  async: "{{ homelab_compose_pull_timeout | default(1800) }}"
+  poll: 15
+  when:
+    - compose_stat.stat.exists
+    - (homelab_update_images | default(false)) | bool
+
+- name: Ensure homelab compose stack is running
+  ansible.builtin.command:
+    cmd: "/usr/bin/docker compose -f {{ compose_file }} up -d --remove-orphans"
+  args:
+    chdir: "{{ compose_dir }}"
+  register: homelab_compose_up
+  async: "{{ homelab_compose_up_timeout | default(1800) }}"
+  poll: 15
+  changed_when: >-
+    (
+      'Recreated' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Recreating' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Created' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Creating' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Started' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Restarting' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Removing' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+      or 'Removed' in ((homelab_compose_up.stdout | default('')) + (homelab_compose_up.stderr | default('')))
+    )
+  when:
+    - compose_stat.stat.exists
+    - homelab_manage_services | bool
+
+- name: Restart Bazarr after custom init script changes
+  ansible.builtin.command:
+    cmd: docker restart bazarr
+  changed_when: true
+  when:
+    - homelab_manage_services | bool
+    - bazarr_lingarr_timeout_init_copy.changed | default(false)
+    - not (homelab_compose_up.changed | default(false))
+
+- name: Gather service facts after homelab compose reconciliation
+  ansible.builtin.service_facts:
+  when: compose_stat.stat.exists and (homelab_manage_services | bool)
+
+- name: Restart cAdvisor after homelab container changes
+  ansible.builtin.systemd:
+    name: cadvisor
+    state: restarted
+  when:
+    - compose_stat.stat.exists
+    - homelab_manage_services | bool
+    - (homelab_compose_up.changed | default(false)) or (compose_copy.changed | default(false))
+    - "'cadvisor.service' in ansible_facts.services"
+
+- name: Wait for cAdvisor after homelab container changes
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ cadvisor_metrics_port }}/metrics"
+    method: GET
+    status_code: 200
+    return_content: false
+  register: media_cadvisor_metrics_ready
+  changed_when: false
+  retries: 24
+  delay: 5
+  until: media_cadvisor_metrics_ready.status == 200
+  when:
+    - compose_stat.stat.exists
+    - homelab_manage_services | bool
+    - (homelab_compose_up.changed | default(false)) or (compose_copy.changed | default(false))
+    - "'cadvisor.service' in ansible_facts.services"
+
+- name: Restart Alloy after homelab container changes
+  ansible.builtin.systemd:
+    name: alloy
+    state: restarted
+  when:
+    - compose_stat.stat.exists
+    - homelab_manage_services | bool
+    - (homelab_compose_up.changed | default(false)) or (compose_copy.changed | default(false))
+    - "'alloy.service' in ansible_facts.services"
+
+- name: Check Lingarr settings database
+  ansible.builtin.stat:
+    path: "{{ lingarr_db_path }}"
+  register: lingarr_db_stat
+  when: (lingarr_settings_overrides | default({}) | length) > 0
+
+- name: Fail when Lingarr settings overrides are configured but the database is missing
+  ansible.builtin.fail:
+    msg: >-
+      Lingarr settings overrides are configured, but {{ lingarr_db_path }} does not exist.
+      Ensure the Lingarr container has started and initialized its config volume before applying overrides.
+  when:
+    - (lingarr_settings_overrides | default({}) | length) > 0
+    - not lingarr_db_stat.stat.exists
+
+- name: Apply Lingarr settings overrides
+  ansible.builtin.shell: |
+    python3 - <<'PY'
+    import json
+    import sqlite3
+
+    db_path = {{ lingarr_db_path | to_json }}
+    desired = json.loads({{ lingarr_settings_overrides | to_json | to_json }})
+
+    def normalize(value):
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value)
+
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    cur = conn.cursor()
+
+    changed = []
+    for key, value in desired.items():
+        value = normalize(value)
+        row = cur.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            cur.execute("INSERT INTO settings(key, value) VALUES(?, ?)", (key, value))
+            changed.append(key)
+        elif row[0] != value:
+            cur.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
+            changed.append(key)
+
+    if changed:
+        conn.commit()
+        print("changed")
+        for key in changed:
+            print(key)
+    else:
+        print("ok")
+    PY
+  register: lingarr_settings_apply
+  changed_when: (lingarr_settings_apply.stdout_lines | default([])) | first == "changed"
+  when:
+    - (lingarr_settings_overrides | default({}) | length) > 0
+    - lingarr_db_stat.stat.exists
+
+- name: Restart Lingarr after settings overrides change
+  ansible.builtin.command:
+    cmd: docker restart lingarr
+  register: lingarr_restart
+  changed_when: lingarr_restart.rc == 0
+  when:
+    - lingarr_settings_apply is changed
+
+- name: Refresh local state backup mirror after media reconciliation
+  ansible.builtin.systemd:
+    name: homelab-local-state-backup.service
+    state: started
+  when: homelab_manage_services | bool
+
+- name: Mark homelab-compose service as started
+  ansible.builtin.systemd:
+    name: homelab-compose
+    state: started
+  when: compose_stat.stat.exists and (homelab_manage_services | bool)

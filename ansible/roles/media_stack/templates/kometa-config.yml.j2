@@ -1,0 +1,96 @@
+# Managed by Ansible. Edit ansible/host_vars/01-media-vm.yml.
+
+settings:
+  cache: true
+  cache_expiration: 60
+  asset_directory:
+    - /config/assets
+  save_report: true
+  run_order: {{ kometa_settings_run_order | default(['operations', 'metadata', 'collections', 'overlays']) | to_json }}
+  asset_folders: {{ kometa_settings_asset_folders | default(true) | to_json }}
+  asset_depth: {{ kometa_settings_asset_depth | default(0) }}
+  create_asset_folders: {{ kometa_settings_create_asset_folders | default(false) | to_json }}
+  prioritize_assets: {{ kometa_settings_prioritize_assets | default(false) | to_json }}
+  dimensional_asset_rename: {{ kometa_settings_dimensional_asset_rename | default(false) | to_json }}
+  download_url_assets: {{ kometa_settings_download_url_assets | default(false) | to_json }}
+  show_missing_assets: {{ kometa_settings_show_missing_assets | default(true) | to_json }}
+  show_missing_season_assets: {{ kometa_settings_show_missing_season_assets | default(false) | to_json }}
+  show_missing_episode_assets: {{ kometa_settings_show_missing_episode_assets | default(false) | to_json }}
+  show_asset_not_needed: {{ kometa_settings_show_asset_not_needed | default(true) | to_json }}
+  sync_mode: {{ kometa_settings_sync_mode | default('append') | to_json }}
+  minimum_items: {{ kometa_settings_minimum_items | default(1) }}
+  item_refresh_delay: {{ kometa_settings_item_refresh_delay | default(0) }}
+  delete_below_minimum: {{ kometa_settings_delete_below_minimum | default(false) | to_json }}
+  delete_not_scheduled: {{ kometa_settings_delete_not_scheduled | default(false) | to_json }}
+  run_again_delay: {{ kometa_settings_run_again_delay | default(0) }}
+  missing_only_released: {{ kometa_settings_missing_only_released | default(false) | to_json }}
+  only_filter_missing: {{ kometa_settings_only_filter_missing | default(false) | to_json }}
+  show_unmanaged: {{ kometa_settings_show_unmanaged | default(true) | to_json }}
+  show_unconfigured: {{ kometa_settings_show_unconfigured | default(true) | to_json }}
+  show_filtered: {{ kometa_settings_show_filtered | default(false) | to_json }}
+  show_unfiltered: {{ kometa_settings_show_unfiltered | default(false) | to_json }}
+  show_options: {{ kometa_settings_show_options | default(false) | to_json }}
+  show_missing: {{ kometa_settings_show_missing | default(true) | to_json }}
+  tvdb_language: {{ kometa_settings_tvdb_language | default('default') | to_json }}
+  playlist_sync_to_users: {{ kometa_settings_playlist_sync_to_users | default(None) | to_json }}
+  playlist_exclude_users: {{ kometa_settings_playlist_exclude_users | default(None) | to_json }}
+  playlist_report: {{ kometa_settings_playlist_report | default(true) | to_json }}
+  verify_ssl: {{ kometa_settings_verify_ssl | default(true) | to_json }}
+  overlay_artwork_filetype: {{ kometa_settings_overlay_artwork_filetype | default('webp_lossy') | to_json }}
+  overlay_artwork_quality: {{ kometa_settings_overlay_artwork_quality | default(90) }}
+
+plex:
+  url: {{ kometa_plex_url | to_json }}
+  token: {{ (kometa_plex_token_runtime | default(kometa_plex_token_effective | default(kometa_plex_token))) | to_json }}
+  timeout: {{ kometa_plex_timeout | default(60) }}
+  verify_ssl: {{ kometa_plex_verify_ssl | default(None) | to_json }}
+  db_cache: {{ kometa_plex_db_cache | default(None) | to_json }}
+  clean_bundles: {{ kometa_plex_clean_bundles | default(false) | to_json }}
+  empty_trash: {{ kometa_plex_empty_trash | default(false) | to_json }}
+  optimize: {{ kometa_plex_optimize | default(false) | to_json }}
+
+tmdb:
+  apikey: {{ (kometa_tmdb_apikey_runtime | default(kometa_tmdb_apikey_effective | default(kometa_tmdb_apikey))) | to_json }}
+  language: {{ (kometa_tmdb_language | default('en')) | to_json }}
+  region: {{ (kometa_tmdb_region | default('HU')) | to_json }}
+  cache_expiration: {{ kometa_tmdb_cache_expiration | default(60) }}
+
+libraries:
+{% for library in kometa_libraries | default([]) %}
+{% set collection_defaults = library.collection_defaults | default([]) %}
+{% set collection_files = library.collection_files | default([]) %}
+{% set overlay_defaults = library.overlay_defaults | default([]) %}
+{% set overlay_files = library.overlay_files | default([]) %}
+{% set metadata_files = library.metadata_files | default([]) %}
+{% set hu_overlay_profile = library.hu_overlay_profile | default('') %}
+  {{ library.name | to_json }}:
+{% if (collection_defaults | length) > 0 or (collection_files | length) > 0 %}
+    collection_files:
+{% for name in collection_defaults %}
+      - default: {{ name | to_json }}
+{% endfor %}
+{% for path in collection_files %}
+      - file: {{ path | to_json }}
+{% endfor %}
+{% endif %}
+{% if hu_overlay_profile == 'movie' or hu_overlay_profile == 'show' or (overlay_defaults | length) > 0 or (overlay_files | length) > 0 %}
+    overlay_files:
+{% if hu_overlay_profile == 'movie' %}
+      - file: "/config/overlays-hu-movies.yml"
+{% elif hu_overlay_profile == 'show' %}
+      - file: "/config/overlays-hu-tv.yml"
+{% endif %}
+{% for name in overlay_defaults %}
+      - default: {{ name | to_json }}
+{% endfor %}
+{% for path in overlay_files %}
+      - file: {{ path | to_json }}
+{% endfor %}
+{% endif %}
+{% if (metadata_files | length) > 0 %}
+    metadata_files:
+{% for path in metadata_files %}
+      - file: {{ path | to_json }}
+{% endfor %}
+{% endif %}
+{% endfor %}

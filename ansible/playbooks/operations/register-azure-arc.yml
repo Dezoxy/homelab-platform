@@ -1,0 +1,25 @@
+---
+- name: Register Proxmox VMs with Azure Arc
+  hosts: media_vm:myapps_vm
+  become: true
+  gather_facts: true
+  vars:
+    azure_arc_subscription_id: "{{ lookup('ansible.builtin.env', 'AZ_SUBSCRIPTION_ID') | default('', true) | trim }}"
+    azure_arc_tenant_id: "{{ lookup('ansible.builtin.env', 'AZ_TENANT_ID') | default('', true) | trim }}"
+    azure_arc_resource_group: >-
+      {{
+        (lookup('ansible.builtin.env', 'AZ_RG') | default('', true) | trim)
+        or (lookup('ansible.builtin.env', 'ARC_RESOURCE_GROUP') | default('', true) | trim)
+      }}
+    azure_arc_location: >-
+      {{
+        (lookup('ansible.builtin.env', 'AZ_LOCATION') | default('', true) | trim)
+        or (lookup('ansible.builtin.env', 'ARC_LOCATION') | default('', true) | trim)
+      }}
+    azure_arc_service_principal_id: "{{ lookup('ansible.builtin.env', 'ARC_SP_ID') | default('', true) | trim }}"
+    azure_arc_service_principal_secret: "{{ lookup('ansible.builtin.env', 'ARC_SP_SECRET') | default('', true) }}"
+
+  tasks:
+    - name: Import Azure Arc role
+      ansible.builtin.import_role:
+        name: azure_arc

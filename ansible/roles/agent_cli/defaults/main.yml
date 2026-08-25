@@ -1,0 +1,28 @@
+---
+# Agent CLIs for the code-server integrated terminal.
+#
+# A deliberately lean replacement for the 392-line role retired with
+# 01-agent-lxc in #793. That one also resolved architectures, fetched GitHub
+# releases, mounted VirtIO-FS shares and wired bash AND zsh profiles for three
+# CLIs. Almost none of that applies here: this guest is an LXC with a bind
+# mount already provided by Terraform, and it needs two CLIs on PATH with their
+# auth state somewhere durable.
+
+agent_cli_enabled: true
+agent_cli_user: toomhorvath
+
+# Auth state on the appdata bind mount, so `claude` and `codex` stay logged in
+# across a container rebuild and land in 01-backup-lxc's restic run. This is
+# the whole reason the guest has a bind mount at all.
+agent_cli_state_dir: /srv/appdata/code
+agent_claude_config_dir: "{{ agent_cli_state_dir }}/claude"
+agent_codex_home: "{{ agent_cli_state_dir }}/codex"
+
+# Pinned, and tracked by renovate.json custom managers. Unpinned `npm i -g`
+# would mean a deploy silently installing whatever shipped that morning.
+agent_claude_package: "@anthropic-ai/claude-code"
+agent_claude_version: "2.1.245"
+agent_codex_package: "@openai/codex"
+agent_codex_version: "0.149.1"
+
+agent_cli_profile_script: /etc/profile.d/agent-cli.sh

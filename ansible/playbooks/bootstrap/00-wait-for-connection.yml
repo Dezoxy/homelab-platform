@@ -1,0 +1,20 @@
+- name: Wait for selected hosts to become reachable
+  hosts: all
+  gather_facts: false
+  vars:
+    maintenance_wait_timeout: 600
+    maintenance_wait_sleep: 5
+
+  tasks:
+    - name: Announce SSH wait target
+      ansible.builtin.debug:
+        msg: >-
+          Waiting for SSH on {{ inventory_hostname }}
+          ({{ ansible_host | default(inventory_hostname) }})
+          for up to {{ maintenance_wait_timeout }} seconds
+
+    - name: Wait for SSH connectivity
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: "{{ maintenance_wait_sleep }}"
+        timeout: "{{ maintenance_wait_timeout }}"

@@ -1,0 +1,304 @@
+---
+- name: Apt update and capture upgradable packages
+  hosts: all
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+  # Declared, not merely inherited: the confirmation prompt below is a run_once
+  # task that summarises EVERY host, which only works because linear walks the
+  # whole fleet through the preceding task before starting this one. Under the
+  # free strategy it would prompt using whatever facts happened to exist yet.
+  strategy: linear
+
+  vars:
+    # Set false (-e update_confirm_disruptive=false) to skip the prompt. Only
+    # this playbook prompts: the weekly unattended run goes through
+    # bootstrap/00-upgrade-all.yml, which never reaches this file, so the gate
+    # cannot hang CI.
+    update_confirm_disruptive: true
+    # A play var, not a set_fact: it is templated at each point of use, so it
+    # reads the apt_disruptive facts as they are by then.
+    # Normalised once: the prompt is read on one delegated host, but every
+    # host's tasks branch on the answer.
+    update_answer: >-
+      {{ update_confirm.user_input | default('') | trim | lower }}
+    update_disruptive_found: >-
+      {{ ansible_play_hosts
+         | map('extract', hostvars)
+         | map(attribute='apt_disruptive', default=[])
+         | select | list | length > 0 }}
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: List upgradable packages
+      ansible.builtin.command: apt list --upgradable
+      register: upgradable_raw
+      changed_when: false
+
+    # NOTE the single backslashes. This is a folded block scalar and YAML does
+    # not process escapes inside one, so '\\.' arrives at the regex engine as a
+    # literal backslash and matches nothing -- which is precisely what it did,
+    # and why every host's section of this log used to open with a stray
+    # "Listing..." entry.
+    - name: Store upgradable package list
+      ansible.builtin.set_fact:
+        apt_upgraded: >-
+          {{ upgradable_raw.stdout_lines
+             | reject('match', '^Listing\.\.\.') | list }}
+
+    - name: Flag upgrades that disrupt running services
+      ansible.builtin.set_fact:
+        apt_disruptive: >-
+          {{ apt_upgraded | select('match', update_disruptive_regex) | list }}
+
+    # run_once + delegate_to: the linear strategy walks every host through the
+    # task above before reaching this one, so by now every apt_disruptive fact
+    # is populated and a single prompt can speak for the whole fleet.
+    - name: Confirm disruptive upgrades before touching anything
+      ansible.builtin.pause:
+        prompt: |
+          The following upgrades restart services or need a reboot:
+
+          {% for h in ansible_play_hosts | sort %}
+          {%- if hostvars[h].apt_disruptive | default([]) | length > 0 %}
+            {{ h }}
+          {%- for p in hostvars[h].apt_disruptive %}
+                {{ p.split('/')[0] }}  ->  {{ p.split()[1] }}
+          {%- endfor %}
+          {%- endif %}
+          {%- endfor %}
+
+          Proceed?
+            [y] upgrade everything
+            [s] skip the packages above, upgrade everything else
+            [n] abort, change nothing   (default)
+        echo: true
+      register: update_confirm
+      run_once: true
+      delegate_to: localhost
+      become: false
+      when:
+        - update_confirm_disruptive | bool
+        - update_disruptive_found | bool
+
+    # run_once makes a failure here fail the play for every host, so nothing is
+    # upgraded anywhere -- which is the whole point of answering "no".
+    #
+    # This also fires when there is no TTY: `pause` does not read piped stdin,
+    # it warns "stdin is not interactive" and returns an empty answer. Failing
+    # closed there is deliberate -- an unattended caller must say so explicitly
+    # rather than silently inherit a "yes".
+    - name: Abort when the upgrade is not confirmed
+      ansible.builtin.fail:
+        msg: >-
+          Aborted: disruptive upgrades were not confirmed, nothing has been
+          upgraded. Answer y when prompted, or pass
+          -e update_confirm_disruptive=false to skip the gate (which is also
+          what a non-interactive caller needs, since the prompt cannot be
+          answered without a TTY).
+      run_once: true
+      when:
+        - update_confirm_disruptive | bool
+        - update_disruptive_found | bool
+        - update_answer not in ['y', 'yes', 's', 'skip']
+
+    - name: Note which packages are being held back
+      ansible.builtin.set_fact:
+        apt_held_back: >-
+          {{ apt_disruptive | map('regex_replace', '/.*', '') | list
+             if update_answer in ['s', 'skip'] else [] }}
+
+    # apt-mark hold, rather than filtering the package list and upgrading the
+    # rest by name: a hold also keeps back anything that would DRAG a held
+    # package in as a dependency, which an explicit name list cannot do -- it
+    # would happily pull the new libc6 in to satisfy something else.
+    #
+    # always: an interrupted run must never leave packages pinned. A leftover
+    # hold is silent and indefinite -- the host would quietly stop receiving
+    # updates for exactly the packages that matter most.
+    - name: Upgrade packages, optionally holding the disruptive ones
+      block:
+        - name: Hold the disruptive packages
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: "{{ apt_held_back }}"
+
+        # autoremove is a variable so the hypervisor can opt out: see
+        # group_vars/proxmox_nodes.yml for why clearing fallback kernels there
+        # is actively unsafe. Guests keep the default.
+        - name: Upgrade all packages
+          ansible.builtin.apt:
+            upgrade: dist
+            autoremove: "{{ apt_autoremove | default(true) | bool }}"
+            autoclean: true
+      always:
+        - name: Release the holds
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop: "{{ apt_held_back }}"
+
+    - name: Check for needrestart
+      ansible.builtin.stat:
+        path: /usr/sbin/needrestart
+      register: needrestart_bin
+
+    # -r l is list-only: it reports, it never restarts. This deliberately still
+    # lists the job units that needrestart_never_restart_units tells it never to
+    # restart -- being told, and choosing when, is the entire point.
+    - name: Ask needrestart what is still pending
+      ansible.builtin.command: needrestart -b -r l
+      register: needrestart_raw
+      changed_when: false
+      failed_when: false
+      when: needrestart_bin.stat.exists
+
+    - name: Store pending service restarts
+      ansible.builtin.set_fact:
+        apt_restart_services: >-
+          {{ needrestart_raw.stdout_lines | default([])
+             | select('match', '^NEEDRESTART-SVC:')
+             | map('regex_replace', '^NEEDRESTART-SVC:\s*', '')
+             | list }}
+        apt_kernel_state: >-
+          {{ (needrestart_raw.stdout_lines | default([])
+              | select('match', '^NEEDRESTART-KSTA:')
+              | map('regex_replace', '^NEEDRESTART-KSTA:\s*', '')
+              | list | first) | default('0', true) }}
+
+    # Debian's canonical kernel comparison, and the ONLY reboot signal that
+    # works on the Proxmox host: it ships neither needrestart nor
+    # update-notifier-common, so /var/run/reboot-required is never written
+    # there and a pending kernel would otherwise go unreported forever.
+    #
+    # Self-gating on containers: an LXC has no kernel packages installed, so
+    # `linux-version list` is empty and no comparison is made -- which is
+    # correct, because `uname -r` in a container reports the HOST's kernel and
+    # comparing that to anything would be meaningless.
+    - name: Check for linux-version
+      ansible.builtin.stat:
+        path: /usr/bin/linux-version
+      register: linux_version_tool
+
+    - name: Compare the running kernel with the newest installed one
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          newest="$(linux-version list | linux-version sort --reverse | head -1)"
+          printf '%s %s\n' "$(uname -r)" "${newest:-none}"
+      register: kernel_pair
+      changed_when: false
+      failed_when: false
+      when: linux_version_tool.stat.exists
+
+    - name: Store kernel state
+      ansible.builtin.set_fact:
+        apt_kernel_running: "{{ _pair[0] | default('') }}"
+        apt_kernel_newest: "{{ _pair[1] | default('none') }}"
+      vars:
+        _pair: "{{ (kernel_pair.stdout | default('') | trim).split() }}"
+
+    # Ubuntu rolls some updates out to a percentage of machines at a time, and
+    # apt defers the rest. Those packages keep appearing under a host in this
+    # log run after run -- captured as "upgradable" before the upgrade, then
+    # deliberately not upgraded -- which reads as a host that never finishes.
+    # Marking them keeps the log honest; nothing is wrong and nothing is
+    # needed, they land on their own as Ubuntu ramps the percentage.
+    - name: Note packages deferred by Ubuntu phasing
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          deferred="$(apt-get -s dist-upgrade 2>/dev/null \
+            | awk '/deferred due to phasing/{f=1;next} f&&/^[[:space:]]/{print;next} f{exit}' \
+            | tr -s ' \n' ' ')"
+          for pkg in ${deferred}; do
+            pct="$(apt-cache policy "${pkg}" 2>/dev/null | grep -o 'phased [0-9]*%' | head -1)"
+            printf '%s|%s\n' "${pkg}" "${pct:-phased}"
+          done
+        executable: /bin/bash
+      register: apt_phased_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Store phased-deferred packages
+      ansible.builtin.set_fact:
+        apt_phased_deferred: "{{ apt_phased_raw.stdout_lines | default([]) | select | list }}"
+
+    # Reported, never acted on. autoremove is deliberately disabled on the
+    # hypervisor (see group_vars/proxmox_nodes.yml: clearing fallback kernels
+    # while an untested one is staged is the wrong order), which means old
+    # kernels accumulate there with nothing to notice. Measured 2026-08-24:
+    # 23 had piled up unseen at ~1.05 GB each -- 970 MB of module tree plus an
+    # 88 MB dracut initrd per kernel -- for 24 GB total.
+    #
+    # On guests, where autoremove runs as part of the upgrade above, this
+    # reports zero and stays quiet on its own.
+    - name: Check what autoremove would reclaim
+      ansible.builtin.shell:
+        cmd: >-
+          apt-get -s autoremove 2>/dev/null
+          | awk '/^Remv/{n++} /disk space will be freed/{f=$0} END{printf "%d|%s", n+0, f}'
+      register: apt_autoremove_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Store reclaimable package summary
+      ansible.builtin.set_fact:
+        apt_autoremovable_count: "{{ (_probe.split('|')[0] | default('0')) | int }}"
+        apt_autoremovable_freed: >-
+          {{ (_probe.split('|')[1] | default('') | trim)
+             | regex_replace('^After this operation, ', '')
+             | regex_replace(' disk space will be freed\.?$', '') }}
+      vars:
+        _probe: "{{ apt_autoremove_probe.stdout | default('0|') }}"
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_flag
+
+    - name: Read the packages that want the reboot
+      ansible.builtin.slurp:
+        src: /var/run/reboot-required.pkgs
+      register: reboot_required_pkgs
+      when: reboot_required_flag.stat.exists
+      failed_when: false
+
+    # .split() with no argument splits on any whitespace, newlines included --
+    # deliberately avoiding a '\n' literal, which a folded scalar would mangle
+    # the same way the reject filter above was mangled.
+    - name: Store reboot status
+      ansible.builtin.set_fact:
+        apt_reboot_required: "{{ reboot_required_flag.stat.exists }}"
+        apt_reboot_packages: >-
+          {{ (reboot_required_pkgs.content | default('') | b64decode).split()
+             if reboot_required_flag.stat.exists else [] }}
+
+- name: Write upgrade log
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  tasks:
+    - name: Ensure logs directory exists
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'APT_LOG_FILE') | dirname }}"
+        state: directory
+        mode: '0755'
+
+    - name: Write apt upgrade log
+      ansible.builtin.template:
+        src: templates/apt-upgrade-log.j2
+        dest: "{{ lookup('env', 'APT_LOG_FILE') }}"
+        mode: '0644'
+
+    # Printed as well as logged: the whole point is that you SEE it at the end
+    # of the run, rather than discovering it in a file you had no reason to open.
+    - name: Report what still needs a restart or a reboot
+      ansible.builtin.debug:
+        msg: "{{ lookup('template', 'templates/apt-pending-summary.j2') }}"

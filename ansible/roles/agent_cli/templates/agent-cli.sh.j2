@@ -1,0 +1,11 @@
+# Managed by Ansible -- ansible/roles/agent_cli/templates/agent-cli.sh.j2
+#
+# Points both CLIs at the appdata bind mount so a login survives a container
+# rebuild. Without these, each writes under $HOME on the container rootfs and
+# the auth is gone the moment the guest is recreated.
+#
+# /etc/profile.d is read by LOGIN shells. code-server's systemd unit runs its
+# ExecStart through a login shell for exactly this reason, so the integrated
+# terminal inherits these too.
+export CLAUDE_CONFIG_DIR="{{ agent_claude_config_dir }}"
+export CODEX_HOME="{{ agent_codex_home }}"

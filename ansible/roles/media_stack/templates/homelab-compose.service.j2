@@ -1,0 +1,19 @@
+[Unit]
+Description=Homelab Docker Compose Stack
+After=docker.service
+Requires=docker.service
+RequiresMountsFor={{ appdata_mount }} {{ media_mount }}
+ConditionPathExists={{ compose_file }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ compose_dir }}
+EnvironmentFile=-{{ compose_env_file }}
+ExecStart=/usr/bin/docker compose -f {{ compose_file }} up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f {{ compose_file }} down
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

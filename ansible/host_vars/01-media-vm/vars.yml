@@ -1,0 +1,267 @@
+# --- Local state (app state/caches that need the VM's local ext4 disk) ---
+# VirtIO-FS mount is fine for regular files, but SQLite write/locking semantics
+# and executable codec helpers can break there.
+homelab_local_state_paths:
+  - name: lingarr
+    service: lingarr
+    source: "{{ appdata_mount }}/lingarr/config"
+    target: "{{ lingarr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/lingarr/config"
+    sqlite_backup_paths:
+      - local.db
+      - Hangfire.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: prowlarr
+    service: prowlarr
+    source: "{{ appdata_mount }}/prowlarr"
+    target: "{{ prowlarr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/prowlarr"
+    db_file: prowlarr.db
+    backup_glob: "{{ appdata_mount }}/prowlarr/Backups/scheduled/prowlarr_backup_*.zip"
+    sqlite_backup_paths:
+      - prowlarr.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: radarr
+    service: radarr
+    source: "{{ appdata_mount }}/radarr"
+    target: "{{ radarr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/radarr"
+    db_file: radarr.db
+    backup_glob: "{{ appdata_mount }}/radarr/Backups/scheduled/radarr_backup_*.zip"
+    sqlite_backup_paths:
+      - radarr.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: sonarr
+    service: sonarr
+    source: "{{ appdata_mount }}/sonarr"
+    target: "{{ sonarr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/sonarr"
+    db_file: sonarr.db
+    backup_glob: "{{ appdata_mount }}/sonarr/Backups/scheduled/sonarr_backup_*.zip"
+    sqlite_backup_paths:
+      - sonarr.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: bazarr
+    service: bazarr
+    source: "{{ appdata_mount }}/bazarr"
+    target: "{{ bazarr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/bazarr"
+    sqlite_backup_paths:
+      - db/bazarr.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: tautulli
+    service: tautulli
+    source: "{{ appdata_mount }}/tautulli"
+    target: "{{ tautulli_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/tautulli"
+    sqlite_backup_paths:
+      - tautulli.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  # Kometa is mirror-only: source == target suppresses the seeding path, which
+  # would otherwise rsync the 12G of overlay artwork onto the VM's local disk.
+  # The mirror must NOT target appdata_mount/kometa — that directory holds the
+  # live overlays/, and sync_tree's `rsync --delete` would wipe it, because the
+  # host side of kometa_config_dir/overlays is only an empty bind-mount stub.
+  # Kometa runs as root in-container, unlike the LinuxServer images below.
+  - name: kometa
+    service: kometa
+    source: "{{ kometa_config_dir }}"
+    target: "{{ kometa_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/kometa-state"
+    sqlite_backup_paths:
+      - config.cache
+    rsync_excludes:
+      - config.cache
+      - config.cache-shm
+      - config.cache-wal
+      - logs/
+      - overlays/
+    owner: "0"
+    group: "0"
+    mode: "0755"
+  - name: seerr
+    service: seerr
+    source: "{{ appdata_mount }}/overseerr"
+    target: "{{ seerr_config_dir }}"
+    backup_target: "{{ homelab_local_state_backup_root }}/overseerr"
+    db_file: db/db.sqlite3
+    sqlite_backup_paths:
+      - db/db.sqlite3
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: plex-databases
+    service: plex
+    source: "{{ appdata_mount }}/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+    target: "{{ plex_databases_dir }}"
+    backup_target: "{{ appdata_mount }}/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+    sqlite_quick_check: false
+    sqlite_backup_paths:
+      - com.plexapp.plugins.library.db
+      - com.plexapp.plugins.library.blobs.db
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: plex-codecs
+    service: plex
+    source: "{{ appdata_mount }}/plex/Library/Application Support/Plex Media Server/Codecs"
+    target: "{{ plex_codecs_dir }}"
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+  - name: plex-cache
+    service: plex
+    source: "{{ appdata_mount }}/plex/Library/Application Support/Plex Media Server/Cache"
+    target: "{{ plex_cache_dir }}"
+    owner: "{{ media_puid }}"
+    group: "{{ media_pgid }}"
+    mode: "0775"
+
+# --- App-local config dirs (on VM's ext4, not VirtIO-FS) ---
+prowlarr_config_dir: "{{ homelab_local_state_root }}/prowlarr"
+radarr_config_dir: "{{ homelab_local_state_root }}/radarr"
+sonarr_config_dir: "{{ homelab_local_state_root }}/sonarr"
+bazarr_config_dir: "{{ homelab_local_state_root }}/bazarr"
+tautulli_config_dir: "{{ homelab_local_state_root }}/tautulli"
+seerr_config_dir: "{{ homelab_local_state_root }}/overseerr"
+plex_databases_dir: "{{ homelab_local_state_root }}/plex-databases"
+plex_codecs_dir: "{{ homelab_local_state_root }}/plex-codecs"
+plex_cache_dir: "{{ homelab_local_state_root }}/plex-cache"
+
+virtiofs_mounts:
+  - tag: homelab-appdata
+    path: /srv/appdata
+  - tag: homelab-media
+    path: /srv/media
+
+# --- Kometa ---
+# Enable after setting the Plex token, TMDb API key, and library names below.
+kometa_enabled: true
+kometa_plex_token: ""
+kometa_tmdb_apikey: ""
+kometa_libraries:
+  - name: movies
+    hu_overlay_profile: movie
+  - name: tvshows
+    hu_overlay_profile: show
+
+# --- Lingarr ---
+_all_iso639_targets: &iso639
+  [aa, ab, ae, af, ak, am, an, ar, as, av, ay, az,
+   ba, be, bg, bi, bm, bn, bo, br, bs,
+   ca, ce, ch, co, cr, cs, cv, cy,
+   da, de, dv, dz,
+   ee, el, en, eo, es, et, eu,
+   fa, ff, fi, fj, fo, fr, fy,
+   ga, gd, gl, gn, gu, gv,
+   ha, he, hi, ho, hr, ht, hu, hy, hz,
+   id, ig, ii, ik, io, is, it, iu,
+   ja, jv,
+   ka, kg, ki, kj, kk, kl, km, kn, ko, kr, ks, ku, kv, kw, ky,
+   la, lb, lg, li, ln, lo, lt, lu, lv,
+   mg, mh, mi, mk, ml, mn, mr, ms, mt, my,
+   na, nb, nd, ne, ng, nl, nn, "no", nr, nv, ny,
+   oc, oj, om, or, os,
+   pa, pi, pl, ps, pt,
+   qu,
+   rm, rn, ro, ru, rw,
+   sa, sc, sd, se, sg, si, sk, sl, sm, sn, so, sq, sr, ss, st, su, sv, sw,
+   ta, te, tg, th, ti, tk, tl, tn, to, tr, ts, tt, tw, ty,
+   ug, uk, ur, uz,
+   ve, vi, vo,
+   wa, wo,
+   xh,
+   yi, yo,
+   za, zh, zu]
+
+lingarr_source_languages:
+  - name: English
+    code: en
+    targets: *iso639
+
+lingarr_target_languages:
+  - name: Hungarian
+    code: hu
+    targets: *iso639
+
+lingarr_ai_prompt: |
+  You are a subtitle translation engine.
+
+  Translate subtitle dialogue from {sourceLanguage} to {targetLanguage}.
+
+  Rules:
+  - Return only the translated target subtitle text.
+  - Use surrounding context only to disambiguate the target line; do not translate or return the context.
+  - Keep line breaks valid for subtitles.
+  - Preserve any markup exactly, including tags such as <i>, </i>, <b>, </b>, {\i1}, {\an8}, {\pos(...)}, {\rStyle}, \N, and <br />.
+  - Preserve speaker labels exactly, such as "TEACHER:" or "STUDENT 1:".
+  - Translate only the spoken dialogue text.
+  - Bracketed SFX like [MUSIC] or [SIGHS] may be translated naturally into {targetLanguage}, while preserving brackets.
+  - If text is already in {targetLanguage}, keep it unchanged.
+  - If unsure about a phrase, copy it unchanged instead of guessing.
+  - Keep profanity strength.
+  - For Hungarian, default to informal tegező unless the source clearly requires formal speech.
+
+  No commentary or extra text.
+
+lingarr_ai_user_prompt: |
+  Use CONTEXT only to translate TARGET. Return only the translated TARGET text.
+
+  [TARGET]
+  {lineToTranslate}
+  [/TARGET]
+
+  [CONTEXT BEFORE]
+  {contextBefore}
+  [/CONTEXT BEFORE]
+
+  [CONTEXT AFTER]
+  {contextAfter}
+  [/CONTEXT AFTER]
+
+lingarr_deepseek_request_template: |
+  {"model":"{model}","messages":[{"role":"system","content":"{systemPrompt}"},{"role":"user","content":"{userMessage}"}],"stream":false,"thinking":{"type":"disabled"},"temperature":0.2,"max_tokens":160}
+
+lingarr_settings_overrides:
+  auth_enabled: false
+  service_type:
+    - deepseek
+  deepseek_model: deepseek-v4-pro
+  deepseek_request_template: "{{ lingarr_deepseek_request_template }}"
+  ai_prompt: "{{ lingarr_ai_prompt }}"
+  ai_user_prompt: "{{ lingarr_ai_user_prompt }}"
+  source_languages: "{{ lingarr_source_languages }}"
+  target_languages: "{{ lingarr_target_languages }}"
+  ai_context_before: 1
+  ai_context_after: 1
+  use_batch_translation: false
+  max_batch_size: 0
+  max_retries: 4
+  retry_delay: 8
+  retry_delay_multiplier: 2
+  request_timeout: 60
+  fix_overlapping_subtitles: true
+  strip_subtitle_formatting: true
+  add_translator_info: false
+  remove_language_tag: false
+  use_subtitle_tagging: false
+  subtitle_tag: lingarr
+  ignore_captions: true
+  subtitle_validation_enabled: true
+  subtitle_validation_mindurationms: 1000
+  subtitle_validation_maxdurationsecs: 7
+  subtitle_validation_minsubtitlelength: 2
+  subtitle_validation_maxsubtitlelength: 120
+  subtitle_validation_maxfilesizebytes: 3145728

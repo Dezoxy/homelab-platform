@@ -1,0 +1,65 @@
+# --- Upstream DNS ---
+adguard_upstream_dns:
+  - "https://dns.quad9.net/dns-query"
+  - "https://dns.google/dns-query"
+  - "tls://dns.quad9.net"
+  - "tls://dns.google"
+adguard_bootstrap_dns:
+  - 9.9.9.9
+  - 8.8.8.8
+adguard_fallback_dns:
+  - 9.9.9.9
+  - 8.8.8.8
+adguard_use_private_ptr_resolvers: false
+
+# --- Filters ---
+adguard_filters:
+  - id: 1
+    name: AdGuard DNS filter
+    url: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+    enabled: true
+
+# --- Whitelist rules ---
+adguard_user_rules:
+  - "@@||chatgpt.com"
+  - "@@||grafana.org"
+  - "@@||tracker.opentrackr.org^"
+  - "@@||tracker.openbittorrent.com^"
+  - "@@||tracker.torrent.eu.org^"
+  - "@@||open.stealth.si^"
+  - "@@||tracker.cyberia.is^"
+  - "@@||t.ncore.sh^"
+  - "@@||t.ncore.pro^"
+
+# --- DNS rewrites (extras not derived from inventory) ---
+# Inventory hosts get <hostname>.home.arpa rewrites auto-generated in the playbook.
+adguard_extra_rewrites:
+  - domain: proxmox.home.arpa
+    answer: 192.168.1.239
+  - domain: pentest.example.com
+    answer: 192.168.1.4
+  # All public subdomains route through the reverse proxy.
+  - domain: "*.example.com"
+    answer: 192.168.1.4
+  # Exception (2026-08-08): jobs.example.com is NOT homelab-hosted — it
+  # is a Cloudflare Worker behind Access, with no route on the reverse proxy,
+  # so the wildcard above sent every LAN client (and the jobs-refresh
+  # container's tracker-sync curl on 01-myapps-vm) into Caddy's 404 instead
+  # of the real site. Answer == the domain itself is AdGuard's documented
+  # exception form: the query falls through the rewrite to the upstream
+  # resolver and gets the public Cloudflare records.
+  - domain: jobs.example.com
+    answer: jobs.example.com
+  # Split-horizon for the UniFi inform endpoint. Publicly this name is a
+  # grey-clouded A record pointing at the home WAN IP, because the remote APs
+  # reach the controller through a router port-forward (see docs/unifi.md).
+  # On the LAN that would require NAT hairpinning, which not every consumer
+  # router does -- so an access point staged here would go offline the moment
+  # the inform host override is applied, looking exactly like a broken design.
+  # Pointing it straight at the controller keeps LAN-side devices on the short
+  # path and stays correct permanently.
+  #
+  # Moved from 192.168.1.8 (01-unifi-lxc) to 01-unifi-vm at the 2026-08-19
+  # cutover, alongside the router forwards for TCP 8080 and UDP 3478.
+  - domain: unifi-inform.example.net
+    answer: 192.168.1.75

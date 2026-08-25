@@ -1,0 +1,185 @@
+- name: Apply system updates
+  hosts: all
+  become: true
+  vars:
+    auto_upgrade: true
+    auto_upgrade_reboot: false
+    auto_upgrade_cache_valid_time: 3600
+    auto_upgrade_reconnect_timeout: 300
+    auto_upgrade_reconnect_sleep: 5
+
+  tasks:
+    # Deliberately NOT gated on auto_upgrade. MODE=config sets auto_upgrade
+    # false, and that is exactly the mode where a slow mirror hurts most: the
+    # roles further down still run their own `apt update`. See apt_mirror_url
+    # in group_vars/all.yml for the measurements behind the chosen mirror.
+    #
+    # Only ubuntu.sources is managed: the legacy /etc/apt/sources.list on these
+    # images carries comments only, so it needs no rewrite.
+    - name: Configure Ubuntu apt sources
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/ubuntu.sources
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          # Managed by Ansible (playbooks/bootstrap/00-system-updates.yml).
+          # Local edits are overwritten on the next deploy.
+          Types: deb
+          URIs: {{ apt_mirror_url }}
+          Suites: {{ _rel }} {{ _rel }}-updates {{ _rel }}-backports
+          Components: {{ apt_sources_components }}
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: {{ apt_security_mirror_url }}
+          Suites: {{ _rel }}-security
+          Components: {{ apt_sources_components }}
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+      vars:
+        # distribution_release, not a hardcoded suite: 01-media-vm is still on
+        # noble while the rest of the fleet is on resolute.
+        _rel: "{{ ansible_facts['distribution_release'] }}"
+      register: apt_sources_file
+      when:
+        - apt_sources_manage | bool
+        - ansible_facts['distribution'] == 'Ubuntu'
+
+    # cache_valid_time below would otherwise happily serve indexes fetched from
+    # the previous mirror, so force exactly one refresh when the list changes.
+    #
+    # noqa no-handler: a handler flushes at end of play, which is too late.
+    # Once the sources file changes, apt resolves download URLs from the NEW
+    # sources against the OLD index files -- a 404/hash mismatch that would hit
+    # the very next task in this play. The refresh has to be inline and ordered.
+    - name: Refresh apt cache after sources change  # noqa: no-handler
+      ansible.builtin.apt:
+        update_cache: true
+      when: apt_sources_file is changed
+
+    - name: Ensure Debian or Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] == "Debian"
+        fail_msg: "System updates are only supported for Debian/Ubuntu hosts."
+      when: auto_upgrade | bool
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: "{{ auto_upgrade_cache_valid_time }}"
+      when: auto_upgrade | bool
+
+    # needrestart hooks apt's DPkg::Post-Invoke, so this drop-in has to be in
+    # place BEFORE the first dpkg operation in this play -- otherwise the very
+    # upgrade that installs it is still free to deadlock. It is also why the
+    # policy lives on the host rather than in an ANSIBLE-only env var:
+    # unattended-upgrades takes the identical hook path with no Ansible
+    # involved. See needrestart_never_restart_units in group_vars/all.yml.
+    #
+    # validate: a syntax error in a conf.d snippet makes needrestart die with
+    # "Error parsing", which takes down every apt run on the host. `perl -c`
+    # catches that before the file is ever moved into place.
+    #
+    # Deliberately NOT gated on auto_upgrade, for the same reason as the apt
+    # sources task above: MODE=config leaves auto_upgrade false, and that is
+    # exactly a host where unattended-upgrades still fires this hook nightly
+    # with no Ansible in the loop. Gating it would leave the config-only hosts
+    # holding the bug.
+    - name: Check whether needrestart is installed
+      ansible.builtin.stat:
+        path: /etc/needrestart/conf.d
+      register: needrestart_confd
+
+    - name: Configure needrestart to leave unattended job units alone
+      ansible.builtin.template:
+        src: needrestart-homelab-jobs.conf.j2
+        dest: /etc/needrestart/conf.d/50-homelab-jobs.conf
+        owner: root
+        group: root
+        mode: "0644"
+        validate: perl -c %s
+      when: needrestart_confd.stat.isdir | default(false)
+
+    # Purged rather than masked: the package has no function on a guest at all,
+    # and leaving it installed just means the next person wonders why a masked
+    # unit is sitting there. See guest_purge_packages in group_vars/all.yml.
+    #
+    # Not gated on auto_upgrade -- a MODE=config host should converge too, and
+    # this reconverges if apt pulls openipmi back as an ipmitool Recommends.
+    - name: Purge packages with no purpose on a virtualised guest
+      ansible.builtin.apt:
+        name: "{{ guest_purge_packages }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: (guest_purge_packages | default([]) | length) > 0
+
+    # AppArmor inside an unprivileged container cannot load policy: the
+    # container has no CAP_MAC_ADMIN, so apparmor_parser exits
+    # "Access denied. You need policy admin privileges to manage profiles."
+    # and `aa-status` reports "No policy loaded into the kernel".
+    #
+    # Masking costs nothing in security. These containers are confined by the
+    # HOST's AppArmor (Proxmox applies lxc-container-default-cgns from outside),
+    # which nothing in here can affect. The in-container unit was never
+    # enforcing anything -- it just burned ~2s of CPU per boot to fail and hold
+    # systemd at `degraded`.
+    #
+    # VMs are deliberately excluded: AppArmor genuinely works there.
+    - name: Check for the AppArmor unit
+      ansible.builtin.stat:
+        path: /usr/lib/systemd/system/apparmor.service
+      register: apparmor_unit
+      when: ansible_facts['virtualization_type'] in container_virtualization_types
+
+    - name: Mask AppArmor inside containers
+      ansible.builtin.systemd:
+        name: apparmor.service
+        masked: true
+        state: stopped
+      when:
+        - ansible_facts['virtualization_type'] in container_virtualization_types
+        - apparmor_unit.stat.exists | default(false)
+
+    - name: Install common guest packages
+      ansible.builtin.apt:
+        name: "{{ common_guest_packages }}"
+        state: present
+      when:
+        - auto_upgrade | bool
+        - (common_guest_packages | default([]) | length) > 0
+
+    - name: Upgrade packages
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        autoclean: true
+      ignore_unreachable: true
+      when: auto_upgrade | bool
+
+    - name: Reset SSH control connection after upgrades
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for host to reconnect after upgrades
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: "{{ auto_upgrade_reconnect_sleep }}"
+        timeout: "{{ auto_upgrade_reconnect_timeout }}"
+      when: auto_upgrade | bool
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+      when: auto_upgrade | bool
+
+    - name: Reboot after upgrades if enabled
+      ansible.builtin.reboot:
+        msg: "Rebooting after package upgrades"
+        reboot_timeout: 1200
+      when:
+        - auto_upgrade | bool
+        - auto_upgrade_reboot | bool
+        - reboot_required.stat.exists

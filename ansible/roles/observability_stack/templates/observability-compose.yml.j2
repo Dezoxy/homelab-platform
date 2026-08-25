@@ -1,0 +1,118 @@
+services:
+  grafana:
+    image: {{ observability_grafana_image | default('grafana/grafana-oss:12.4.2') }}
+    container_name: grafana
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ observability_grafana_port }}:3000"
+    environment:
+      - TZ={{ observability_timezone }}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GRAFANA_ALERTS_TELEGRAM_BOT_TOKEN=${GRAFANA_ALERTS_TELEGRAM_BOT_TOKEN:-}
+      - GRAFANA_ALERTS_TELEGRAM_CHAT_ID=${GRAFANA_ALERTS_TELEGRAM_CHAT_ID:-}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - {{ observability_appdata_dir }}/grafana/data:/var/lib/grafana
+      - {{ observability_appdata_dir }}/grafana/provisioning:/etc/grafana/provisioning
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:3000/api/health >/dev/null 2>&1; elif command -v curl >/dev/null 2>&1; then curl -fsS http://localhost:3000/api/health >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+{% if observability_adguard_exporter_enabled | default(false) %}
+      - adguard-exporter
+{% endif %}
+
+  prometheus:
+    image: {{ observability_prometheus_image | default('prom/prometheus:v3.10.0') }}
+    container_name: prometheus
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ observability_prometheus_port }}:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time={{ observability_prometheus_retention_time }}
+      - --web.enable-lifecycle
+      - --web.enable-otlp-receiver
+    volumes:
+      - {{ observability_appdata_dir }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - {{ observability_appdata_dir }}/prometheus/data:/prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:9090/-/healthy >/dev/null 2>&1; elif command -v curl >/dev/null 2>&1; then curl -fsS http://localhost:9090/-/healthy >/dev/null 2>&1; else exit 1; fi"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  loki:
+    image: {{ observability_loki_image | default('grafana/loki:3.7.1') }}
+    container_name: loki
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ observability_loki_port }}:3100"
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - {{ observability_appdata_dir }}/loki/data:/loki
+    restart: unless-stopped
+    # Intentionally no Docker healthcheck: upstream Loki image may not include shell/curl/wget.
+
+{% if observability_adguard_exporter_enabled | default(false) %}
+  adguard-exporter:
+    image: {{ observability_adguard_exporter_image | default('ghcr.io/henrywhitaker3/adguard-exporter:v1.2.1') }}
+    container_name: adguard-exporter
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      - ADGUARD_SERVERS={{ observability_adguard_exporter_server | default('http://01-dns-lxc.home.arpa:3000') }}
+      - ADGUARD_USERNAMES=${ADGUARD_EXPORTER_USERNAME}
+      - ADGUARD_PASSWORDS=${ADGUARD_EXPORTER_PASSWORD}
+      - INTERVAL={{ observability_adguard_exporter_interval | default('30s') }}
+      - BIND_ADDR=:{{ observability_adguard_exporter_port | default(9618) }}
+    restart: unless-stopped
+    # Intentionally no Docker healthcheck: adguard-exporter is built from scratch (no shell/curl/wget).
+{% endif %}
+
+{% if observability_blackbox_exporter_enabled | default(false) %}
+  blackbox-exporter:
+    image: {{ observability_blackbox_exporter_image }}
+    container_name: blackbox-exporter
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ observability_blackbox_exporter_port }}:9115"
+    volumes:
+      - {{ observability_appdata_dir }}/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    restart: unless-stopped
+    # Intentionally no Docker healthcheck: blackbox_exporter's image may not include shell/curl/wget.
+{% endif %}
+
+  tempo:
+    image: {{ observability_tempo_image | default('grafana/tempo:2.10.3') }}
+    container_name: tempo
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "{{ observability_tempo_port }}:3200"
+      - "{{ observability_otlp_grpc_port }}:4317"
+      - "{{ observability_otlp_http_port }}:4318"
+    command:
+      - -config.file=/etc/tempo.yaml
+    volumes:
+      - {{ observability_appdata_dir }}/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - {{ observability_appdata_dir }}/tempo/data:/var/tempo
+    restart: unless-stopped
+    # Intentionally no Docker healthcheck: upstream Tempo image may not include shell/curl/wget.

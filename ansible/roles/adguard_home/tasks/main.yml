@@ -1,0 +1,281 @@
+---
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts["distribution"] in ["Debian", "Ubuntu"]
+    fail_msg: "This playbook expects Debian or Ubuntu."
+
+- name: Resolve AdGuard Home architecture
+  ansible.builtin.set_fact:
+    adguard_arch: "{{ adguard_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+
+- name: Build AdGuard Home archive name
+  ansible.builtin.set_fact:
+    adguard_archive: "AdGuardHome_linux_{{ adguard_arch }}.tar.gz"
+
+- name: Build AdGuard Home download URL
+  ansible.builtin.set_fact:
+    adguard_download_url: "https://static.adguard.com/adguardhome/release/{{ adguard_archive }}"
+
+- name: Stop systemd-resolved to free port 53
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Check resolv.conf symlink
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+  register: resolv_conf
+
+- name: Remove resolv.conf symlink
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    state: absent
+  when: resolv_conf.stat.islnk | default(false)
+
+- name: Write resolv.conf with bootstrap resolver settings
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    mode: "0644"
+    unsafe_writes: true  # /etc/resolv.conf may be a bind-mount (Docker/LXC)
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Create AdGuard Home directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ adguardhome_install_dir }}"
+    - "{{ adguardhome_config_dir }}"
+    - "{{ adguardhome_work_dir }}"
+
+- name: Check AdGuard Home config file
+  ansible.builtin.stat:
+    path: "{{ adguardhome_config_dir }}/AdGuardHome.yaml"
+  register: adguard_config_file
+  when: adguard_manage_config
+
+- name: Read existing AdGuard Home config
+  ansible.builtin.slurp:
+    path: "{{ adguardhome_config_dir }}/AdGuardHome.yaml"
+  register: adguard_config_slurp
+  when:
+    - adguard_manage_config
+    - adguard_config_file.stat.exists
+
+- name: Parse existing AdGuard Home config
+  ansible.builtin.set_fact:
+    adguard_config_existing: >-
+      {{ (adguard_config_slurp.content | b64decode | from_yaml) if adguard_config_file.stat.exists else {} }}
+  when: adguard_manage_config
+
+- name: Decide whether to update AdGuard admin user/password
+  ansible.builtin.set_fact:
+    adguard_set_admin_credentials: >-
+      {{
+        (adguard_admin_user | default('') | length > 0)
+        and (adguard_admin_password | default('') | length > 0)
+      }}
+  when: adguard_manage_config
+
+- name: Require AdGuard admin credentials (initial setup only)
+  ansible.builtin.assert:
+    that:
+      - adguard_set_admin_credentials or (adguard_config_file.stat.exists | default(false)) and ((adguard_config_existing.users | default([])) | length > 0)
+    fail_msg: >-
+      Set adguard_admin_user and adguard_admin_password for initial AdGuard Home setup
+      (or keep existing users from {{ adguardhome_config_dir }}/AdGuardHome.yaml).
+  when: adguard_manage_config
+
+- name: Generate AdGuard admin password hash
+  ansible.builtin.command: "htpasswd -nbB '{{ adguard_admin_user }}' '{{ adguard_admin_password }}'"
+  register: adguard_htpasswd
+  changed_when: false
+  no_log: true
+  # htpasswd -nb only prints a hash; it touches nothing. Needed under --check
+  # because the fact below splits its stdout, and a skipped register made that
+  # "object of type 'list' has no attribute 1".
+  check_mode: false
+  when:
+    - adguard_manage_config
+    - adguard_set_admin_credentials
+
+- name: Set AdGuard admin password hash fact
+  ansible.builtin.set_fact:
+    adguard_admin_password_hash: "{{ adguard_htpasswd.stdout.split(':', 1)[1] }}"
+  no_log: true
+  when:
+    - adguard_manage_config
+    - adguard_set_admin_credentials
+
+- name: Decide AdGuard users config
+  ansible.builtin.set_fact:
+    adguard_users_effective: >-
+      {{
+        [{'name': adguard_admin_user, 'password': adguard_admin_password_hash}]
+        if adguard_set_admin_credentials
+        else (adguard_config_existing.users | default([]))
+      }}
+  no_log: true
+  when: adguard_manage_config
+
+- name: Stop AdGuard Home before managing config
+  ansible.builtin.systemd:
+    name: adguardhome
+    state: stopped
+  failed_when: false
+  when: adguard_manage_config
+
+- name: Build DNS rewrites from inventory (hostname.home.arpa -> IP)
+  ansible.builtin.set_fact:
+    _inventory_rewrites: "{{ (_inventory_rewrites | default([])) + [{'domain': item ~ '.home.arpa', 'answer': hostvars[item].ansible_host}] }}"
+  loop: "{{ groups['all'] | sort }}"
+  when:
+    - adguard_manage_config
+    - hostvars[item].ansible_host is defined
+  no_log: true
+
+- name: Merge inventory rewrites with extras
+  ansible.builtin.set_fact:
+    adguard_rewrites: "{{ (_inventory_rewrites | default([])) + (adguard_extra_rewrites | default([])) }}"
+  when: adguard_manage_config
+
+- name: Require AdGuard rewrites list
+  ansible.builtin.assert:
+    that:
+      - adguard_rewrites is defined
+      - adguard_rewrites | length > 0
+    fail_msg: "adguard_rewrites is empty; check inventory hosts and adguard_extra_rewrites."
+  when: adguard_manage_config
+
+- name: Enable AdGuard rewrites
+  ansible.builtin.set_fact:
+    adguard_rewrites_effective: "{{ adguard_rewrites | default([]) | map('combine', {'enabled': true}) | list }}"
+  when: adguard_manage_config
+
+- name: Build AdGuard Home config overrides
+  ansible.builtin.set_fact:
+    adguard_config_overrides:
+      schema_version: "{{ adguard_schema_version }}"
+      users: "{{ adguard_users_effective | default([]) }}"
+      http:
+        address: "{{ adguard_bind_host }}:{{ adguard_web_port }}"
+      dns:
+        bind_hosts:
+          - 0.0.0.0
+        port: "{{ adguard_dns_port }}"
+        protection_enabled: true
+        filtering_enabled: true
+        ratelimit: "{{ adguard_ratelimit | default(200) | int }}"
+        ratelimit_subnet_len_ipv4: "{{ adguard_ratelimit_subnet_len_ipv4 | default(32) | int }}"
+        ratelimit_subnet_len_ipv6: "{{ adguard_ratelimit_subnet_len_ipv6 | default(128) | int }}"
+        upstream_dns: "{{ adguard_upstream_dns }}"
+        bootstrap_dns: "{{ adguard_bootstrap_dns }}"
+        fallback_dns: "{{ adguard_fallback_dns | default([]) }}"
+        use_private_ptr_resolvers: "{{ adguard_use_private_ptr_resolvers | default(true) }}"
+        local_ptr_upstreams: "{{ adguard_local_ptr_upstreams | default([]) }}"
+      filtering:
+        protection_enabled: true
+        filtering_enabled: true
+        filters_update_interval: "{{ adguard_filters_update_interval }}"
+        rewrites_enabled: true
+        rewrites: "{{ adguard_rewrites_effective | default([]) }}"
+      filters: "{{ adguard_filters | default([]) }}"
+      whitelist_filters: "{{ adguard_whitelist_filters | default([]) }}"
+      user_rules: "{{ adguard_user_rules | default([]) }}"
+      querylog:
+        enabled: true
+        interval: "{{ adguard_querylog_interval }}"
+        size_memory: "{{ adguard_querylog_size_memory }}"
+      statistics:
+        enabled: true
+        interval: "{{ adguard_statistics_interval }}"
+  when: adguard_manage_config
+
+- name: Merge AdGuard Home config
+  ansible.builtin.set_fact:
+    adguard_config: "{{ adguard_config_existing | combine(adguard_config_overrides, recursive=True, list_merge='replace') }}"
+  when: adguard_manage_config
+
+- name: Write AdGuard Home config
+  ansible.builtin.copy:
+    dest: "{{ adguardhome_config_dir }}/AdGuardHome.yaml"
+    mode: "0600"
+    content: "{{ adguard_config | to_nice_yaml }}"
+  when: adguard_manage_config
+  notify: Restart AdGuard Home
+
+- name: Download AdGuard Home release
+  ansible.builtin.get_url:
+    url: "{{ adguard_download_url }}"
+    dest: "/tmp/{{ adguard_archive }}"
+    mode: "0644"
+
+- name: Extract AdGuard Home
+  ansible.builtin.unarchive:
+    src: "/tmp/{{ adguard_archive }}"
+    dest: "{{ adguardhome_install_dir }}"
+    remote_src: true
+    extra_opts:
+      - --strip-components=1
+    creates: "{{ adguardhome_install_dir }}/AdGuardHome"
+
+- name: Check AdGuard Home binary (root)
+  ansible.builtin.stat:
+    path: "{{ adguardhome_install_dir }}/AdGuardHome"
+  register: adguard_bin_root
+
+- name: Check AdGuard Home binary (nested)
+  ansible.builtin.stat:
+    path: "{{ adguardhome_install_dir }}/AdGuardHome/AdGuardHome"
+  register: adguard_bin_nested
+
+- name: Select AdGuard Home binary path
+  ansible.builtin.set_fact:
+    adguard_bin_path: "{{ adguardhome_install_dir }}/AdGuardHome"
+  when: adguard_bin_root.stat.exists and adguard_bin_root.stat.isreg
+
+- name: Select AdGuard Home nested binary path
+  ansible.builtin.set_fact:
+    adguard_bin_path: "{{ adguardhome_install_dir }}/AdGuardHome/AdGuardHome"
+  when: adguard_bin_nested.stat.exists and adguard_bin_nested.stat.isreg
+
+- name: Ensure AdGuard Home binary path is valid
+  ansible.builtin.assert:
+    that:
+      - adguard_bin_path is defined
+    fail_msg: "AdGuard Home binary not found after extraction."
+
+- name: Ensure AdGuard Home binary is executable
+  ansible.builtin.file:
+    path: "{{ adguard_bin_path }}"
+    state: file
+    mode: "0755"
+
+- name: Install AdGuard Home systemd unit
+  ansible.builtin.template:
+    src: adguardhome.service.j2
+    dest: /etc/systemd/system/adguardhome.service
+    mode: "0644"
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start AdGuard Home
+  ansible.builtin.systemd:
+    name: adguardhome
+    enabled: true
+    state: started

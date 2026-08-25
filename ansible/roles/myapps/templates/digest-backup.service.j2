@@ -1,0 +1,12 @@
+# notification-digest state.db snapshot (oneshot; triggered by
+# digest-backup.timer). Runs the templated /usr/local/bin/digest-state-backup
+# script -- see that file's own docstring for the online-backup/WAL safety
+# story and for why this is a script file rather than an ExecStart
+# python -c one-liner (quoting-layer SyntaxError on first run, 2026-08-17).
+[Unit]
+Description=notification-digest state.db snapshot
+OnFailure=digest-backup-notify.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/digest-state-backup

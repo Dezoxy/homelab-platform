@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: cloudflared
+  author: toomhorvath
+  description: "Installs and configures cloudflared as a Cloudflare Tunnel client."
+  license: MIT
+  min_ansible_version: "2.14"

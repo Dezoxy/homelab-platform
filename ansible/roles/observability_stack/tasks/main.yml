@@ -1,0 +1,619 @@
+---
+- name: Install Docker
+  ansible.builtin.import_role:
+    name: docker
+
+- name: Derive compose paths from observability_compose_dir
+  ansible.builtin.set_fact:
+    observability_compose_file: "{{ observability_compose_file | default(observability_compose_dir ~ '/compose.yml') }}"
+    observability_env_file: "{{ observability_env_file | default(observability_compose_dir ~ '/.env') }}"
+
+- name: Derive Grafana local URL
+  ansible.builtin.set_fact:
+    observability_grafana_local_url_effective: "{{ observability_grafana_local_url | default('http://127.0.0.1:' ~ (observability_grafana_port | string), true) }}"
+
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] in ["Debian", "Ubuntu"]
+    fail_msg: "This playbook expects Debian or Ubuntu."
+
+- name: Check for existing observability environment file
+  ansible.builtin.stat:
+    path: "{{ observability_env_file }}"
+  register: observability_env_file_stat
+
+
+- name: Read existing observability environment file
+  ansible.builtin.slurp:
+    path: "{{ observability_env_file }}"
+  register: observability_env_file_content
+  when: observability_env_file_stat.stat.exists | default(false)
+
+- name: Derive runtime Grafana admin password
+  ansible.builtin.set_fact:
+    observability_grafana_admin_password_runtime: >-
+      {{
+        (observability_grafana_admin_password_effective | default('') | trim)
+        or
+        (
+          (observability_env_file_content.content | default('') | b64decode)
+          | regex_findall('(?m)^GRAFANA_ADMIN_PASSWORD=(.*)$')
+          | first
+          | default('')
+          | trim
+        )
+      }}
+
+- name: Derive runtime Grafana Telegram alerting settings
+  ansible.builtin.set_fact:
+    observability_grafana_alert_telegram_bot_token_runtime: >-
+      {{
+        (observability_grafana_alert_telegram_bot_token_effective | default('') | trim)
+        or
+        (
+          (observability_env_file_content.content | default('') | b64decode)
+          | regex_findall('(?m)^GRAFANA_ALERTS_TELEGRAM_BOT_TOKEN=(.*)$')
+          | first
+          | default('')
+          | trim
+        )
+      }}
+    observability_grafana_alert_telegram_chat_id_runtime: >-
+      {{
+        (observability_grafana_alert_telegram_chat_id_effective | default('') | trim)
+        or
+        (
+          (observability_env_file_content.content | default('') | b64decode)
+          | regex_findall('(?m)^GRAFANA_ALERTS_TELEGRAM_CHAT_ID=(.*)$')
+          | first
+          | default('')
+          | trim
+        )
+      }}
+  when: observability_grafana_alerting_provisioning_enabled | default(false)
+
+- name: Derive whether Grafana Telegram alerting is enabled
+  ansible.builtin.set_fact:
+    observability_grafana_alert_telegram_enabled: >-
+      {{
+        (observability_grafana_alerting_provisioning_enabled | default(false))
+        and
+        (observability_grafana_alert_telegram_bot_token_runtime | default('') | length > 0)
+        and
+        (observability_grafana_alert_telegram_chat_id_runtime | default('') | length > 0)
+      }}
+
+- name: Derive runtime AdGuard exporter credentials
+  ansible.builtin.set_fact:
+    observability_adguard_exporter_username_runtime: >-
+      {{
+        (observability_adguard_exporter_username_effective | default('') | trim)
+        or
+        (
+          (observability_env_file_content.content | default('') | b64decode)
+          | regex_findall('(?m)^ADGUARD_EXPORTER_USERNAME=(.*)$')
+          | first
+          | default('')
+          | trim
+        )
+        or 'admin'
+      }}
+    observability_adguard_exporter_password_runtime: >-
+      {{
+        (observability_adguard_exporter_password_effective | default('') | trim)
+        or
+        (
+          (observability_env_file_content.content | default('') | b64decode)
+          | regex_findall('(?m)^ADGUARD_EXPORTER_PASSWORD=(.*)$')
+          | first
+          | default('')
+          | trim
+        )
+      }}
+  when: observability_adguard_exporter_enabled | default(false)
+
+- name: Require Grafana admin password (or existing env file)
+  ansible.builtin.assert:
+    that:
+      - (observability_grafana_admin_password_runtime | default('') | length > 0) or (observability_env_file_stat.stat.exists | default(false))
+    fail_msg: >-
+      Missing Grafana admin password. Provide 'observability_grafana_admin_password' (recommended via GitHub Secrets)
+      or set GRAFANA_ADMIN_PASSWORD in the environment. If this is not the first install,
+      ensure {{ observability_env_file }} already exists on the host.
+
+- name: Require AdGuard exporter password
+  ansible.builtin.assert:
+    that:
+      - observability_adguard_exporter_password_runtime | default('') | length > 0
+    fail_msg: >-
+      Missing AdGuard exporter password. Provide 'observability_adguard_exporter_password'
+      (or set ADGUARD_PW / ADGUARD_EXPORTER_PASSWORD / ADGUARD_ADMIN_PASSWORD in the environment).
+      If this is not the first install, ensure {{ observability_env_file }} already contains
+      ADGUARD_EXPORTER_PASSWORD with a non-empty value.
+  when: observability_adguard_exporter_enabled | default(false)
+
+- name: Stop adguard-exporter before validating credentials
+  ansible.builtin.command:
+    argv:
+      - docker
+      - stop
+      - adguard-exporter
+  register: observability_adguard_exporter_stop
+  changed_when: observability_adguard_exporter_stop.rc == 0
+  failed_when: false
+  when: observability_adguard_exporter_enabled | default(false)
+
+- name: Validate AdGuard exporter credentials against AdGuard API
+  ansible.builtin.uri:
+    url: "{{ (observability_adguard_exporter_server | default('http://01-dns-lxc.home.arpa:3000')) | regex_replace('/+$', '') }}/control/login"
+    method: POST
+    body_format: json
+    body:
+      name: "{{ observability_adguard_exporter_username_runtime | default(observability_adguard_exporter_username_effective) }}"
+      password: "{{ observability_adguard_exporter_password_runtime }}"
+    status_code:
+      - 200
+      - 401
+      - 403
+  register: observability_adguard_login
+  no_log: true
+  when: observability_adguard_exporter_enabled | default(false)
+
+- name: Fail when AdGuard exporter credentials do not validate
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to write ADGUARD_EXPORTER_PASSWORD to {{ observability_env_file }} because AdGuard rejected
+      the supplied credentials at {{ observability_adguard_exporter_server }} (HTTP {{ observability_adguard_login.status | default('not returned') }}).
+      Update ADGUARD_PW to the current AdGuard admin password, or wait for the AdGuard login lockout window to expire
+      and rerun the deploy.
+  when:
+    - observability_adguard_exporter_enabled | default(false)
+    - observability_adguard_login is defined
+    - not (observability_adguard_login.skipped | default(false))
+    - (observability_adguard_login.status | default(0) | int) != 200
+
+- name: Verify AdGuard API session after login
+  ansible.builtin.uri:
+    url: "{{ (observability_adguard_exporter_server | default('http://01-dns-lxc.home.arpa:3000')) | regex_replace('/+$', '') }}/control/status"
+    method: GET
+    headers:
+      Cookie: "{{ observability_adguard_login.cookies_string }}"
+    status_code: 200
+  register: observability_adguard_status
+  no_log: true
+  when:
+    - observability_adguard_exporter_enabled | default(false)
+    - (observability_adguard_login.status | default(0) | int) == 200
+
+- name: Ensure required mountpoint directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ observability_appdata_dir }}"
+
+- name: Check required mount targets (avoid writing to root filesystem)
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, TARGET, -T, "{{ item }}"]
+  register: observability_mount_targets
+  loop:
+    - "{{ observability_appdata_dir }}"
+  changed_when: false
+  when: not (observability_skip_mount_check | default(false) | bool)
+
+- name: Fail when required storage mounts are missing
+  ansible.builtin.fail:
+    msg: >-
+      Path {{ item.item }} resolves to "/" inside the container, which means it is on the root filesystem.
+      This will corrupt your host if the observability stack writes data to root.
+      Fix: ensure Proxmox mount_point/bind mounts are configured so this path lands on real storage:
+      - {{ observability_appdata_dir }} (observability appdata)
+  when:
+    - not (observability_skip_mount_check | default(false) | bool)
+    - (item.stdout | trim) == "/"
+  loop: "{{ observability_mount_targets.results | default([]) }}"
+
+- name: Create observability config directories (root-owned, container reads only)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ observability_appdata_dir }}/grafana"
+    - "{{ observability_appdata_dir }}/grafana/provisioning"
+    - "{{ observability_appdata_dir }}/grafana/provisioning/datasources"
+    - "{{ observability_appdata_dir }}/grafana/provisioning/plugins"
+    - "{{ observability_appdata_dir }}/grafana/provisioning/alerting"
+    - "{{ observability_appdata_dir }}/grafana/provisioning/dashboards"
+    - "{{ observability_appdata_dir }}/grafana/provisioning/dashboards/homelab"
+    - "{{ observability_appdata_dir }}/prometheus"
+    - "{{ observability_appdata_dir }}/loki"
+    - "{{ observability_appdata_dir }}/tempo"
+
+# Each container runs as its image's default UID and writes to its own data dir.
+# Privileged LXC means UIDs map 1:1 with the host, so we set numeric owners directly.
+- name: Create observability data directories owned by container UIDs
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.uid }}"
+    group: "{{ item.uid }}"
+    mode: "0750"
+  loop:
+    - { path: "{{ observability_appdata_dir }}/grafana/data", uid: 472 }   # grafana/grafana-oss
+    - { path: "{{ observability_appdata_dir }}/prometheus/data", uid: 65534 }   # prom/prometheus (nobody)
+    - { path: "{{ observability_appdata_dir }}/loki/data", uid: 10001 }   # grafana/loki
+    - { path: "{{ observability_appdata_dir }}/tempo/data", uid: 10001 }   # grafana/tempo
+
+# Self-heal stale ownership inside data dirs (e.g. files left over from when
+# the directories were created world-writable). Idempotent — only emits
+# changes the first time it sees mismatched ownership.
+- name: Repair observability data directory ownership recursively
+  ansible.builtin.command: chown -R {{ item.uid }}:{{ item.uid }} {{ item.path }}
+  loop:
+    - { path: "{{ observability_appdata_dir }}/grafana/data", uid: 472 }
+    - { path: "{{ observability_appdata_dir }}/prometheus/data", uid: 65534 }
+    - { path: "{{ observability_appdata_dir }}/loki/data", uid: 10001 }
+    - { path: "{{ observability_appdata_dir }}/tempo/data", uid: 10001 }
+  changed_when: false
+
+- name: Install Prometheus config
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ observability_appdata_dir }}/prometheus/prometheus.yml"
+    mode: "0644"
+  register: observability_prometheus_config_copy
+
+- name: Install Tempo config (local storage)
+  ansible.builtin.template:
+    src: tempo.yml.j2
+    dest: "{{ observability_appdata_dir }}/tempo/tempo.yaml"
+    mode: "0644"
+  register: observability_tempo_config_copy
+
+- name: Ensure blackbox exporter appdata directory
+  ansible.builtin.file:
+    path: "{{ observability_appdata_dir }}/blackbox"
+    state: directory
+    mode: "0755"
+  when: observability_blackbox_exporter_enabled | default(false)
+
+- name: Install blackbox exporter config
+  ansible.builtin.template:
+    src: blackbox.yml.j2
+    dest: "{{ observability_appdata_dir }}/blackbox/blackbox.yml"
+    mode: "0644"
+  register: observability_blackbox_config_copy
+  when: observability_blackbox_exporter_enabled | default(false)
+
+- name: Install Grafana datasource provisioning
+  ansible.builtin.template:
+    src: grafana-datasources.yml.j2
+    dest: "{{ observability_appdata_dir }}/grafana/provisioning/datasources/datasources.yml"
+    mode: "0644"
+  register: observability_datasources_copy
+
+- name: Install Grafana dashboard provider provisioning
+  ansible.builtin.template:
+    src: grafana-dashboard-provider.yml.j2
+    dest: "{{ observability_appdata_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+    mode: "0644"
+  register: observability_dashboard_provider_copy
+
+- name: Install Grafana dashboards
+  ansible.builtin.template:
+    src: "{{ observability_grafana_template_dir }}/{{ item }}"
+    dest: "{{ observability_appdata_dir }}/grafana/provisioning/dashboards/homelab/{{ item | regex_replace('\\.j2$', '') }}"
+    mode: "0644"
+  loop: "{{ observability_grafana_dashboard_templates }}"
+  register: observability_dashboards_copy
+
+- name: Install Grafana alert rules
+  ansible.builtin.template:
+    src: "{{ observability_grafana_template_dir }}/{{ observability_grafana_alert_rule_file }}.j2"
+    dest: "{{ observability_appdata_dir }}/grafana/provisioning/alerting/{{ observability_grafana_alert_rule_file }}"
+    mode: "0644"
+  when: observability_grafana_alerting_provisioning_enabled | default(false)
+  register: observability_alert_rules_copy
+
+- name: Remove Grafana alert rules when file provisioning is disabled
+  ansible.builtin.file:
+    path: "{{ observability_appdata_dir }}/grafana/provisioning/alerting/{{ observability_grafana_alert_rule_file }}"
+    state: absent
+  when: not (observability_grafana_alerting_provisioning_enabled | default(false))
+  register: observability_alert_rules_cleanup
+
+- name: Ensure Grafana Telegram contact point file provisioning is absent
+  ansible.builtin.file:
+    path: "{{ observability_appdata_dir }}/grafana/provisioning/alerting/{{ observability_grafana_alert_contact_points_file }}"
+    state: absent
+  register: observability_alert_contact_points_cleanup
+
+- name: Ensure Grafana Telegram notification policy file provisioning is absent
+  ansible.builtin.file:
+    path: "{{ observability_appdata_dir }}/grafana/provisioning/alerting/{{ observability_grafana_alert_policies_file }}"
+    state: absent
+  register: observability_alert_policies_cleanup
+
+- name: Find stale Grafana dashboards
+  ansible.builtin.find:
+    paths: "{{ observability_appdata_dir }}/grafana/provisioning/dashboards/homelab"
+    patterns: "*.json"
+    file_type: file
+  register: observability_dashboard_files
+
+- name: Remove stale Grafana dashboards
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ observability_dashboard_files.files }}"
+  when: >-
+    (item.path | basename)
+    not in (observability_grafana_dashboard_templates | map('regex_replace', '\\.j2$', '') | list)
+  register: observability_dashboards_cleanup
+
+- name: Ensure observability compose directory
+  ansible.builtin.file:
+    path: "{{ observability_compose_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install observability environment file
+  ansible.builtin.template:
+    src: observability.env.j2
+    dest: "{{ observability_env_file }}"
+    mode: "0600"
+  no_log: true
+  register: observability_env_copy
+  when: >-
+    (observability_grafana_admin_password_runtime | default('') | length > 0)
+    or (
+      (observability_adguard_exporter_enabled | default(false))
+      and (observability_adguard_exporter_password_runtime | default('') | length > 0)
+    )
+    or (not (observability_env_file_stat.stat.exists | default(false)))
+
+- name: Install observability compose file
+  ansible.builtin.template:
+    src: observability-compose.yml.j2
+    dest: "{{ observability_compose_file }}"
+    mode: "0644"
+  register: observability_compose_copy
+
+- name: Install observability systemd unit
+  ansible.builtin.template:
+    src: observability-compose.service.j2
+    dest: /etc/systemd/system/observability.service
+    mode: "0644"
+  register: observability_unit_copy
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start observability stack
+  ansible.builtin.systemd:
+    name: observability
+    enabled: true
+    state: started
+  when: observability_manage_services | default(true)
+
+- name: Wait for Grafana API to become healthy
+  ansible.builtin.uri:
+    url: "{{ observability_grafana_local_url_effective }}/api/health"
+    status_code: 200
+  register: observability_grafana_health
+  retries: 20
+  delay: 3
+  until: observability_grafana_health.status == 200
+  when:
+    - observability_manage_services | default(true)
+    - not ansible_check_mode
+
+- name: Reconcile Grafana admin password in Grafana database
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - grafana
+      - /usr/share/grafana/bin/grafana
+      - cli
+      - admin
+      - reset-admin-password
+      - --password-from-stdin
+    stdin: "{{ observability_grafana_admin_password_runtime }}"
+  no_log: true
+  changed_when: false
+  when:
+    - observability_grafana_admin_password_effective | default('') | trim | length > 0
+    - observability_manage_services | default(true)
+
+- name: Read existing Grafana contact points
+  ansible.builtin.uri:
+    url: "{{ observability_grafana_local_url_effective }}/api/v1/provisioning/contact-points"
+    method: GET
+    force_basic_auth: true
+    url_username: "{{ observability_grafana_admin_user | default('admin') }}"
+    url_password: "{{ observability_grafana_admin_password_runtime }}"
+    status_code: 200
+  register: observability_grafana_contact_points
+  when:
+    - observability_grafana_alert_telegram_enabled | bool
+    - observability_manage_services | default(true)
+
+- name: Derive whether Grafana Telegram contact point already exists
+  ansible.builtin.set_fact:
+    observability_grafana_alert_telegram_contact_point_exists: >-
+      {{
+        (
+          observability_grafana_contact_points.json
+          | default([])
+          | selectattr('uid', 'equalto', 'homelab_telegram')
+          | list
+          | length
+        ) > 0
+      }}
+  when:
+    - observability_grafana_alert_telegram_enabled | bool
+    - observability_manage_services | default(true)
+
+- name: Create Grafana Telegram contact point when missing
+  ansible.builtin.uri:
+    url: "{{ observability_grafana_local_url_effective }}/api/v1/provisioning/contact-points"
+    method: POST
+    body_format: json
+    body:
+      uid: homelab_telegram
+      name: homelab-telegram
+      type: telegram
+      settings:
+        bottoken: "{{ observability_grafana_alert_telegram_bot_token_runtime }}"
+        chatid: "{{ observability_grafana_alert_telegram_chat_id_runtime }}"
+      disableResolveMessage: false
+    force_basic_auth: true
+    url_username: "{{ observability_grafana_admin_user | default('admin') }}"
+    url_password: "{{ observability_grafana_admin_password_runtime }}"
+    status_code:
+      - 200
+      - 202
+  no_log: true
+  register: observability_grafana_alert_telegram_contact_point_create
+  when:
+    - observability_grafana_alert_telegram_enabled | bool
+    - not (observability_grafana_alert_telegram_contact_point_exists | default(false) | bool)
+    - observability_manage_services | default(true)
+
+- name: Update Grafana Telegram contact point when present
+  ansible.builtin.uri:
+    url: "{{ observability_grafana_local_url_effective }}/api/v1/provisioning/contact-points/homelab_telegram"
+    method: PUT
+    body_format: json
+    body:
+      uid: homelab_telegram
+      name: homelab-telegram
+      type: telegram
+      settings:
+        bottoken: "{{ observability_grafana_alert_telegram_bot_token_runtime }}"
+        chatid: "{{ observability_grafana_alert_telegram_chat_id_runtime }}"
+      disableResolveMessage: false
+    force_basic_auth: true
+    url_username: "{{ observability_grafana_admin_user | default('admin') }}"
+    url_password: "{{ observability_grafana_admin_password_runtime }}"
+    status_code:
+      - 200
+      - 202
+  no_log: true
+  register: observability_grafana_alert_telegram_contact_point_update
+  when:
+    - observability_grafana_alert_telegram_enabled | bool
+    - observability_grafana_alert_telegram_contact_point_exists | default(false) | bool
+    - observability_manage_services | default(true)
+
+- name: Reconcile Grafana Telegram notification policy
+  ansible.builtin.uri:
+    url: "{{ observability_grafana_local_url_effective }}/api/v1/provisioning/policies"
+    method: PUT
+    body_format: json
+    body:
+      receiver: homelab-telegram
+      group_by:
+        - grafana_folder
+        - alertname
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+    force_basic_auth: true
+    url_username: "{{ observability_grafana_admin_user | default('admin') }}"
+    url_password: "{{ observability_grafana_admin_password_runtime }}"
+    status_code:
+      - 200
+      - 202
+  register: observability_grafana_alert_telegram_policy_update
+  when:
+    - observability_grafana_alert_telegram_enabled | bool
+    - observability_manage_services | default(true)
+
+- name: Determine whether observability stack restart is required
+  ansible.builtin.set_fact:
+    observability_restart_required: >-
+      {{
+        (observability_prometheus_config_copy.changed | default(false))
+        or (observability_tempo_config_copy.changed | default(false))
+        or (observability_blackbox_config_copy.changed | default(false))
+        or (observability_datasources_copy.changed | default(false))
+        or (observability_dashboard_provider_copy.changed | default(false))
+        or (observability_dashboards_copy.changed | default(false))
+        or (observability_dashboards_cleanup.changed | default(false))
+        or (observability_alert_rules_copy.changed | default(false))
+        or (observability_alert_rules_cleanup.changed | default(false))
+        or (observability_alert_contact_points_copy.changed | default(false))
+        or (observability_alert_contact_points_cleanup.changed | default(false))
+        or (observability_alert_policies_copy.changed | default(false))
+        or (observability_alert_policies_cleanup.changed | default(false))
+        or (observability_compose_copy.changed | default(false))
+        or (observability_unit_copy.changed | default(false))
+        or (observability_env_copy.changed | default(false))
+      }}
+
+- name: Check Docker FORWARD chain before observability restart
+  ansible.builtin.command:
+    argv:
+      - iptables
+      - -t
+      - filter
+      - -S
+      - DOCKER-FORWARD
+  register: observability_docker_forward_chain
+  changed_when: false
+  failed_when: false
+  when: observability_restart_required | bool
+
+- name: Restart Docker when DOCKER-FORWARD chain is missing
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+  when:
+    - observability_restart_required | bool
+    - observability_docker_forward_chain.rc != 0
+    - observability_manage_services | default(true)
+
+- name: Wait for Docker daemon after self-heal restart
+  ansible.builtin.command:
+    argv: [docker, info]
+  register: observability_docker_info
+  changed_when: false
+  retries: 10
+  delay: 3
+  until: observability_docker_info.rc == 0
+  when:
+    - observability_restart_required | bool
+    - observability_docker_forward_chain.rc != 0
+    - observability_manage_services | default(true)
+
+- name: Restart observability stack when compose or configs changed
+  ansible.builtin.systemd:
+    name: observability
+    state: restarted
+  when:
+    - observability_restart_required | bool
+    - observability_manage_services | default(true)
+
+- name: Restart adguard-exporter after credential validation when stack did not restart
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - -f
+      - "{{ observability_compose_file }}"
+      - up
+      - -d
+      - adguard-exporter
+    chdir: "{{ observability_compose_dir }}"
+  changed_when: true
+  when:
+    - observability_adguard_exporter_enabled | default(false)
+    - observability_adguard_exporter_stop.changed | default(false)
+    - not (observability_restart_required | bool)
+    - observability_manage_services | default(true)

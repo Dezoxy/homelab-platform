@@ -1,0 +1,130 @@
+name: CI / Trivy Image Scan
+on:
+  pull_request:
+    paths:
+      - "ansible/host_vars/**"
+      - "ansible/roles/**/defaults/main.yml"
+      - "ansible/roles/**/defaults/main.yaml"
+      - "scripts/ci/extract_container_images.py"
+      - ".github/workflows/trivy.yml"
+  schedule:
+    # 03:15 CET / 04:15 CEST, before Renovate's 06:00 local window.
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    # ────────────────────────────────────────────────────────────────────────
+    # TEMPORARILY SKIPPED (kept, not removed). Trivy scans are disabled
+    # repo-wide while their recurring problems are worked out. The triggers,
+    # steps, version pin, and all wiring are intentionally left intact.
+    #
+    # The job only runs when repository variable TRIVY_ENABLED == 'true'. That
+    # variable is intentionally unset, so the job is skipped on every trigger
+    # (PRs, daily schedule, manual dispatch). A skipped run reports
+    # conclusion=skipped.
+    #
+    # Re-enable by setting repo variable TRIVY_ENABLED=true
+    # (Settings → Secrets and variables → Actions → Variables), or by changing
+    # the guard below. A repo-variable gate is used instead of `if: false`
+    # because actionlint rejects constant `if:` conditions (if-cond rule).
+    # ────────────────────────────────────────────────────────────────────────
+    if: ${{ vars.TRIVY_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="0.74.0"
+          curl -fsSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"
+          sudo tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+
+      - name: Extract image references
+        id: images
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          scan_all=false
+          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+            scan_all=true
+          elif ! git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- \
+            .github/workflows/trivy.yml scripts/ci/extract_container_images.py; then
+            scan_all=true
+          fi
+
+          if [[ "${scan_all}" == "true" ]]; then
+            echo "Extracting the full Ansible image-pin inventory."
+            mapfile -d '' source_files < <(
+              find ansible/host_vars -type f \( -name '*.yml' -o -name '*.yaml' \) -print0
+              find ansible/roles -type f \
+                \( -path '*/defaults/main.yml' -o -path '*/defaults/main.yaml' \) -print0
+            )
+            images="$(python3 scripts/ci/extract_container_images.py "${source_files[@]}")"
+          else
+            echo "Extracting changed Ansible image pins."
+            images="$(
+              git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- \
+                ansible/host_vars \
+                ':(glob)ansible/roles/*/defaults/main.yml' \
+                ':(glob)ansible/roles/*/defaults/main.yaml' \
+              | python3 scripts/ci/extract_container_images.py
+            )"
+          fi
+
+          if [[ -z "${images}" ]]; then
+            echo "No literal tagged image references found; nothing to scan."
+            { echo "list="; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found images:"
+          echo "$images"
+          {
+            echo "list<<EOF"
+            echo "$images"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Scan images for HIGH/CRITICAL CVEs
+        shell: bash
+        env:
+          IMAGES: ${{ steps.images.outputs.list }}
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r image; do
+            [[ -z "$image" ]] && continue
+            echo "--- Scanning: $image ---"
+            if ! trivy image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --no-progress \
+              "${image}"; then
+              failed=$((failed + 1))
+            fi
+          done <<< "$IMAGES"
+
+          if [[ $failed -gt 0 ]]; then
+            echo "$failed image(s) are vulnerable or could not be scanned"
+            exit 1
+          fi

@@ -1,0 +1,210 @@
+- name: Bootstrap SSH users and keys
+  hosts: all
+  become: true
+  vars:
+    toomhorvath_pubkey: >-
+      {{
+        (lookup('ansible.builtin.file', inventory_dir + '/../keys/toomhorvath.pub', errors='ignore')
+          | default('', true) | trim)
+        or (lookup('env', 'TOOMHORVATH_SSH_PUBLIC_KEY') | default('', true) | trim)
+        or (lookup('env', 'ADMIN_SSH_PUBKEY') | default('', true) | trim)
+      }}
+    runner_pubkey: >-
+      {{
+        (lookup('ansible.builtin.file', inventory_dir + '/../keys/runner.pub', errors='ignore')
+          | default('', true) | trim)
+        or (lookup('env', 'RUNNER_SSH_PUBLIC_KEY') | default('', true) | trim)
+        or (lookup('env', 'RUNNER_SSH_PUBKEY') | default('', true) | trim)
+      }}
+    bootstrap_user: toomhorvath
+    bootstrap_groups:
+      - sudo
+    runner_ssh_user: runner
+    runner_ssh_groups:
+      - sudo
+    legacy_cloud_init_user: root
+    remove_runner_key_from_legacy_cloud_init_user: true
+    bootstrap_force: false
+
+  pre_tasks:
+    - name: Ensure SSH public keys are available
+      ansible.builtin.assert:
+        that:
+          - toomhorvath_pubkey | length > 0
+          - runner_pubkey | length > 0
+        fail_msg: >-
+          Missing SSH public keys. Provide keys/toomhorvath.pub and keys/runner.pub
+          or set TOOMHORVATH_SSH_PUBLIC_KEY and RUNNER_SSH_PUBLIC_KEY in the environment.
+
+    - name: Check if bootstrap user exists
+      ansible.builtin.command: id -u "{{ bootstrap_user }}"
+      register: bootstrap_user_id
+      failed_when: false
+      changed_when: false
+
+    - name: Check if runner SSH user exists
+      ansible.builtin.command: id -u "{{ runner_ssh_user }}"
+      register: runner_user_id
+      failed_when: false
+      changed_when: false
+
+    - name: Check if legacy cloud-init user exists
+      ansible.builtin.command: id -u "{{ legacy_cloud_init_user }}"
+      register: legacy_user_id
+      failed_when: false
+      changed_when: false
+
+    - name: Check authorized_keys file
+      ansible.builtin.stat:
+        path: "/home/{{ bootstrap_user }}/.ssh/authorized_keys"
+      register: bootstrap_auth_keys
+      when: bootstrap_user_id.rc == 0
+
+    - name: Check required keys in authorized_keys
+      ansible.builtin.command: "grep -Fqx '{{ item }}' /home/{{ bootstrap_user }}/.ssh/authorized_keys"
+      register: bootstrap_key_checks
+      loop:
+        - "{{ toomhorvath_pubkey }}"
+      failed_when: false
+      changed_when: false
+      when: bootstrap_user_id.rc == 0 and bootstrap_auth_keys.stat.exists
+
+    - name: Check runner authorized_keys file
+      ansible.builtin.stat:
+        path: "/home/{{ runner_ssh_user }}/.ssh/authorized_keys"
+      register: runner_auth_keys
+      when: runner_user_id.rc == 0
+
+    - name: Check runner key in authorized_keys
+      ansible.builtin.command: "grep -Fqx '{{ runner_pubkey }}' /home/{{ runner_ssh_user }}/.ssh/authorized_keys"
+      register: runner_key_check
+      failed_when: false
+      changed_when: false
+      when: runner_user_id.rc == 0 and runner_auth_keys.stat.exists
+
+    - name: Check bootstrap sudoers file
+      ansible.builtin.stat:
+        path: /etc/sudoers.d/90-bootstrap-user
+      register: bootstrap_sudoers_file
+
+    - name: Check runner sudoers file
+      ansible.builtin.stat:
+        path: /etc/sudoers.d/90-runner-user
+      register: runner_sudoers_file
+
+    - name: Normalize bootstrap_force
+      ansible.builtin.set_fact:
+        bootstrap_force_bool: "{{ bootstrap_force | bool }}"
+
+    - name: Compute bootstrap state
+      ansible.builtin.set_fact:
+        bootstrap_user_exists: "{{ bootstrap_user_id.rc == 0 }}"
+        bootstrap_keys_missing: >-
+          {{
+            (bootstrap_user_id.rc != 0)
+            or (not (bootstrap_auth_keys.stat.exists | default(false)))
+            or ((bootstrap_key_checks.results | default([]))
+                | selectattr('rc', 'ne', 0)
+                | list
+                | length > 0)
+          }}
+        bootstrap_sudoers_missing: "{{ (bootstrap_user_id.rc != 0) or (not bootstrap_sudoers_file.stat.exists) }}"
+        runner_user_exists: "{{ runner_user_id.rc == 0 }}"
+        runner_keys_missing: >-
+          {{
+            (runner_user_id.rc != 0)
+            or (not (runner_auth_keys.stat.exists | default(false)))
+            or (runner_key_check.rc | default(1) != 0)
+          }}
+        runner_sudoers_missing: "{{ (runner_user_id.rc != 0) or (not runner_sudoers_file.stat.exists) }}"
+
+    - name: Decide if bootstrap is needed
+      ansible.builtin.set_fact:
+        bootstrap_needed_user: "{{ bootstrap_force_bool or (bootstrap_user_id.rc != 0) }}"
+        bootstrap_needed_keys: "{{ bootstrap_force_bool or bootstrap_keys_missing }}"
+        bootstrap_needed_sudoers: "{{ bootstrap_force_bool or bootstrap_sudoers_missing }}"
+        runner_needed_user: "{{ bootstrap_force_bool or (runner_user_id.rc != 0) }}"
+        runner_needed_keys: "{{ bootstrap_force_bool or runner_keys_missing }}"
+        runner_needed_sudoers: "{{ bootstrap_force_bool or runner_sudoers_missing }}"
+
+  tasks:
+    - name: Ensure sudo is installed
+      ansible.builtin.package:
+        name: sudo
+        state: present
+      when: bootstrap_needed_user
+
+    - name: Ensure bootstrap user exists
+      ansible.builtin.user:
+        name: "{{ bootstrap_user }}"
+        groups: "{{ bootstrap_groups | join(',') }}"
+        append: true
+        create_home: true
+        shell: /bin/bash
+        state: present
+      when: bootstrap_needed_user
+
+    - name: Install SSH keys for bootstrap user
+      ansible.posix.authorized_key:
+        user: "{{ bootstrap_user }}"
+        key: "{{ item }}"
+        state: present
+      loop:
+        - "{{ toomhorvath_pubkey }}"
+      when: bootstrap_needed_keys
+
+    - name: Ensure runner key is not installed for bootstrap user
+      ansible.posix.authorized_key:
+        user: "{{ bootstrap_user }}"
+        key: "{{ runner_pubkey }}"
+        state: absent
+      when: bootstrap_needed_user or bootstrap_user_exists
+
+    - name: Configure passwordless sudo for bootstrap user
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-bootstrap-user
+        mode: "0440"
+        content: |
+          {{ bootstrap_user }} ALL=(ALL) NOPASSWD:ALL
+        validate: "/usr/sbin/visudo -cf %s"
+      when: bootstrap_needed_sudoers
+
+    - name: Ensure runner SSH user exists
+      ansible.builtin.user:
+        name: "{{ runner_ssh_user }}"
+        groups: "{{ runner_ssh_groups | join(',') }}"
+        append: true
+        create_home: true
+        shell: /bin/bash
+        state: present
+      when: runner_needed_user
+
+    - name: Install SSH key for runner user
+      ansible.posix.authorized_key:
+        user: "{{ runner_ssh_user }}"
+        key: "{{ runner_pubkey }}"
+        state: present
+      when: runner_needed_keys
+
+    - name: Ensure admin key is not installed for runner user
+      ansible.posix.authorized_key:
+        user: "{{ runner_ssh_user }}"
+        key: "{{ toomhorvath_pubkey }}"
+        state: absent
+      when: runner_needed_user or runner_user_exists
+
+    - name: Ensure runner key is not installed for legacy cloud-init user
+      ansible.posix.authorized_key:
+        user: "{{ legacy_cloud_init_user }}"
+        key: "{{ runner_pubkey }}"
+        state: absent
+      when: (remove_runner_key_from_legacy_cloud_init_user | bool) and (legacy_user_id.rc == 0)
+
+    - name: Configure passwordless sudo for runner user
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-runner-user
+        mode: "0440"
+        content: |
+          {{ runner_ssh_user }} ALL=(ALL) NOPASSWD:ALL
+        validate: "/usr/sbin/visudo -cf %s"
+      when: runner_needed_sudoers

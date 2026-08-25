@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: code_server
+  author: toomhorvath
+  description: "Runs code-server (VS Code in the browser) alongside the agent CLIs."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies: []

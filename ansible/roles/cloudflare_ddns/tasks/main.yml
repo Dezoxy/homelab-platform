@@ -1,0 +1,89 @@
+---
+- name: Require Cloudflare DDNS configuration
+  ansible.builtin.assert:
+    that:
+      - (cloudflare_ddns_api_token | default('') | trim) | length > 0
+      - (cloudflare_ddns_zone_id | default('') | trim) | length > 0
+      - (cloudflare_ddns_record_name | default('') | trim) | length > 0
+    fail_msg: >-
+      cloudflare_ddns is enabled but incompletely configured. The token comes
+      from the unifi-ddns-cf-api-token Key Vault secret (folder=unifi, envvar=
+      UNIFI_DDNS_CF_API_TOKEN) and must be scoped Zone:DNS:Edit on
+      example.net ONLY -- do not reuse CLOUDFLARE_DNS_API_TOKEN, which can
+      also rewrite the primary zone. Set zone id and record name in
+      ansible/host_vars/01-unifi-vm/vars.yml. See docs/unifi.md.
+  when: cloudflare_ddns_enabled | bool
+
+- name: Ensure curl is present
+  ansible.builtin.apt:
+    name: curl
+    state: present
+  when: cloudflare_ddns_enabled | bool
+
+- name: Ensure DDNS state directory
+  ansible.builtin.file:
+    path: "{{ cloudflare_ddns_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when: cloudflare_ddns_enabled | bool
+
+- name: Install DDNS environment file
+  ansible.builtin.template:
+    src: cloudflare-ddns.env.j2
+    dest: "{{ cloudflare_ddns_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart cloudflare-ddns timer
+  when: cloudflare_ddns_enabled | bool
+
+- name: Install DDNS updater script
+  ansible.builtin.template:
+    src: cloudflare-ddns.sh.j2
+    dest: "{{ cloudflare_ddns_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart cloudflare-ddns timer
+  when: cloudflare_ddns_enabled | bool
+
+- name: Install DDNS systemd unit
+  ansible.builtin.template:
+    src: cloudflare-ddns.service.j2
+    dest: /etc/systemd/system/cloudflare-ddns.service
+    mode: "0644"
+  notify: Restart cloudflare-ddns timer
+  when: cloudflare_ddns_enabled | bool
+
+- name: Install DDNS systemd timer
+  ansible.builtin.template:
+    src: cloudflare-ddns.timer.j2
+    dest: /etc/systemd/system/cloudflare-ddns.timer
+    mode: "0644"
+  notify: Restart cloudflare-ddns timer
+  when: cloudflare_ddns_enabled | bool
+
+- name: Enable and start the DDNS timer
+  ansible.builtin.systemd_service:
+    name: cloudflare-ddns.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: cloudflare_ddns_enabled | bool
+
+# Run once at deploy time rather than waiting up to the timer interval: if the
+# token is wrong or the record is missing, that should fail the deploy, not
+# surface as three offline access points at the next IP change.
+- name: Run the DDNS updater once to verify it works
+  ansible.builtin.command: "{{ cloudflare_ddns_bin }}"
+  environment:
+    CF_API_TOKEN: "{{ cloudflare_ddns_api_token }}"
+    CF_ZONE_ID: "{{ cloudflare_ddns_zone_id }}"
+    CF_RECORD_NAME: "{{ cloudflare_ddns_record_name }}"
+  register: cloudflare_ddns_first_run
+  changed_when: "'now points at' in cloudflare_ddns_first_run.stdout"
+  no_log: true
+  when: cloudflare_ddns_enabled | bool

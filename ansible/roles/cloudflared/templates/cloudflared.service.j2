@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflared Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/cloudflared
+ExecStart=/usr/bin/cloudflared tunnel{% if cloudflared_no_autoupdate %} --no-autoupdate{% endif %} --metrics $CLOUDFLARED_METRICS run --token $TUNNEL_TOKEN
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

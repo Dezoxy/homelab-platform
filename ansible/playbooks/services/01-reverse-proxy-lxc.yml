@@ -1,0 +1,17 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Configure Traefik in 01-reverse-proxy-lxc
+  hosts: 01-reverse-proxy-lxc
+  become: true
+  tasks:
+    - name: Deploy traefik role
+      ansible.builtin.import_role:
+        name: traefik

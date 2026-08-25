@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PRIMARY_ENV_FILE="{{ restic_appdata_env_file }}"
+SECONDARY_ENABLED="{{ 'true' if (restic_appdata_secondary_enabled_effective | bool) else 'false' }}"
+SECONDARY_ENV_FILE="{{ restic_appdata_secondary_env_file_effective }}"
+SOURCE_DIR="{{ restic_appdata_source_dir }}"
+EXCLUDE_FILE="{{ restic_appdata_exclude_file_effective }}"
+CACHE_DIR="{{ restic_cache_dir }}"
+LOCK_FILE="{{ restic_lock_file }}"
+METRICS_DIR="{{ restic_textfile_directory }}"
+PRIMARY_SUCCESS_METRIC_FILE="{{ restic_appdata_primary_success_metric_file }}"
+SECONDARY_SUCCESS_METRIC_FILE="{{ restic_appdata_secondary_success_metric_file }}"
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+CURRENT_PHASE="startup"
+CURRENT_PHASE_STARTED_AT="$(date +%s)"
+
+log() {
+  printf '%s run_id=%s %s\n' "$(date --iso-8601=seconds)" "${RUN_ID}" "$*" >&2
+}
+
+start_phase() {
+  CURRENT_PHASE="$1"
+  CURRENT_PHASE_STARTED_AT="$(date +%s)"
+  log "START phase=\"${CURRENT_PHASE}\""
+}
+
+end_phase() {
+  local status="${1:-0}"
+  local ended_at
+  local duration
+
+  ended_at="$(date +%s)"
+  duration=$((ended_at - CURRENT_PHASE_STARTED_AT))
+  if [ "${status}" -eq 0 ]; then
+    log "OK phase=\"${CURRENT_PHASE}\" duration_seconds=${duration}"
+  else
+    log "FAIL phase=\"${CURRENT_PHASE}\" status=${status} duration_seconds=${duration}"
+  fi
+  CURRENT_PHASE="idle"
+  CURRENT_PHASE_STARTED_AT="${ended_at}"
+}
+
+log_failure_on_exit() {
+  local status="$?"
+
+  if [ "${status}" -ne 0 ]; then
+    end_phase "${status}"
+  fi
+  exit "${status}"
+}
+
+trap log_failure_on_exit EXIT
+
+log "Starting restic appdata backup script restic_version=\"$(restic version 2>/dev/null || printf 'unavailable')\""
+
+mkdir -p "${CACHE_DIR}"
+mkdir -p "${METRICS_DIR}"
+export RESTIC_CACHE_DIR="${CACHE_DIR}"
+
+S3_CONNECTIONS={{ restic_appdata_s3_connections | default(0) | int }}
+restic_cmd=(restic)
+if [ "${S3_CONNECTIONS}" -gt 0 ]; then
+  restic_cmd+=(-o "s3.connections=${S3_CONNECTIONS}")
+fi
+
+mkdir -p "$(dirname "${LOCK_FILE}")"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "Another restic run is already in progress (lock: ${LOCK_FILE})." >&2
+  exit 0
+fi
+log "Acquired lock lock_file=${LOCK_FILE} cache_dir=${RESTIC_CACHE_DIR}"
+
+has_excludes=false
+exclude_args=()
+if [ -r "${EXCLUDE_FILE}" ] && [ -s "${EXCLUDE_FILE}" ]; then
+  has_excludes=true
+  exclude_args+=(--exclude-file "${EXCLUDE_FILE}")
+  log "Using exclude file exclude_file=${EXCLUDE_FILE}"
+else
+  log "No exclude file configured or file is empty exclude_file=${EXCLUDE_FILE}"
+fi
+
+load_env_file() {
+  local env_file="$1"
+
+  if [ ! -r "${env_file}" ]; then
+    echo "Missing env file: ${env_file}" >&2
+    exit 1
+  fi
+
+  unset RESTIC_REPOSITORY RESTIC_PASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+
+  # shellcheck disable=SC1090
+  set -a
+  . "${env_file}"
+  set +a
+
+  if [ -z "${RESTIC_REPOSITORY:-}" ]; then
+    echo "RESTIC_REPOSITORY is not set (configure ${env_file})." >&2
+    exit 1
+  fi
+  if [ -z "${RESTIC_PASSWORD:-}" ]; then
+    echo "RESTIC_PASSWORD is not set (configure ${env_file})." >&2
+    exit 1
+  fi
+
+  # Derive the AWS region from a standard AWS S3 endpoint when it is omitted.
+  if [ -z "${AWS_DEFAULT_REGION:-}" ] && [[ "${RESTIC_REPOSITORY:-}" =~ ^s3:s3\.([^.]+)\.amazonaws\.com/ ]]; then
+    AWS_DEFAULT_REGION="${BASH_REMATCH[1]}"
+    export AWS_DEFAULT_REGION
+  fi
+}
+
+ensure_repo_initialized() {
+  local label="$1"
+  local init_err
+
+  init_err="$(mktemp -t restic-init-err.XXXXXX)"
+  if ! "${restic_cmd[@]}" cat config >/dev/null 2>"${init_err}"; then
+    if grep -q "Is there a repository at the following location?" "${init_err}"; then
+      echo "Restic repo not initialized for ${label}; running restic init..." >&2
+      "${restic_cmd[@]}" init
+    else
+      cat "${init_err}" >&2
+      rm -f "${init_err}"
+      exit 1
+    fi
+  fi
+  rm -f "${init_err}"
+
+  # Clean up stale locks from previous crashed runs for this repository.
+  "${restic_cmd[@]}" unlock >/dev/null 2>&1 || true
+}
+
+metric_file_for_label() {
+  local label="$1"
+
+  case "${label}" in
+    b2)
+      printf '%s\n' "${PRIMARY_SUCCESS_METRIC_FILE}"
+      ;;
+    aws)
+      printf '%s\n' "${SECONDARY_SUCCESS_METRIC_FILE}"
+      ;;
+    *)
+      echo "Unknown backup target label: ${label}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+write_repository_metrics() {
+  local label="$1"
+  local metric_file="$2"
+  local raw_json="$3"
+  local latest_json="$4"
+  local now
+  local tmp_file
+
+  now="$(date +%s)"
+  tmp_file="${metric_file}.$$"
+  RAW_JSON="${raw_json}" \
+  LATEST_JSON="${latest_json}" \
+  METRIC_LABEL="${label}" \
+  METRIC_NOW="${now}" \
+  python3 - <<'PY' >"${tmp_file}"
+import json
+import os
+
+label = os.environ["METRIC_LABEL"]
+now = int(os.environ["METRIC_NOW"])
+raw = json.loads(os.environ["RAW_JSON"])
+latest = json.loads(os.environ["LATEST_JSON"])
+labels = f'backup_set="appdata",service="restic",target="{label}"'
+
+def emit_help(name: str, description: str) -> None:
+    print(f"# HELP {name} {description}")
+    print(f"# TYPE {name} gauge")
+
+def emit_value(name: str, value) -> None:
+    print(name + "{" + labels + "} " + str(value))
+
+emit_help(
+    "homelab_restic_backup_last_success_unixtime",
+    "Unix timestamp of the last successful restic appdata backup.",
+)
+emit_value("homelab_restic_backup_last_success_unixtime", now)
+
+emit_help(
+    "homelab_restic_repository_stored_size_bytes",
+    "Compressed repository size in bytes reported by restic stats --mode raw-data.",
+)
+emit_value("homelab_restic_repository_stored_size_bytes", raw["total_size"])
+
+emit_help(
+    "homelab_restic_repository_uncompressed_size_bytes",
+    "Repository size in bytes before compression reported by restic stats --mode raw-data.",
+)
+emit_value("homelab_restic_repository_uncompressed_size_bytes", raw["total_uncompressed_size"])
+
+emit_help(
+    "homelab_restic_repository_blob_count",
+    "Number of blobs in the repository reported by restic stats --mode raw-data.",
+)
+emit_value("homelab_restic_repository_blob_count", raw["total_blob_count"])
+
+emit_help(
+    "homelab_restic_repository_snapshots_count",
+    "Number of snapshots retained in the repository reported by restic stats --mode raw-data.",
+)
+emit_value("homelab_restic_repository_snapshots_count", raw["snapshots_count"])
+
+emit_help(
+    "homelab_restic_repository_compression_ratio",
+    "Compression ratio reported by restic stats --mode raw-data.",
+)
+emit_value("homelab_restic_repository_compression_ratio", raw["compression_ratio"])
+
+emit_help(
+    "homelab_restic_repository_compression_space_saving_percent",
+    "Compression space saving percentage reported by restic stats --mode raw-data.",
+)
+emit_value(
+    "homelab_restic_repository_compression_space_saving_percent",
+    raw["compression_space_saving"],
+)
+
+emit_help(
+    "homelab_restic_repository_compression_progress_percent",
+    "Compression progress percentage reported by restic stats --mode raw-data.",
+)
+emit_value(
+    "homelab_restic_repository_compression_progress_percent",
+    raw["compression_progress"],
+)
+
+emit_help(
+    "homelab_restic_latest_restore_size_bytes",
+    "Restore size in bytes for the latest appdata snapshot reported by restic stats latest.",
+)
+emit_value("homelab_restic_latest_restore_size_bytes", latest["total_size"])
+
+emit_help(
+    "homelab_restic_latest_file_count",
+    "Number of files in the latest appdata snapshot reported by restic stats latest.",
+)
+emit_value("homelab_restic_latest_file_count", latest["total_file_count"])
+PY
+  mv "${tmp_file}" "${metric_file}"
+}
+
+run_backup_target() {
+  local env_file="$1"
+  local label="$2"
+  local metric_file
+  local raw_json
+  local latest_json
+  local -a backup_args
+
+  start_phase "load environment (${label})"
+  load_env_file "${env_file}"
+  log "Loaded environment target=${label} repository=${RESTIC_REPOSITORY}"
+  end_phase
+
+  start_phase "repository init and unlock (${label})"
+  ensure_repo_initialized "${label}"
+  end_phase
+
+  log "Running restic backup target=${label} source=${SOURCE_DIR}"
+  backup_args=("${restic_cmd[@]}" backup "${SOURCE_DIR}" --tag appdata --tag "${label}")
+  if [ "${has_excludes}" = "true" ]; then
+    backup_args+=("${exclude_args[@]}")
+  fi
+  start_phase "backup (${label})"
+  "${backup_args[@]}"
+  end_phase
+
+  log "Pruning old snapshots target=${label} keep_daily={{ restic_appdata_keep_daily }} keep_weekly={{ restic_appdata_keep_weekly }} keep_monthly={{ restic_appdata_keep_monthly }}"
+  start_phase "forget and prune (${label})"
+  "${restic_cmd[@]}" forget --prune \
+    --keep-daily {{ restic_appdata_keep_daily }} \
+    --keep-weekly {{ restic_appdata_keep_weekly }} \
+    --keep-monthly {{ restic_appdata_keep_monthly }}
+  end_phase
+
+  log "Running metadata-only repository check target=${label}"
+  start_phase "metadata check (${label})"
+  "${restic_cmd[@]}" check
+  end_phase
+
+  metric_file="$(metric_file_for_label "${label}")"
+  log "Collecting raw repository metrics target=${label}"
+  start_phase "raw repository metrics (${label})"
+  raw_json="$("${restic_cmd[@]}" stats --mode raw-data --json)"
+  end_phase
+
+  log "Collecting latest snapshot metrics target=${label}"
+  start_phase "latest snapshot metrics (${label})"
+  latest_json="$("${restic_cmd[@]}" stats latest --json)"
+  end_phase
+
+  start_phase "write metrics (${label})"
+  write_repository_metrics "${label}" "${metric_file}" "${raw_json}" "${latest_json}"
+  end_phase
+}
+
+run_backup_target "${PRIMARY_ENV_FILE}" "b2"
+
+# AWS secondary restic target is currently disabled.
+# if [ "${SECONDARY_ENABLED}" = "true" ]; then
+#   run_backup_target "${SECONDARY_ENV_FILE}" "aws"
+# fi
+
+log "Backup complete."

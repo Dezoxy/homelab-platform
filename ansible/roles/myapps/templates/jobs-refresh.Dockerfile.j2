@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm-slim
+
+# This image is built locally and exists in no registry, yet between one-shot
+# runs no container references it -- an unfiltered `docker image prune -a`
+# deletes it and the next timer fire dies on an impossible pull (happened
+# 2026-08-02, first Sunday of pve-fleet-cleanup.timer). The fleet cleanup's
+# prune excludes images carrying this label; keep the key in sync with
+# scripts/ops/pve_fleet_cleanup.py.
+LABEL homelab.prune-keep="true"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG CLAUDE_CLI_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/usr/local/bin:${PATH}"
+
+# node:22-bookworm-slim ships neither git, curl, nor an SSH client; git is
+# needed at runtime to check out the jobs-dashboard repo and the
+# employee-cv sparse checkout into their bind-mounted volumes (the host has
+# git, but per this role's everything-runs-in-a-container rule, the
+# container does its own checkout). openssh-client provides the `ssh`
+# binary git-over-SSH needs -- both repos are cloned/pulled/pushed over SSH
+# using the per-repo deploy keys bind-mounted read-only at runtime (see
+# myapps-compose.yml.j2).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         git \
+         openssh-client \
+         ca-certificates \
+         curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-accept github.com's host key at build time so a run never blocks on an
+# interactive SSH host-key prompt (git over SSH would otherwise refuse to
+# connect non-interactively under StrictHostKeyChecking). These two lines
+# are GitHub's own published ed25519 + ecdsa host keys -- pinned as literals
+# rather than fetched via `ssh-keyscan` at build time, deliberately: keyscan
+# is trust-on-first-use, and a MITM during the image build would plant a
+# forged github.com host key into the image, which this container is later
+# handed a WRITE-capable deploy key against (jobs-dashboard) -- exactly the
+# kind of credential a forged host key exists to steal. Not secrets --
+# public values, documented at
+# https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+# and served machine-readably as `ssh_keys` by https://api.github.com/meta
+# (verified against that endpoint directly when this was written). A future
+# GitHub SSH host-key rotation will require updating the two lines below.
+# `test -s` fails the build loudly rather than silently shipping an image
+# with an empty/broken known_hosts.
+#
+# This lands in `node`'s home (/home/node), not /root: the container runs
+# as the `node` user (uid/gid 1000, already shipped by this base image),
+# not root -- see the USER instruction below for why. /root itself is 0700
+# and would be unreadable to that user, so root's known_hosts would never
+# be found by its git/ssh.
+RUN mkdir -p /home/node/.ssh \
+    && chmod 700 /home/node/.ssh \
+    && { \
+         echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'; \
+         echo 'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg='; \
+       } >> /home/node/.ssh/known_hosts \
+    && test -s /home/node/.ssh/known_hosts \
+    && chmod 644 /home/node/.ssh/known_hosts \
+    && chown -R node:node /home/node/.ssh
+
+# Installer mechanism: a pinned CLI version via build arg, installed through
+# a throwaway HOME so the CLI binary can be lifted out to /usr/local/bin
+# without carrying install-time state into the image. Installed as root
+# (root owns /usr/local/bin already) but landed with mode 0755, so the
+# non-root `node` user can execute it too.
+RUN tmp_home="$(mktemp -d)" \
+    && installer="$(mktemp)" \
+    && curl -fsSL https://claude.ai/install.sh -o "$installer" \
+    && HOME="$tmp_home" bash "$installer" "$CLAUDE_CLI_VERSION" \
+    && install -m 0755 "$tmp_home/.local/bin/claude" /usr/local/bin/claude \
+    && rm -rf "$tmp_home" "$installer"
+
+WORKDIR /data
+
+# The bootstrap script is NOT baked into this image -- it's rendered by the
+# role onto the host (jobs-refresh-bootstrap.sh.j2) and bind-mounted
+# read-only at this exact path (see myapps-compose.yml.j2). That keeps
+# tweaks to the bootstrap mechanics (repo URLs, sparse paths) an Ansible
+# redeploy, not an image rebuild, and mirrors how this role already keeps
+# config out of images (digest.env, the notify script). The bootstrap
+# clones/pulls both repos and execs the app's own
+# jobs-dashboard/scripts/refresh-run.sh, which is what actually needs
+# node/npm -- so the image only has to provide the runtime, not the logic.
+#
+# Run as the non-root `node` user (uid/gid 1000, shipped by this base
+# image), not root -- for two independent reasons: Claude CLI's
+# `--permission-mode bypassPermissions` (which refresh-run.sh needs, since
+# it runs headless with no TTY to answer a permission prompt) refuses to
+# run under root/sudo by design; and separately, this container holds a
+# WRITE-capable git deploy key, which is worth not handing to a root
+# process regardless. myapps-compose.yml.j2 sets the same uid:gid via
+# `user:`, and the role chowns the bind-mounted host paths (repo,
+# employee-cv, claude-home, both SSH keys) to match -- see
+# myapps_jobs_refresh_container_uid/_gid in defaults/main.yml.
+ENV HOME=/home/node
+USER node
+CMD ["/usr/local/bin/jobs-refresh-bootstrap.sh"]

@@ -1,0 +1,9 @@
+[Unit]
+Description=Restic failure notification: appdata
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists={{ restic_notify_script }}
+
+[Service]
+Type=oneshot
+ExecStart={{ restic_notify_script }} {{ restic_appdata_service_name }}.service

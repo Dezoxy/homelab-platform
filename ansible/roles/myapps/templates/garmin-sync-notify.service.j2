@@ -1,0 +1,12 @@
+[Unit]
+Description=garmin-health sync failure notification
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists={{ myapps_notify_script }}
+
+[Service]
+Type=oneshot
+# Second argument overrides the notify env file: garmin alerts go to the
+# DEDICATED health bot, not the shared digest alert bot. The journal tail this
+# ships can contain the owner's Garmin account name and data dates.
+ExecStart={{ myapps_notify_script }} garmin-sync.service {{ myapps_garmin_health_notify_env_file }}

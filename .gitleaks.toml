@@ -1,0 +1,10 @@
+[allowlist]
+description = "Project-specific false positive suppressions"
+
+# retired/infra-proxmox/terraform/01-n8n-lxc/main.tf (n8n stack retired) — the
+# `keyctl` attribute is a Proxmox LXC Linux kernel keyring capability flag, not
+# an API key. gitleaks generic-api-key fired on `keyctl = var.n8n_lxc_keyctl`
+# (entropy 3.7); this historical commit suppression is kept for history scans.
+commits = [
+  "04a15cecc79cf0ed9f1dc2921ccc76f0c9ea5b05",
+]

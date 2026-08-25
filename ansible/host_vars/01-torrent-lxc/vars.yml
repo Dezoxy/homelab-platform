@@ -1,0 +1,118 @@
+---
+qbittorrent_conf_settings:
+  - key: "WebUI\\ReverseProxySupportEnabled"
+    value: "true"
+  - key: "WebUI\\TrustedReverseProxiesList"
+    value: "192.168.1.0/24"
+  # Keep incomplete data on the staging SSD bind mount. qBittorrent stores
+  # both legacy Downloads keys and current Session keys across upgrades.
+  - key: "Downloads\\SavePath"
+    value: "/downloads"
+  - key: "Downloads\\TempPath"
+    value: "/incomplete"
+  - key: "Downloads\\TempPathEnabled"
+    value: "true"
+  - key: "Downloads\\UseIncompleteExtension"
+    value: "true"
+  - key: "Session\\DefaultSavePath"
+    value: "/downloads"
+  - key: "Session\\TempPath"
+    value: "/incomplete"
+  - key: "Session\\TempPathEnabled"
+    value: "true"
+  - key: "Session\\SubcategoriesEnabled"
+    value: "true"
+  - key: "Session\\UseCategoryPathsInManualMode"
+    value: "true"
+  - key: "Session\\AddExtensionToIncompleteFiles"
+    value: "true"
+
+qbittorrent_api_username: "{{ lookup('ansible.builtin.env', 'QBITTORRENT_USERNAME') | default('', true) }}"
+qbittorrent_api_password: "{{ lookup('ansible.builtin.env', 'QBITTORRENT_PASSWORD') | default('', true) }}"
+
+qbittorrent_api_preferences:
+  save_path: "/downloads"
+  temp_path: "/incomplete"
+  temp_path_enabled: true
+  incomplete_files_ext: true
+  torrent_content_layout: "Subfolder"
+  auto_tmm_enabled: true
+  category_changed_tmm_enabled: true
+  save_path_changed_tmm_enabled: true
+  torrent_changed_tmm_enabled: true
+  use_subcategories: true
+  use_category_paths_in_manual_mode: true
+  add_stopped_enabled: false
+  add_to_top_of_queue: false
+  merge_trackers: false
+  preallocate_all: false
+  queueing_enabled: true
+  max_active_downloads: 6
+  max_active_torrents: 20
+  max_active_uploads: 15
+  max_connec: 1000
+  max_connec_per_torrent: 500
+  max_uploads: 40
+  max_uploads_per_torrent: 20
+  dl_limit: 0
+  up_limit: 61440000
+  alt_dl_limit: 0
+  alt_up_limit: 0
+  dont_count_slow_torrents: true
+  slow_torrent_dl_rate_threshold: 300
+  slow_torrent_ul_rate_threshold: 100
+  slow_torrent_inactive_timer: 120
+  max_ratio: -1
+  max_ratio_enabled: false
+  max_ratio_act: 0
+  max_seeding_time: 1
+  max_seeding_time_enabled: true
+  max_inactive_seeding_time: -1
+  max_inactive_seeding_time_enabled: false
+  auto_delete_mode: 0
+  torrent_stop_condition: "None"
+  torrent_content_remove_option: "Delete"
+  recheck_completed_torrents: false
+  excluded_file_names_enabled: false
+  use_unwanted_folder: false
+  delete_torrent_content_files: false
+  disk_cache: 4096
+  disk_cache_ttl: 600
+  disk_io_read_mode: 1
+  disk_io_write_mode: 1
+  async_io_threads: 4
+  checking_memory_use: 256
+  disk_queue_size: 134217728
+  file_pool_size: 200
+  hashing_threads: 2
+  enable_coalesce_read_write: true
+  enable_piece_extent_affinity: true
+  listen_port: 57324
+  random_port: false
+  upnp: false
+  dht: true
+  pex: true
+  lsd: true
+  encryption: 0
+  anonymous_mode: false
+  bypass_local_auth: false
+  web_ui_reverse_proxy_enabled: true
+  web_ui_reverse_proxies_list: "192.168.1.0/24"
+  web_ui_port: 8080
+  web_ui_host_header_validation_enabled: false
+  web_ui_csrf_protection_enabled: false
+  web_ui_clickjacking_protection_enabled: false
+  web_ui_secure_cookie_enabled: false
+  web_ui_session_timeout: 3600
+  file_log_enabled: true
+  file_log_backup_enabled: true
+  file_log_delete_old: true
+  file_log_max_size: 65
+  file_log_age: 1
+  file_log_age_type: 1
+
+qbittorrent_categories:
+  - name: movies-radarr
+    save_path: ""
+  - name: tv-sonarr
+    save_path: ""

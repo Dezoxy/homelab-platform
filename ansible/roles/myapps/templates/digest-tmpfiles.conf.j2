@@ -1,0 +1,21 @@
+# notification-digest retention hygiene, applied by systemd-tmpfiles-clean
+# (daily by default). Two rules:
+#  - archive: every digest's markdown lands here forever otherwise; a year
+#    of retention keeps anything plausibly wanted while bounding growth.
+#    'e' = clean an EXISTING dir by age, never create or chown it (the
+#    role's own directory task owns creation and the container-UID chown).
+#  - backups: daily state.db snapshots (digest-backup.service); 7 days'
+#    worth is plenty for the "restore cursors/dedup after a bad crash" case
+#    these exist for. 'd' also creates the dir on tmpfiles --create runs.
+#
+# The OFFSITE copies of those same snapshots are pruned by
+# digest-state-backup itself, not from here. A rule for them was tried and
+# rejected on 2026-08-25: systemd-tmpfiles refuses the path with "Detected
+# unsafe path transition /srv/backup-share (owned by packer) ->
+# .../myapps-digest (owned by root)", its guard against ownership changing
+# mid-path. Chowning the directory to satisfy it would weaken that guard for
+# a share; pruning in the script keeps the retention next to the code that
+# writes the files, behind the mountpoint check that already stops it acting
+# on a phantom local directory.
+e {{ myapps_digest_archive_dir }} - - - 365d
+d {{ myapps_digest_backup_dir }} 0750 root root 7d

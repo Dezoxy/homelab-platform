@@ -1,0 +1,24 @@
+[Unit]
+Description=withings-sync: push Withings scale readings into Garmin Connect (one-shot)
+After=docker.service
+Requires=docker.service
+OnFailure=withings-sync-notify.service
+ConditionPathExists={{ myapps_compose_file }}
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ myapps_compose_dir }}
+# A `docker compose run` container is owned by dockerd, not by this unit's
+# cgroup, so stopping the unit leaves the container running -- see
+# digest-run.sh.j2 for the 2026-08-24 incident that came from exactly that.
+# Naming the container gives ExecStopPost something to tear down, so the run
+# dies with the unit instead of outliving it and racing the next one.
+ExecStartPre=-/usr/bin/docker rm -f myapps-run-%N
+ExecStopPost=-/usr/bin/docker rm -f myapps-run-%N
+# The service's `command:` in the compose file carries the CLI arguments, so
+# the one-time interactive login and this unit run the identical invocation.
+ExecStart=/usr/bin/docker compose -f {{ myapps_compose_file }} run --rm --name myapps-run-%N withings-sync
+TimeoutStartSec={{ myapps_withings_sync_timeout_start_sec }}
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,77 @@
+---
+- name: List downloaded LXC templates
+  ansible.builtin.command:
+    argv:
+      - pveam
+      - list
+      - "{{ proxmox_image_resolution.image.template_datastore_id }}"
+  register: proxmox_image_lxc_templates_before
+  changed_when: false
+
+- name: Check pinned LXC template archive presence
+  ansible.builtin.set_fact:
+    proxmox_image_lxc_template_volume: >-
+      {{
+        proxmox_image_resolution.image.template_datastore_id
+        ~ ':vztmpl/'
+        ~ proxmox_image_resolution.image.template_file_name
+      }}
+    proxmox_image_lxc_template_present: >-
+      {{
+        (
+          proxmox_image_resolution.image.template_datastore_id
+          ~ ':vztmpl/'
+          ~ proxmox_image_resolution.image.template_file_name
+        ) in proxmox_image_lxc_templates_before.stdout
+      }}
+
+- name: Download missing pinned LXC template archive from current index
+  ansible.builtin.command:
+    argv:
+      - pveam
+      - download
+      - "{{ proxmox_image_resolution.image.template_datastore_id }}"
+      - "{{ proxmox_image_resolution.image.template_file_name }}"
+  register: proxmox_image_lxc_download_from_index
+  changed_when: proxmox_image_lxc_download_from_index.rc == 0
+  failed_when: false
+  when: not proxmox_image_lxc_template_present
+
+- name: Update Proxmox LXC template index after a download miss
+  ansible.builtin.command:
+    argv:
+      - pveam
+      - update
+  changed_when: true
+  when:
+    - not proxmox_image_lxc_template_present
+    - (proxmox_image_lxc_download_from_index.rc | default(1)) != 0
+
+- name: Retry pinned LXC template archive download after index update
+  ansible.builtin.command:
+    argv:
+      - pveam
+      - download
+      - "{{ proxmox_image_resolution.image.template_datastore_id }}"
+      - "{{ proxmox_image_resolution.image.template_file_name }}"
+  changed_when: true
+  when:
+    - not proxmox_image_lxc_template_present
+    - (proxmox_image_lxc_download_from_index.rc | default(1)) != 0
+
+- name: Relist downloaded LXC templates
+  ansible.builtin.command:
+    argv:
+      - pveam
+      - list
+      - "{{ proxmox_image_resolution.image.template_datastore_id }}"
+  register: proxmox_image_lxc_templates_after
+  changed_when: false
+
+- name: Verify pinned LXC template archive exists
+  ansible.builtin.assert:
+    that:
+      - proxmox_image_lxc_template_volume in proxmox_image_lxc_templates_after.stdout
+    fail_msg: >-
+      Expected {{ proxmox_image_lxc_template_volume }} after the Proxmox LXC
+      template ensure step.

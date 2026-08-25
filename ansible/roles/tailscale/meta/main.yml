@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: tailscale
+  author: toomhorvath
+  description: "Installs Tailscale and configures it as a subnet router with SNAT."
+  license: MIT
+  min_ansible_version: "2.14"

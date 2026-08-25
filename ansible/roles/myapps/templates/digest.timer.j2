@@ -1,0 +1,11 @@
+[Unit]
+Description=notification-digest (timer)
+
+[Timer]
+OnCalendar={{ myapps_digest_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_digest_randomized_delay_sec }}
+Unit=digest.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+---
+base_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+
+# Cloudflare documents this distro-neutral suite for Debian and Ubuntu.
+# Named Ubuntu suites can lag newly released LTS versions.
+cloudflared_repo_release: any
+cloudflared_keyring: /usr/share/keyrings/cloudflare-main.gpg
+cloudflared_repo: "deb [signed-by={{ cloudflared_keyring }}] https://pkg.cloudflare.com/cloudflared {{ cloudflared_repo_release }} main"
+cloudflared_udp_buffer_max: "7340032"
+cloudflared_ping_group_range: ""
+cloudflared_metrics_listen: "0.0.0.0:2000"
+cloudflared_no_autoupdate: true
+cloudflared_configure_sysctl: true
+
+# Injected at runtime from the secret store (CLOUDFLARED_TUNNEL_TOKEN) — no default.
+# cloudflared_tunnel_token: ""

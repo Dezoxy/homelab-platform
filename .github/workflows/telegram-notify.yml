@@ -1,0 +1,63 @@
+name: Platform / Telegram Notifications
+
+on:
+  workflow_run:
+    workflows:
+      - "CI / Actions Lint"
+      - "CI / Ansible Lint"
+      - "Platform / Deploy"
+      - "CI / Secret Scan"
+      - "Platform / Maintenance / Monitoring"
+      - "Platform / Maintenance / Support Access"
+      - "Platform / Maintenance / Upgrades"
+      - "Platform / Base Image"
+      - "CI / Packer Validate"
+      - "Debug / Runner Smoke"
+      - "CI / ShellCheck"
+      - "CI / Terraform Plan"
+      - "CI / Trivy Image Scan"
+    types:
+      - completed
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch CI notification secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: ci
+
+      - name: Download workflow jobs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+            -o "${RUNNER_TEMP}/workflow-jobs.json"
+
+      - name: Send Telegram notifications
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/notify_workflow_run_telegram.py \
+            --event "${GITHUB_EVENT_PATH}" \
+            --jobs "${RUNNER_TEMP}/workflow-jobs.json"

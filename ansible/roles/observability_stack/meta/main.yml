@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: observability_stack
+  author: toomhorvath
+  description: "Deploys the observability stack (Grafana, Prometheus, Loki, Tempo)."
+  license: MIT
+  min_ansible_version: "2.14"

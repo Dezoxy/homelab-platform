@@ -1,0 +1,30 @@
+[Unit]
+Description=notification-digest overnight (no Telegram ping) (one-shot)
+After=docker.service
+Requires=docker.service
+OnFailure=digest-overnight-notify.service
+ConditionPathExists={{ myapps_compose_file }}
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ myapps_compose_dir }}
+# A `docker compose run` container is owned by dockerd, not by this unit's
+# cgroup, so stopping the unit leaves the container running -- see
+# digest-run.sh.j2 for the 2026-08-24 incident that came from exactly that.
+# Naming the container gives ExecStopPost something to tear down, so the run
+# dies with the unit instead of outliving it and racing the next one.
+Environment=MYAPPS_RUN_NAME=myapps-run-%N
+ExecStartPre=-/usr/bin/docker rm -f myapps-run-%N
+ExecStopPost=-/usr/bin/docker rm -f myapps-run-%N
+# Same window cycle as digest.service -- collect, summarize, persist,
+# archive -- with the named reader-facing channels suppressed for the digest
+# this run produces. The digest row, its stamped items and its archive copy
+# are written identically, and the daily brief still consumes this window
+# (it reads window digests by kind, never by delivery state).
+ExecStart={{ myapps_digest_run_script }} hide:telegram
+# Includes myapps_digest_lock_wait_sec: the shared-lock wait happens inside
+# ExecStart (digest-run.sh.j2), so systemd counts it against this timeout.
+TimeoutStartSec={{ myapps_digest_timeout_start_sec + myapps_digest_lock_wait_sec }}
+
+[Install]
+WantedBy=multi-user.target

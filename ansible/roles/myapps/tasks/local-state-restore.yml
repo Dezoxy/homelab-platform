@@ -1,0 +1,144 @@
+---
+# Restore half of the local-state mirror. Modelled on media_stack's sequence,
+# with two deliberate differences:
+#
+#   - Quiesce is an ASSERT, not a stop. These consumers are timer-driven oneshot
+#     units, not long-running containers, so there is nothing to stop -- but
+#     seeding underneath a run that is already in flight would race it.
+#
+#   - There is no corruption fallback. media can re-restore from an app's own
+#     scheduled backup archive via backup_glob; neither garmin-health nor
+#     withings-sync writes such archives, so a failed integrity check FAILS THE
+#     DEPLOY instead of continuing with a corrupt database.
+
+- name: Check local state seed markers
+  ansible.builtin.stat:
+    path: "{{ item.target }}/{{ homelab_local_state_marker_name }}"
+  loop: "{{ homelab_local_state_paths }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: myapps_local_state_markers
+
+# CONTENT, not existence. The install half creates backup_target on the share,
+# and for these entries backup_target IS source -- so the directory always
+# exists by the time we get here and stat() would report a snapshot that is not
+# there. Restoring from an empty "snapshot" would mark the host seeded and
+# suppress every future restore.
+- name: Check whether a snapshot with content exists on the share
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      find {{ item.item.source | quote }} -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null
+    executable: /bin/bash
+  register: myapps_local_state_sources
+  changed_when: false
+  failed_when: false
+  loop: "{{ myapps_local_state_markers.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not (item.stat.exists | default(false))
+
+# A oneshot mid-run holds the files we are about to replace underneath it.
+- name: Require the consuming unit to be idle before seeding
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "{{ item.item.item.service }}.service"]
+  register: myapps_local_state_active
+  changed_when: false
+  failed_when: myapps_local_state_active.stdout | trim == "active"
+  loop: "{{ myapps_local_state_sources.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.stdout | default('') | trim) | length > 0
+
+# rsync, matching media's seed. No --delete: media can safely mirror because it
+# only ever seeds an empty target, but here a partially-populated target (a
+# token written by a first login, say) must not be wiped by a stale snapshot.
+- name: Seed local state from the share
+  ansible.builtin.command:
+    argv:
+      - rsync
+      - -a
+      - --numeric-ids
+      - "{{ item.item.item.source }}/"
+      - "{{ item.item.item.target }}/"
+  changed_when: true
+  loop: "{{ myapps_local_state_sources.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.stdout | default('') | trim) | length > 0
+
+- name: Verify restored SQLite databases
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import sqlite3, sys
+        conn = sqlite3.connect(sys.argv[1])
+        result = conn.execute("PRAGMA quick_check;").fetchone()
+        conn.close()
+        if result != ("ok",):
+            raise SystemExit(f"quick_check failed: {result!r}")
+      - "{{ item.item.item.target }}/{{ item.item.item.db_file }}"
+  register: myapps_local_state_db_checks
+  changed_when: false
+  failed_when: false
+  loop: "{{ myapps_local_state_sources.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.stdout | default('') | trim) | length > 0
+    - item.item.item.db_file is defined
+
+# Fail loudly rather than mark the seed complete over a corrupt database: the
+# marker would suppress every future restore attempt, turning one bad restore
+# into a permanent one.
+- name: Fail when a restored database does not pass its integrity check
+  ansible.builtin.fail:
+    msg: >-
+      Restored {{ item.item.item.item.name }} database failed PRAGMA quick_check:
+      {{ item.stderr | default(item.stdout) | default('no output') }}.
+      The snapshot on the share is unusable; do NOT let the seed marker be
+      written over it. Investigate before re-running.
+  loop: "{{ myapps_local_state_db_checks.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item.name | default('unknown') }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.rc | default(0)) != 0
+
+- name: Mark local state seed complete
+  ansible.builtin.copy:
+    content: "ok\n"
+    dest: "{{ item.item.item.target }}/{{ homelab_local_state_marker_name }}"
+    owner: "{{ item.item.item.owner }}"
+    group: "{{ item.item.item.group }}"
+    mode: "0644"
+  loop: "{{ myapps_local_state_sources.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.stdout | default('') | trim) | length > 0
+
+# A host with no snapshot on the share is the FIRST deploy of this mechanism,
+# not a failure: there is nothing to restore from yet. Mark it seeded so the
+# nightly mirror can start producing snapshots, and say so plainly.
+- name: Mark local state seeded when the share has no snapshot yet
+  ansible.builtin.copy:
+    content: "ok\n"
+    dest: "{{ item.item.item.target }}/{{ homelab_local_state_marker_name }}"
+    owner: "{{ item.item.item.owner }}"
+    group: "{{ item.item.item.group }}"
+    mode: "0644"
+  loop: "{{ myapps_local_state_sources.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name }}"
+  when:
+    - not (item.skipped | default(false))
+    - (item.stdout | default('') | trim) | length == 0

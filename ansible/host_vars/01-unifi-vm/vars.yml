@@ -1,0 +1,38 @@
+---
+# 01-unifi-vm -- UniFi OS Server.
+#
+# A VM rather than an LXC because UniFi OS Server needs Podman >= 4.3 and does
+# not support Docker; Podman inside an unprivileged LXC needs community
+# workarounds for sysctl, su/group restrictions, /proc and /dev/net/tun.
+# Note this host is deliberately NOT in the docker_hosts inventory group.
+
+unifi_os_user: toomhorvath
+unifi_os_timezone: Europe/Budapest
+
+# Host-owned storage, same mapping 01-media-vm uses. The Terraform stack
+# attaches the Proxmox directory mapping; this mounts it.
+appdata_mount: /srv/appdata
+
+virtiofs_mounts:
+  - tag: homelab-appdata
+    path: "{{ appdata_mount }}"
+
+# Only the BACKUP directory lives on the share. The live database stays on the
+# VM's local disk for the same reason 01-media-vm keeps SQLite off VirtIO-FS
+# (homelab_local_state_paths) -- and because UniFi's raw data directory is not
+# a supported restore source in the first place. The .unf auto-backups are.
+unifi_os_appdata_dir: "{{ appdata_mount }}/unifi-os"
+unifi_os_backup_dir: "{{ unifi_os_appdata_dir }}/backup"
+
+# --- Cloudflare DDNS ---
+# Moved here from 01-unifi-lxc at cutover. The connection is dynamic: without
+# this, an ISP-assigned IP change takes all three APs offline until someone
+# fixes the record by hand -- and the only remote fix is an on-site set-inform.
+#
+# This is why the updater must be live on THIS host before the LXC is retired:
+# the timer that keeps the record current lived on the guest being removed.
+unifi_vm_manage_ddns: true
+cloudflare_ddns_enabled: true
+# example.net. Not a secret -- it is in toom-edge's import blocks too.
+cloudflare_ddns_zone_id: "de4cc42fa369d3bf06ab159f1ebf3638"
+cloudflare_ddns_record_name: "unifi-inform.example.net"

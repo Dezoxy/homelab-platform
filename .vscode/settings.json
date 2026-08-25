@@ -1,0 +1,8 @@
+{
+  "git.autoRepositoryDetection": "openEditors",
+  "git.ignoredRepositories": [
+    "/Users/horvathtoom/Documents/github/homelab/.claude/worktrees/frosty-tesla-76b57c",
+    "/Users/horvathtoom/Documents/github/homelab/.claude/worktrees/jolly-ishizaka-79fe9e",
+    "/Users/horvathtoom/Documents/github/homelab/.claude/worktrees/tender-wing-1fcbe4"
+  ]
+}

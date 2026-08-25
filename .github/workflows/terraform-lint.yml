@@ -1,0 +1,96 @@
+name: CI / Terraform Lint
+
+on:
+  pull_request:
+    paths:
+      - "infra-proxmox/terraform/**"
+      - "scripts/ci/build_terraform_stack_matrix.py"
+      - "scripts/ci/versions.sh"
+      - ".tflint.hcl"
+      - ".github/workflows/terraform-lint.yml"
+  # Post-merge safety net: PR checks can be merged past while still pending.
+  push:
+    branches: [main]
+    paths:
+      - "infra-proxmox/terraform/**"
+      - "scripts/ci/build_terraform_stack_matrix.py"
+      - "scripts/ci/versions.sh"
+      - ".tflint.hcl"
+      - ".github/workflows/terraform-lint.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs, but never cancel a main validation: two quick
+  # merges would otherwise leave the first commit silently unvalidated, which
+  # is the exact gap this push trigger exists to close.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  terraform-stacks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: matrix
+        shell: bash
+        run: echo "matrix=$(python3 scripts/ci/build_terraform_stack_matrix.py)" >> "${GITHUB_OUTPUT}"
+
+  tflint:
+    needs: terraform-stacks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      matrix: ${{ fromJSON(needs.terraform-stacks.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Install tflint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip" -o tflint.zip
+          unzip -q tflint.zip tflint
+          sudo mv tflint /usr/local/bin/tflint
+          tflint --version
+
+      - name: tflint init (install plugins)
+        run: tflint --init --config="$(pwd)/.tflint.hcl"
+
+      - name: tflint
+        working-directory: ${{ matrix.dir }}
+        run: tflint --config="$(git rev-parse --show-toplevel)/.tflint.hcl" --format=compact --minimum-failure-severity=warning
+
+  checkov:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Install checkov
+        shell: bash
+        run: pip install checkov=="${CHECKOV_VERSION}" --break-system-packages
+
+      - name: checkov
+        shell: bash
+        run: |
+          checkov \
+            --directory infra-proxmox/terraform \
+            --framework terraform \
+            --compact \
+            --quiet \
+            --skip-check CKV_TF_1 \
+            --output cli
+        # CKV_TF_1: requires module sources to be pinned to a commit hash —
+        # our modules are local paths, so this check is not applicable.

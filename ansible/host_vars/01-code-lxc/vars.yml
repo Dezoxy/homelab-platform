@@ -1,0 +1,86 @@
+---
+# 01-code-lxc -- code-server plus the claude/codex CLIs.
+#
+# Everything durable lives on /srv/appdata/code, the Terraform bind mount from
+# the Proxmox host, so it survives a rebuild and is picked up by
+# 01-backup-lxc's restic run without any backup-side change.
+
+appdata_mount: /srv/appdata/code
+
+# code-server state: settings, installed extensions, open editors.
+code_server_state_dir: /srv/appdata/code/code-server
+
+# CLI auth state, so `claude` and `codex` stay logged in across rebuilds.
+agent_cli_state_dir: /srv/appdata/code
+
+# Extensions resolvable on Open VSX, installed by id -- fully reproducible from
+# this repo, so a rebuilt container gets them back without needing the backup.
+#
+# Mirrored from the macOS VS Code install on 2026-08-25 (42 extensions), minus
+# the 9 Open VSX does not carry. Each id below was verified to resolve against
+# the Open VSX API before being listed; code-server resolves ids there, NOT
+# against Microsoft's marketplace, so an id that only exists on the latter
+# fails at install time with an unhelpful error.
+code_server_extensions:
+  - alexcvzz.vscode-sqlite
+  - anthropic.claude-code
+  - bierner.markdown-mermaid
+  - dart-code.dart-code
+  - dart-code.flutter
+  - github.vscode-github-actions
+  - golang.go
+  - hashicorp.terraform
+  - mechatroner.rainbow-csv
+  - mermaidchart.vscode-mermaid-chart
+  - ms-azuretools.vscode-containers
+  - ms-dotnettools.vscode-dotnet-runtime
+  - ms-python.debugpy
+  - ms-python.python
+  - ms-python.vscode-python-envs
+  - ms-vscode.cmake-tools
+  - ms-vscode.cpptools-themes
+  - ms-vscode.makefile-tools
+  - openai.chatgpt
+  - pkief.material-icon-theme
+  - qwtel.sqlite-viewer
+  - redhat.ansible
+  - redhat.java
+  - redhat.vscode-yaml
+  - samuelcolvin.jinjahtml
+  - tomoki1207.pdf
+  - vscjava.vscode-gradle
+  - vscjava.vscode-java-debug
+  - vscjava.vscode-java-dependency
+  - vscjava.vscode-java-pack
+  - vscjava.vscode-java-test
+  - vscjava.vscode-maven
+  - yzhang.markdown-all-in-one
+
+# NOT carried by Open VSX, and therefore NOT installable here by id:
+#
+#   khaled.vscode-openrouter-extension            -> installed from the vsix drop dir below
+#   ms-dotnettools.csdevkit
+#   ms-dotnettools.csharp
+#   ms-python.vscode-pylance
+#   ms-vscode-remote.remote-containers
+#   ms-vscode.cpp-devtools
+#   ms-vscode.cpptools
+#   ms-vscode.cpptools-extension-pack
+#   ms-vscode.vscode-chat-customizations-evaluations
+#
+# The Microsoft ones are not an oversight and not a gap to fill later. They are
+# proprietary, licensed for use with Microsoft's own products, and deliberately
+# absent from Open VSX -- several also refuse to run outside official VS Code
+# builds. Pylance, C# Dev Kit, cpptools and Remote Containers are all in that
+# category. Sideloading their .vsix files would be both a licence problem and,
+# in practice, broken.
+#
+# Open-source equivalents exist if the language matters here: basedpyright or
+# python-lsp-server for Pylance, clangd for cpptools, and the C# support in
+# muhammad-sammy.csharp.
+
+# Anything Open VSX does NOT carry goes in the drop directory as a .vsix, which
+# lives on the appdata bind mount and is therefore backed up:
+#   /srv/appdata/code/code-server/vsix/
+# Currently: khaled.vscode-openrouter-extension (no Open VSX listing, no stable
+# upstream URL to pin, and 2.7 MB is over the repo's large-file limit).

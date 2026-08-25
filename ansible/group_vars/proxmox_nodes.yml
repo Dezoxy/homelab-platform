@@ -1,0 +1,19 @@
+# Overrides for the hypervisor itself (ansible/inventory-proxmox.ini).
+#
+# NO AUTOREMOVE ON THE HYPERVISOR.
+#
+# `apt-get autoremove` on this host wants to delete a dozen old
+# proxmox-kernel-*-pve-signed packages. apt protects the RUNNING kernel, so
+# that part is safe -- but it does not protect the FALLBACKS, and this host
+# routinely carries a newly installed kernel that has not been booted yet
+# (measured 2026-08-24: running 7.0.14-11, installed 7.0.14-12).
+#
+# Clearing the fallbacks in the same run that stages an untested kernel is the
+# wrong order: a kernel that fails to boot is the one moment those older
+# entries are worth having, and this host is the hypervisor -- if it does not
+# come back, neither does anything else.
+#
+# There is no space pressure forcing the issue either (/ is 54% of 94G), so the
+# cleanup earns nothing here. Run `apt autoremove` by hand after a new kernel
+# has proven it boots.
+apt_autoremove: false

@@ -1,0 +1,43 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Install code-server and the agent CLIs on 01-code-lxc
+  hosts: 01-code-lxc
+  become: true
+  vars:
+    # Password is a SECOND factor behind Cloudflare Access, not the only gate:
+    # the port is reachable from anywhere on the LAN. Reuses the credential
+    # retained from 01-agent-lxc rather than minting a second one.
+    code_server_password_effective: >-
+      {{
+        (code_server_password_override | default('') | trim)
+        or (lookup('env', 'CODE_SERVER_PASSWORD') | default('', true) | trim)
+      }}
+
+  tasks:
+    # The repo's own toolchain, so make lint / make ci / make deploy run here
+    # as well as on the Mac. See the Azure CLI note in the role defaults for
+    # what an `az login` on this box actually grants.
+    - name: Import dev_toolchain role
+      ansible.builtin.import_role:
+        name: dev_toolchain
+
+    # CLIs first: the role writes /etc/profile.d/agent-cli.sh and notifies the
+    # code-server restart, so the editor's integrated terminals come up with
+    # CLAUDE_CONFIG_DIR and CODEX_HOME already set.
+    - name: Import agent_cli role
+      ansible.builtin.import_role:
+        name: agent_cli
+
+    - name: Import code_server role
+      ansible.builtin.import_role:
+        name: code_server
+      vars:
+        code_server_password: "{{ code_server_password_effective }}"

@@ -1,0 +1,9 @@
+[Unit]
+Description=notification-digest evening failure notification
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists={{ myapps_notify_script }}
+
+[Service]
+Type=oneshot
+ExecStart={{ myapps_notify_script }} digest-evening.service

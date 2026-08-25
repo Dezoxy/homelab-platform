@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# jobs-refresh bootstrap: this is the container's CMD (see
+# jobs-refresh.Dockerfile.j2 and myapps-compose.yml.j2, which bind-mounts
+# this file in read-only). Its only job is to get both git checkouts into
+# place on a completely fresh host, then hand off to the app's own refresh
+# script. The actual refresh logic lives in the jobs-dashboard repo as
+# scripts/refresh-run.sh -- deliberately NOT here -- so updating it is a
+# repo commit, not an Ansible redeploy. This script only needs to change
+# when the bootstrap mechanics themselves change (repo URLs, sparse paths,
+# how a checkout is refreshed).
+#
+# Every step is logged with a timestamp prefix: journalctl captures stdout,
+# and myapps-notify.sh.j2 tails the last 120 lines of it into the failure
+# alert, so these lines are what a human sees first when this fails at 3am.
+
+log() {
+  printf '[%s] %s\n' "$(date -Is 2>/dev/null || date)" "$*"
+}
+
+fail() {
+  log "FATAL: $*"
+  exit 1
+}
+
+JOBS_DASHBOARD_DIR="/data/jobs-dashboard"
+EMPLOYEE_CV_DIR="/data/employee-cv"
+JOBS_DASHBOARD_REPO="{{ myapps_jobs_refresh_repo_url }}"
+EMPLOYEE_CV_REPO="{{ myapps_jobs_refresh_employee_cv_repo_url }}"
+EMPLOYEE_CV_SPARSE_PATHS=(
+{% for path in myapps_jobs_refresh_employee_cv_sparse_paths %}
+  "{{ path }}"
+{% endfor %}
+)
+
+: "${JOBS_DASHBOARD_SSH_KEY_PATH:?JOBS_DASHBOARD_SSH_KEY_PATH not set -- see jobs-refresh.env}"
+: "${EMPLOYEE_CV_SSH_KEY_PATH:?EMPLOYEE_CV_SSH_KEY_PATH not set -- see jobs-refresh.env}"
+
+# IdentitiesOnly=yes: use exactly the named key, never ssh-agent/other keys
+# offered opportunistically -- keeps the write-capable dashboard key from
+# ever being tried against the employee-cv clone or vice versa.
+JOBS_DASHBOARD_GIT_SSH="ssh -i ${JOBS_DASHBOARD_SSH_KEY_PATH} -o IdentitiesOnly=yes"
+EMPLOYEE_CV_GIT_SSH="ssh -i ${EMPLOYEE_CV_SSH_KEY_PATH} -o IdentitiesOnly=yes"
+
+log "jobs-refresh bootstrap starting"
+
+# --- jobs-dashboard: full checkout, write-capable key ---
+if [ -d "${JOBS_DASHBOARD_DIR}/.git" ]; then
+  log "jobs-dashboard: existing checkout at ${JOBS_DASHBOARD_DIR}, running 'git pull --ff-only'"
+  if ! GIT_SSH_COMMAND="${JOBS_DASHBOARD_GIT_SSH}" git -C "${JOBS_DASHBOARD_DIR}" pull --ff-only; then
+    fail "jobs-dashboard: 'git pull --ff-only' failed at ${JOBS_DASHBOARD_DIR}. Local and remote have diverged (or another git error occurred). Refusing to merge, rebase, or reset automatically -- a divergence here means another publisher wrote to this repo since the last run. A human must inspect ${JOBS_DASHBOARD_DIR} and resolve this manually before the next run."
+  fi
+else
+  log "jobs-dashboard: no checkout found, cloning ${JOBS_DASHBOARD_REPO} into ${JOBS_DASHBOARD_DIR}"
+  GIT_SSH_COMMAND="${JOBS_DASHBOARD_GIT_SSH}" git clone "${JOBS_DASHBOARD_REPO}" "${JOBS_DASHBOARD_DIR}"
+fi
+log "jobs-dashboard: ready at ${JOBS_DASHBOARD_DIR}"
+
+# --- employee-cv: sparse checkout, read-only key. The repo holds the full
+# CV corpus; the job only ever needs the two files below, so nothing else
+# in it is fetched. ---
+if [ -d "${EMPLOYEE_CV_DIR}/.git" ]; then
+  log "employee-cv: existing checkout at ${EMPLOYEE_CV_DIR}, running 'git pull --ff-only'"
+  if ! GIT_SSH_COMMAND="${EMPLOYEE_CV_GIT_SSH}" git -C "${EMPLOYEE_CV_DIR}" pull --ff-only; then
+    fail "employee-cv: 'git pull --ff-only' failed at ${EMPLOYEE_CV_DIR}. Local and remote have diverged (or another git error occurred). Refusing to merge, rebase, or reset automatically -- a human must inspect ${EMPLOYEE_CV_DIR} and resolve this manually before the next run."
+  fi
+else
+  log "employee-cv: no checkout found, sparse-cloning ${EMPLOYEE_CV_REPO} into ${EMPLOYEE_CV_DIR} (only: {{ myapps_jobs_refresh_employee_cv_sparse_paths | join(', ') }})"
+  GIT_SSH_COMMAND="${EMPLOYEE_CV_GIT_SSH}" git clone --no-checkout "${EMPLOYEE_CV_REPO}" "${EMPLOYEE_CV_DIR}"
+  git -C "${EMPLOYEE_CV_DIR}" sparse-checkout init --cone
+  git -C "${EMPLOYEE_CV_DIR}" sparse-checkout set "${EMPLOYEE_CV_SPARSE_PATHS[@]}"
+  GIT_SSH_COMMAND="${EMPLOYEE_CV_GIT_SSH}" git -C "${EMPLOYEE_CV_DIR}" checkout
+fi
+log "employee-cv: ready at ${EMPLOYEE_CV_DIR}"
+
+# --- export the dashboard key for everything after this point ---
+# Everything above this line used GIT_SSH_COMMAND as a per-command prefix,
+# which applies to that one invocation only. refresh-run.sh (exec'd below)
+# runs scripts/publish.sh, which does its own plain `git fetch`/`git push`
+# against jobs-dashboard with no GIT_SSH_COMMAND of its own -- without an
+# exported default, those have no key configured and SSH auth fails
+# (observed: commit succeeds, then "fetch failed -- offline? continuing"
+# followed by a push failure, even though the host has network access).
+# Exporting here makes it the ambient default for every plain git command
+# run by the exec'd script and anything it in turn calls.
+#
+# ORDERING REQUIREMENT, load-bearing: this MUST stay after both checkouts
+# above finish their git operations, and it is only safe to export the
+# write-capable jobs-dashboard key process-wide BECAUSE nothing after this
+# point performs git operations against employee-cv -- refresh-run.sh's own
+# git use (via scripts/publish.sh) targets jobs-dashboard exclusively. If a
+# future change adds a git operation against employee-cv anywhere after this
+# export, it MUST set its own GIT_SSH_COMMAND per-command (like the
+# employee-cv block above), or it will silently authenticate with the wrong,
+# write-capable key instead of the read-only one.
+export GIT_SSH_COMMAND="${JOBS_DASHBOARD_GIT_SSH}"
+
+# --- hand off to the app's own refresh script ---
+REFRESH_SCRIPT="${JOBS_DASHBOARD_DIR}/scripts/refresh-run.sh"
+if [ ! -e "${REFRESH_SCRIPT}" ]; then
+  fail "${REFRESH_SCRIPT} not found. The jobs-dashboard checkout at ${JOBS_DASHBOARD_DIR} does not have this script -- nothing to run."
+fi
+if [ ! -x "${REFRESH_SCRIPT}" ]; then
+  fail "${REFRESH_SCRIPT} exists but is not executable. Fix its permissions in the jobs-dashboard repo (chmod +x scripts/refresh-run.sh) and redeploy."
+fi
+
+log "Handing off to ${REFRESH_SCRIPT}"
+exec "${REFRESH_SCRIPT}"

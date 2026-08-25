@@ -1,0 +1,11 @@
+[Unit]
+Description=garmin-health sync (timer)
+
+[Timer]
+OnCalendar={{ myapps_garmin_health_sync_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_garmin_health_sync_randomized_delay_sec }}
+Unit=garmin-sync.service
+
+[Install]
+WantedBy=timers.target

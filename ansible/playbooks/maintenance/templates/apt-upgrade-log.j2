@@ -1,0 +1,69 @@
+==========================================
+Homelab apt upgrade log
+Date: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+==========================================
+
+Kernel state (needrestart KSTA): 1 = current, 2 = ABI-compatible upgrade,
+3 = kernel version upgraded, reboot needed to run it.
+{% for host in groups['all'] | sort %}
+
+## {{ host }} ({{ hostvars[host].ansible_host | default(host) }})
+{% set pkgs = hostvars[host].apt_upgraded | default(none) %}
+{% if pkgs is none %}
+  (unreachable or upgrade failed)
+{% elif pkgs | length == 0 %}
+  (up to date - nothing to upgrade)
+{% else %}
+{% set dmap = {} %}
+{% for d in hostvars[host].apt_phased_deferred | default([]) %}
+{% set _ = dmap.update({ d.split('|')[0]: d.split('|')[1] }) %}
+{% endfor %}
+{% for pkg in pkgs %}
+  {{ pkg }}{% if pkg.split('/')[0] in dmap %}  [deferred: {{ dmap[pkg.split('/')[0]] }}]{% endif %}
+
+{% endfor %}
+{% endif %}
+{% set held = hostvars[host].apt_held_back | default([]) %}
+{% if held | length > 0 %}
+
+  HELD BACK at your request (not upgraded, still pending):
+{% for h in held %}
+    {{ h }}
+{% endfor %}
+{% endif %}
+{% set svcs = hostvars[host].apt_restart_services | default([]) %}
+{% if svcs | length > 0 %}
+
+  services still running older code (needrestart, list-only):
+{% for svc in svcs %}
+    {{ svc }}
+{% endfor %}
+{% endif %}
+{% set reclaim = hostvars[host].apt_autoremovable_count | default(0) | int %}
+{% if reclaim > 0 %}
+
+  {{ reclaim }} package(s) no longer required{% if hostvars[host].apt_autoremovable_freed | default('') %}, {{ hostvars[host].apt_autoremovable_freed }} reclaimable{% endif %}
+
+    run `apt autoremove` here when convenient (not done automatically)
+{% endif %}
+{% set krun = hostvars[host].apt_kernel_running | default('') %}
+{% set knew = hostvars[host].apt_kernel_newest | default('none') %}
+{% set kstale = knew not in ['', 'none'] and knew != krun %}
+{% if hostvars[host].apt_reboot_required | default(false) %}
+
+  ** REBOOT REQUIRED **
+{% set rpkgs = hostvars[host].apt_reboot_packages | default([]) %}
+{% if rpkgs | length > 0 %}
+    requested by: {{ rpkgs | join(', ') }}
+{% endif %}
+{% if kstale %}
+    running {{ krun }}, newest installed {{ knew }}
+{% endif %}
+{% elif kstale %}
+
+  ** REBOOT REQUIRED ** running {{ krun }}, newest installed {{ knew }}
+{% elif (hostvars[host].apt_kernel_state | default('0')) == '3' %}
+
+  ** REBOOT REQUIRED ** kernel upgraded (needrestart KSTA 3)
+{% endif %}
+{% endfor %}

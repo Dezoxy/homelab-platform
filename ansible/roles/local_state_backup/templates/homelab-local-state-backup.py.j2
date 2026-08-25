@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CONFIG = json.loads({{ homelab_local_state_paths | to_json | to_json }})
+RSYNC_EXCLUDES = [
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "*.db-journal",
+    "*.sqlite",
+    "*.sqlite-shm",
+    "*.sqlite-wal",
+    "*.sqlite-journal",
+    "*.sqlite3",
+    "*.sqlite3-shm",
+    "*.sqlite3-wal",
+    "*.sqlite3-journal",
+]
+
+
+def run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def remove_if_exists(path: Path) -> None:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def sync_tree(source: Path, destination: Path, extra_excludes: list[str] | None = None) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    cmd = ["rsync", "-a", "--delete", "--numeric-ids"]
+    for pattern in [*RSYNC_EXCLUDES, *(extra_excludes or [])]:
+        cmd.extend(["--exclude", pattern])
+    cmd.extend([f"{source}/", f"{destination}/"])
+    run(cmd)
+
+
+def log_event(event: str, db: str, status: str, duration_ms: int | None = None, attempt: int | None = None, error: str | None = None) -> None:
+    record: dict = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "db": db,
+        "status": status,
+    }
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+    if attempt is not None:
+        record["attempt"] = attempt
+    if error is not None:
+        record["error"] = error
+    print(json.dumps(record), file=sys.stderr)
+
+
+def backup_sqlite(source: Path, destination: Path, quick_check: bool = True, max_retries: int = 3) -> None:
+    """
+    Snapshot a live SQLite DB safely to a VirtIO-FS destination.
+
+    Strategy:
+      1. sqlite3.backup() writes the snapshot to a temp file on local ext4 (/tmp) —
+         fast and reliable, no VirtIO-FS involved.
+      2. PRAGMA quick_check runs against the local temp copy.
+      3. shutil.copy2() copies the validated snapshot to the VirtIO-FS destination
+         using a .tmp side-file + atomic os.replace(), retried up to max_retries
+         times with exponential backoff on OSError (covers transient VirtIO-FS I/O
+         errors).
+      4. /tmp temp file is always cleaned up in the finally block.
+    """
+    t0 = time.monotonic()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Step 1 — snapshot to local /tmp (ext4, not VirtIO-FS)
+    staging_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{source.name}.",
+        suffix=".sqlite-backup",
+        dir="/tmp",
+        delete=False,
+    )
+    staging_handle.close()
+    staging_path = Path(staging_handle.name)
+
+    source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
+    destination_connection = sqlite3.connect(staging_path, timeout=30)
+    try:
+        source_connection.backup(destination_connection)
+
+        # Step 2 — validate on local ext4 before touching VirtIO-FS
+        if quick_check:
+            result = destination_connection.execute("PRAGMA quick_check;").fetchone()
+            if result != ("ok",):
+                raise RuntimeError(f"quick_check failed for {source}: {result!r}")
+        destination_connection.commit()
+        destination_connection.close()
+        source_connection.close()
+
+        # Step 3 — copy validated snapshot to VirtIO-FS with retry
+        source_stat = source.stat()
+        destination_tmp = destination.with_name(f".{destination.name}.tmp")
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                remove_if_exists(destination_tmp)
+                shutil.copy2(staging_path, destination_tmp)
+                os.chown(destination_tmp, source_stat.st_uid, source_stat.st_gid)
+                os.chmod(destination_tmp, stat.S_IMODE(source_stat.st_mode))
+                os.replace(destination_tmp, destination)
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                wait = 2 ** (attempt - 1)
+                log_event("sqlite_copy", str(source), "retry", attempt=attempt, error=str(exc))
+                if attempt < max_retries:
+                    time.sleep(wait)
+
+        if last_exc is not None:
+            raise last_exc
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log_event("sqlite_backup", str(source), "ok", duration_ms=duration_ms)
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log_event("sqlite_backup", str(source), "failed", duration_ms=duration_ms, error=str(exc))
+        raise
+    finally:
+        # Always close connections and clean up /tmp regardless of outcome
+        try:
+            destination_connection.close()
+        except Exception:
+            pass
+        try:
+            source_connection.close()
+        except Exception:
+            pass
+        remove_if_exists(staging_path)
+
+
+def prune_stale_sidecars(destination: Path) -> int:
+    """
+    Remove every SQLite -wal/-shm/-journal file under a backup destination.
+
+    The destination must never hold one. rsync excludes them (RSYNC_EXCLUDES),
+    and backup_sqlite() closes its connection, validates on local ext4, then
+    copies exactly ONE checkpointed file across -- so a sidecar here is always a
+    leftover from an earlier layout, never part of the current snapshot.
+
+    They are not harmless. `--delete` does not remove excluded files from the
+    destination (that needs `--delete-excluded`, which here would delete the
+    databases themselves, since *.db and *.sqlite3 are excluded too and written
+    separately by backup_sqlite). So sidecars accumulate indefinitely, and a
+    restore copies them back next to a much newer database. SQLite then tries to
+    replay the stale WAL and reports "database disk image is malformed" for a
+    file that is byte-perfect.
+
+    Measured 2026-08-25 during the 01-media-vm 26.04 rebuild: 14 April sidecars
+    beside August snapshots. overseerr restored "corrupt" with an md5 identical
+    to its source, and sonarr's fallback believed the same false alarm, threw
+    away the good snapshot and restored an older scheduled backup -- losing 5
+    series and 38 episodes until it was put back by hand.
+    """
+    removed = 0
+    for pattern in ("*-wal", "*-shm", "*-journal"):
+        for stale in destination.rglob(pattern):
+            if stale.is_file():
+                remove_if_exists(stale)
+                log_event("sidecar_pruned", str(stale), "ok")
+                removed += 1
+    return removed
+
+
+def sync_item(item: dict[str, object]) -> None:
+    source = Path(item["target"])
+    destination = Path(item["backup_target"])
+
+    log_event("rsync_start", str(source), "start")
+    t0 = time.monotonic()
+    # rsync_excludes covers per-app paths the global SQLite patterns miss: caches
+    # that must go through backup_sqlite() instead, disposable logs, and empty
+    # bind-mount stubs whose real content lives outside the local state tree.
+    sync_tree(source, destination, item.get("rsync_excludes", []))
+    log_event("rsync_done", str(source), "ok", duration_ms=int((time.monotonic() - t0) * 1000))
+
+    for relative_path in item.get("sqlite_backup_paths", []):
+        source_db = source / relative_path
+        destination_db = destination / relative_path
+        if source_db.exists():
+            backup_sqlite(
+                source_db,
+                destination_db,
+                quick_check=bool(item.get("sqlite_quick_check", True)),
+            )
+            continue
+
+        remove_if_exists(destination_db)
+        remove_if_exists(Path(f"{destination_db}-wal"))
+        remove_if_exists(Path(f"{destination_db}-shm"))
+        remove_if_exists(Path(f"{destination_db}-journal"))
+
+    # Last, so it also clears sidecars beside databases that WERE backed up
+    # above -- the case the per-database cleanup on the missing-source path
+    # never covered, and the one that actually bit.
+    prune_stale_sidecars(destination)
+
+
+def main() -> int:
+    for item in CONFIG:
+        if item.get("backup_target"):
+            sync_item(item)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Local edits are overwritten on the next deploy.
+#
+# IdentitiesOnly is not decoration: without it ssh offers every key it can find
+# and GitHub rejects the connection after too many failed offers, which looks
+# identical to having the wrong key.
+{% for h in code_server_ssh_hosts %}
+
+Host {{ h.host }}
+  HostName {{ h.host }}
+  User {{ h.user }}
+  IdentityFile {{ h.identity }}
+  IdentitiesOnly yes
+{% endfor %}

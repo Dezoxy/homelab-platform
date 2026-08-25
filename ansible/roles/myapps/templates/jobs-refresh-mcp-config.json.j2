@@ -1,0 +1,24 @@
+{#
+  MCP config for jobs-refresh's Claude CLI, loaded via --mcp-config (see
+  JOBS_REFRESH_MCP_CONFIG in jobs-refresh.env.j2). Shape verified two ways
+  against the installed CLI (2.1.199, matching myapps_jobs_refresh_claude_cli_version;
+  re-verified locally against 2.1.215):
+    1. `claude mcp add --transport http <name> <url>` writes exactly this
+       "type": "http" + "url" shape into a project .mcp.json.
+    2. A file in this shape loads cleanly with
+       `claude --mcp-config <file> --strict-mcp-config mcp list` (it reaches
+       the "Checking MCP server health..." step -- no schema/parse error).
+  "playwright" is the server name the browse step should reference by.
+  The URL is chromium's service name + myapps_playwright_mcp_port, NOT
+  playwright-mcp's own container name: playwright-mcp runs with
+  network_mode: "service:chromium", so on the compose network its listening
+  port answers on chromium's address (see myapps-compose.yml.j2).
+#}
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "http",
+      "url": "http://chromium:{{ myapps_playwright_mcp_port }}/mcp"
+    }
+  }
+}

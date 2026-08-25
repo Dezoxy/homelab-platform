@@ -1,0 +1,30 @@
+[global]
+  workgroup = {{ backup_smb_workgroup | default('WORKGROUP') }}
+  server role = standalone server
+  map to guest = Never
+  server min protocol = SMB2
+  disable netbios = yes
+  dns proxy = no
+  mdns name = mdns
+  load printers = no
+  printing = bsd
+  printcap name = /dev/null
+  ea support = yes
+  vfs objects = catia fruit streams_xattr
+  fruit:model = MacSamba
+  fruit:metadata = stream
+  fruit:delete_empty_adfiles = yes
+  fruit:wipe_intentionally_left_blank_rfork = yes
+
+[{{ backup_smb_share_name | default('macbook-backup') }}]
+  path = {{ backup_smb_share_path_effective }}
+  browseable = yes
+  read only = no
+  guest ok = no
+  valid users = {{ backup_smb_user }}
+  force user = {{ backup_smb_user }}
+  force group = {{ backup_smb_group }}
+  create mask = 0600
+  directory mask = 0700
+  fruit:time machine = {{ 'yes' if (backup_smb_time_machine_enabled | default(true)) | bool else 'no' }}
+  {{ backup_smb_time_machine_max_size_directive }}

@@ -1,0 +1,1911 @@
+---
+- name: Derive compose path from myapps_compose_dir
+  ansible.builtin.set_fact:
+    myapps_compose_file: "{{ myapps_compose_file | default(myapps_compose_dir ~ '/compose.yml') }}"
+    myapps_chromium_env_file: "{{ myapps_chromium_env_file | default(myapps_compose_dir ~ '/chromium.env') }}"
+    myapps_digest_env_file: "{{ myapps_digest_env_file | default(myapps_compose_dir ~ '/digest.env') }}"
+    myapps_jobs_refresh_env_file: "{{ myapps_jobs_refresh_env_file | default(myapps_compose_dir ~ '/jobs-refresh.env') }}"
+    myapps_garmin_health_env_file: "{{ myapps_garmin_health_env_file | default(myapps_compose_dir ~ '/garmin-health.env') }}"
+
+- name: Ensure myapps compose directory
+  ansible.builtin.file:
+    path: "{{ myapps_compose_dir }}"
+    state: directory
+    mode: "0755"
+
+# Local state: mirror the databases and one-time-login tokens that live on this
+# host's LOCAL ext4 disk onto the share, where restic sweeps them to B2. The
+# install half (directories + the SQLite-safe mirror script) and the restore
+# half run here, BEFORE any service starts. The units are installed at the end
+# of this role, never here -- the timer is Persistent=true, so enabling it
+# mid-restore can fire an rsync --delete over the snapshot being restored from.
+- name: Install local state directories and mirror script
+  ansible.builtin.import_role:
+    name: local_state_backup
+    tasks_from: install
+
+- name: Restore local state from the share when this host has none
+  ansible.builtin.import_tasks: local-state-restore.yml
+
+- name: Require a GHCR pull token when notification-digest is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_digest_ghcr_pull_token_effective | default(myapps_digest_ghcr_pull_token) | default('')) | length > 0
+    fail_msg: >-
+      Missing GHCR pull token. ghcr.io/dezoxy/notification-digest is a PRIVATE
+      package (its repo is private), so Docker cannot pull it anonymously the
+      way it pulls the public netcheck image. Store a read:packages PAT as the
+      digest-ghcr-pull-token Key Vault secret (folder=digest,
+      envvar=DIGEST_GHCR_PULL_TOKEN), or pass
+      -e myapps_digest_ghcr_pull_token=... at deploy.
+  when: myapps_digest_enabled | default(false) | bool
+
+# Fail at deploy time, not at the collector's 6-hourly runtime ConfigError,
+# when Reddit is enabled without its session cookie -- same rationale as the
+# GHCR assert above. The cookie value itself is never printed by assert.
+- name: Require the Reddit session cookie when the Reddit collector is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_digest_reddit_session_effective | default(myapps_digest_reddit_session) | default('')) | length > 0
+    fail_msg: >-
+      Missing Reddit session cookie. myapps_digest_reddit_enabled is true but
+      no cookie resolved. Store the owner's reddit_session browser cookie as
+      the digest-reddit-session Key Vault secret (folder=digest,
+      envvar=DIGEST_REDDIT_SESSION), or pass
+      -e myapps_digest_reddit_session=... at deploy.
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_reddit_enabled | default(false) | bool
+
+# Same shape as the Reddit assert above, with a sharper blast radius: a
+# Patreon ConfigError aborts the WHOLE digest run, so an unconfigured cookie
+# would take the window, daily and weekly briefs down with it.
+#
+# POSITION IS LOAD-BEARING: this must run BEFORE the digest.env template
+# task below. That template gates the PATREON_* pair on the enable flag, so
+# with the flag on and the cookie missing it would render exactly the
+# half-configured pair the app refuses to start on -- and an assert that
+# fired only AFTER the file was written would abort the play while leaving
+# the broken env on disk for the next window timer run to crash against.
+# The cookie value itself is never printed by assert.
+- name: Require the Patreon session cookie when the Patreon collector is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_digest_patreon_session_cookie_effective
+         | default(myapps_digest_patreon_session_cookie) | default('')) | length > 0
+      - (myapps_digest_patreon_campaign_id | default('')) | length > 0
+    fail_msg: >-
+      Patreon collector enabled without both of its settings. It needs
+      myapps_digest_patreon_campaign_id (the numeric campaign id, not a
+      secret) AND the owner's patreon.com session_id cookie. Store the cookie
+      as the digest-patreon-session-cookie Key Vault secret (folder=digest,
+      envvar=DIGEST_PATREON_SESSION_COOKIE), or pass
+      -e myapps_digest_patreon_session_cookie=... at deploy.
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_patreon_enabled | default(false) | bool
+
+- name: Assert the positions tracker has a Telegram topic and something to track
+  ansible.builtin.assert:
+    that:
+      - (myapps_digest_telegram_positions_thread_id | default('') | string | trim) | length > 0
+      - ((myapps_digest_positions_tg_channels | default('') | trim) | length > 0)
+        or ((myapps_digest_positions_x_accounts | default('') | trim) | length > 0)
+    fail_msg: >-
+      myapps_digest_positions_enabled requires
+      myapps_digest_telegram_positions_thread_id AND at least one of
+      myapps_digest_positions_tg_channels / myapps_digest_positions_x_accounts.
+      Without a topic the app falls back to the WINDOW digest's topic, which
+      would drop portfolio updates into the general news feed; with nothing
+      to track the timer fires six times a day against a no-op.
+  when:
+    - myapps_digest_positions_enabled | default(false) | bool
+
+# Fail at deploy time, not at 20:30 in the journal, when a unit's
+# TimeoutStartSec no longer covers the app budgets this same role hands the
+# container. This exists because that drift already happened silently:
+# digest-daily.service failed with Result=timeout every night from at least
+# 2026-08-14 to 2026-08-17, delivering the brief and then being SIGINTed
+# during teardown, because TimeoutStartSec was hardcoded 600 while the app
+# was handed 600 + 600 + up to 1200. Both sides of that comparison are set
+# HERE, so it is checkable -- documenting the invariant is what failed last
+# time. See the TimeoutStartSec block in defaults/main.yml for the budgets.
+#
+# Only the daily runs a verify pass, so only its budget includes it. The
+# translate budget counts ONCE per run mode even though translate_digest may
+# retry on a fallback model, because notification-digest 0.15.0's
+# TRANSLATE_TIMEOUT_SECONDS caps each leg -- on an older image the retry is
+# unbounded and this assert would understate the real worst case, which is
+# why myapps_digest_image must be >= 0.15.0 for this to mean anything.
+- name: Require each digest unit's TimeoutStartSec to cover its app budget
+  ansible.builtin.assert:
+    that:
+      - myapps_digest_timeout_start_sec | int >
+        (myapps_digest_claude_timeout_seconds | int)
+        + (myapps_digest_translate_timeout_seconds | int)
+      - myapps_digest_daily_timeout_start_sec | int >
+        (myapps_digest_claude_timeout_seconds | int)
+        + (myapps_digest_verify_daily_timeout_seconds | int)
+        + (myapps_digest_translate_timeout_seconds | int)
+      - myapps_digest_weekly_timeout_start_sec | int >
+        (myapps_digest_claude_timeout_seconds | int)
+        + (myapps_digest_translate_timeout_seconds | int)
+    fail_msg: >-
+      A digest unit's TimeoutStartSec no longer covers the app timeouts this
+      role sets, so systemd would kill a run whose every internal step behaved
+      as designed. Budgets: claude={{ myapps_digest_claude_timeout_seconds }},
+      verify_daily={{ myapps_digest_verify_daily_timeout_seconds }},
+      translate={{ myapps_digest_translate_timeout_seconds }}. Ceilings:
+      window={{ myapps_digest_timeout_start_sec }},
+      daily={{ myapps_digest_daily_timeout_start_sec }},
+      weekly={{ myapps_digest_weekly_timeout_start_sec }}. Raise the ceiling
+      or lower a budget -- but note the daily's ceiling is capped near 1500 by
+      the Sunday daily->weekly gap (see defaults/main.yml); prefer lowering
+      verify_daily, the one phase the app treats as optional.
+  when: myapps_digest_enabled | default(false) | bool
+
+# community.docker is not in ansible/requirements.yml, so we shell out -- same
+# approach as the dashboard role. The token travels only via stdin, never in
+# argv (where it would appear in `ps` output) and never in a log.
+- name: Log in to GHCR for the notification-digest image pull
+  ansible.builtin.command:
+    argv:
+      - docker
+      - login
+      - ghcr.io
+      - -u
+      - digest-deploy
+      - --password-stdin
+    stdin: "{{ myapps_digest_ghcr_pull_token_effective | default(myapps_digest_ghcr_pull_token) }}"
+  no_log: true
+  changed_when: true
+  when: myapps_digest_enabled | default(false) | bool
+
+# Pull at DEPLOY time, not at first timer fire. The digest service sits behind
+# `profiles: ["oneshot"]`, so `docker compose up -d` never pulls it -- without
+# this the image would first be fetched by the 6-hourly timer, turning a bad
+# token or a typo'd tag into a silent 06:00 failure in the journal instead of a
+# loud, immediate deploy failure.
+- name: Pre-pull the notification-digest image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - "{{ myapps_digest_image }}"
+  register: myapps_digest_pull
+  changed_when: "'Downloaded newer image' in myapps_digest_pull.stdout"
+  when: myapps_digest_enabled | default(false) | bool
+
+# --- Chromium ---
+# Unlike digest/jobs-refresh (profiles: ["oneshot"], never part of `up -d`),
+# chromium is a long-lived service started by `docker compose up -d` itself
+# -- so its bind-mounted profile directory and env file must exist BEFORE
+# the compose file is installed and the service is (re)started, mirroring
+# T3MP3ST's directory placement above rather than digest's placement below.
+- name: Ensure Chromium profile directory
+  ansible.builtin.file:
+    path: "{{ myapps_chromium_profile_dir }}"
+    state: directory
+    owner: "{{ myapps_chromium_puid }}"
+    group: "{{ myapps_chromium_pgid }}"
+    mode: "0750"
+  when: myapps_chromium_enabled | default(false) | bool
+
+# CUSTOM_USER/PASSWORD/PUID/PGID/TZ/CHROME_CLI all land here instead of the
+# 0644 myapps-compose.yml.j2, mirroring digest.env.j2 -- keeps the UI
+# PASSWORD out of the world-readable compose file and off `--diff` output.
+- name: Install Chromium environment file
+  ansible.builtin.template:
+    src: chromium.env.j2
+    dest: "{{ myapps_chromium_env_file }}"
+    mode: "0600"
+  register: myapps_chromium_env_copy
+  no_log: true
+  when: myapps_chromium_enabled | default(false) | bool
+
+# playwright-mcp joins chromium's network namespace (network_mode:
+# "service:chromium" in the compose template) to reach chromium's
+# loopback-only CDP port -- it cannot exist without that service. Fail here
+# rather than let the compose template render a `depends_on: [chromium]`
+# against a service that was never defined.
+- name: Require chromium to be enabled when playwright-mcp is enabled
+  ansible.builtin.assert:
+    that:
+      - myapps_chromium_enabled | default(false) | bool
+    fail_msg: >-
+      myapps_playwright_mcp_enabled requires myapps_chromium_enabled --
+      playwright-mcp attaches to chromium's CDP port via
+      network_mode: "service:chromium" and cannot run without it.
+  when: myapps_playwright_mcp_enabled | default(false) | bool
+
+- name: Install myapps compose file
+  ansible.builtin.template:
+    src: myapps-compose.yml.j2
+    dest: "{{ myapps_compose_file }}"
+    mode: "0644"
+  register: myapps_compose_copy
+
+- name: Install myapps systemd unit
+  ansible.builtin.template:
+    src: myapps-compose.service.j2
+    dest: /etc/systemd/system/myapps.service
+    mode: "0644"
+  register: myapps_unit_copy
+
+- name: Record whether myapps deployment changed
+  ansible.builtin.set_fact:
+    myapps_deploy_changed: >-
+      {{
+        (myapps_compose_copy.changed | default(false))
+        or (myapps_unit_copy.changed | default(false))
+        or (myapps_chromium_env_copy.changed | default(false))
+      }}
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start myapps service
+  ansible.builtin.systemd:
+    name: myapps
+    enabled: true
+    state: >-
+      {{
+        'restarted'
+        if (myapps_restart_on_change | default(true) | bool)
+           and (myapps_deploy_changed | bool)
+        else 'started'
+      }}
+  when: myapps_manage_services | bool
+
+# notification-digest's image runs as uid 1000; the container needs write
+# access to its bind-mounted state dir (mirrors how observability_stack owns
+# data dirs by numeric container UID).
+- name: Ensure notification-digest directories owned by the container UID
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: 1000
+    group: 1000
+    mode: "0750"
+  loop:
+    - "{{ myapps_digest_state_dir }}"
+    - "{{ myapps_digest_archive_dir }}"
+    - "{{ myapps_digest_claude_home_dir }}"
+  when: myapps_digest_enabled | default(false) | bool
+
+# --- notification-digest state restore (disaster recovery) ---
+# The read half of the nightly offsite mirror. Runs BEFORE the compose file
+# and the timers below: a digest run starting against a missing state.db
+# would create an empty one, and the restore's own guard then refuses to
+# overwrite it -- turning a recoverable rebuild into a permanent loss of the
+# dedup ledger, plus the duplicate-delivery burst that ledger prevents.
+#
+# Marker-gated exactly like media_stack's homelab_local_state_marker_name:
+# seeding must happen once, on a host with no state, and never again.
+- name: Check whether notification-digest state has been seeded
+  ansible.builtin.stat:
+    path: "{{ myapps_digest_state_marker }}"
+  register: myapps_digest_state_marker_stat
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_state_restore_enabled | default(false) | bool
+
+- name: Install notification-digest state restore script
+  ansible.builtin.template:
+    src: digest-state-restore.py.j2
+    dest: "{{ myapps_digest_state_restore_script }}"
+    mode: "0755"
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_state_restore_enabled | default(false) | bool
+
+- name: Restore notification-digest state from the newest valid offsite snapshot
+  ansible.builtin.command:
+    argv: ["{{ myapps_digest_state_restore_script }}"]
+  register: myapps_digest_state_restore
+  # The script is idempotent and self-reporting: it exits 0 having done
+  # nothing when state.db already exists or no snapshot is available, and
+  # non-zero only when it genuinely could not do its job (share unmounted,
+  # every snapshot corrupt). Both of those must fail the play -- a host that
+  # silently starts with an empty ledger looks healthy and re-delivers
+  # everything.
+  changed_when: "'restored ' in myapps_digest_state_restore.stdout"
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_state_restore_enabled | default(false) | bool
+    - not (myapps_digest_state_marker_stat.stat.exists | default(false))
+
+- name: Mark notification-digest state as seeded
+  ansible.builtin.copy:
+    content: "ok\n"
+    dest: "{{ myapps_digest_state_marker }}"
+    owner: 1000
+    group: 1000
+    mode: "0644"
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_state_restore_enabled | default(false) | bool
+    - not (myapps_digest_state_marker_stat.stat.exists | default(false))
+
+# All digest runtime config (including TG_*/SMTP_* secrets) renders here
+# instead of into the 0644 myapps-compose.yml.j2, mirroring how dashboard.env
+# and observability.env keep secrets out of the world-readable compose file
+# and off `--diff` output.
+- name: Install notification-digest environment file
+  ansible.builtin.template:
+    src: digest.env.j2
+    dest: "{{ myapps_digest_env_file }}"
+    mode: "0600"
+  no_log: true
+  when: myapps_digest_enabled | default(false) | bool
+
+# Content comes from the digest-x-cookies Key Vault secret via
+# myapps_digest_x_cookies_effective (see ansible/playbooks/services/
+# 01-myapps-vm.yml). The file lands under the /data bind mount so
+# X_COOKIES_PATH (/data/x-cookies.json) resolves inside the container.
+- name: Write notification-digest X cookies file
+  ansible.builtin.copy:
+    dest: "{{ myapps_digest_state_dir }}/x-cookies.json"
+    content: "{{ myapps_digest_x_cookies_effective | default('') }}"
+    owner: 1000
+    group: 1000
+    mode: "0600"
+  no_log: true
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_x_enabled | default(false) | bool
+    - (myapps_digest_x_cookies_effective | default('') | trim | length) > 0
+
+# Shared entrypoint for EVERY notification-digest systemd unit: it takes a
+# lock before running `docker compose run`, so two digest modes can never be
+# in flight at once. The failure it prevents is a Telegram one, not a SQLite
+# one -- see digest-run.sh.j2's own header for the full reasoning.
+#
+# Installed whenever the digest is enabled at all, unconditionally on the
+# per-mode flags: every unit's ExecStart points here, so a mode enabled
+# later must not be able to find the script missing. ConditionPathExists on
+# the compose file already covers the "nothing deployed yet" case.
+- name: Install notification-digest shared run wrapper
+  ansible.builtin.template:
+    src: digest-run.sh.j2
+    dest: "{{ myapps_digest_run_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: myapps_digest_enabled | default(false) | bool
+
+# Generic script + env file shared by every myapps scheduled job's failure
+# alerting (see myapps-notify.sh.j2). Gated on EITHER digest OR jobs-refresh
+# being enabled -- gating on digest alone would silently break jobs-refresh
+# alerting whenever digest was off, which is exactly the bug class this
+# generalization exists to avoid.
+- name: Install myapps failure notification script
+  ansible.builtin.template:
+    src: myapps-notify.sh.j2
+    dest: "{{ myapps_notify_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: >-
+    (myapps_digest_enabled | default(false) | bool)
+    or (myapps_jobs_refresh_enabled | default(false) | bool)
+    or (myapps_garmin_health_enabled | default(false) | bool)
+    or (myapps_withings_sync_enabled | default(false) | bool)
+
+# The failure-notify script was renamed from the digest-specific
+# /usr/local/sbin/digest-notify to the generic path above; nothing
+# references the old path anymore. Remove it unconditionally (not gated on
+# digest/jobs-refresh) so a previous deploy's script doesn't linger
+# unreferenced on the host. Safe to run repeatedly: a no-op once removed.
+- name: Remove obsolete digest-notify script
+  ansible.builtin.file:
+    path: /usr/local/sbin/digest-notify
+    state: absent
+
+- name: Ensure myapps notify env file exists (do not overwrite)
+  ansible.builtin.copy:
+    dest: "{{ myapps_digest_notify_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+    content: |
+      # myapps failure notification environment (shared by every scheduled
+      # job's OnFailure= alert, e.g. notification-digest, jobs-refresh).
+      # Fill these in to receive an alert when a job run fails.
+      # Ntfy:
+      #   NTFY_URL=https://ntfy.sh (or your self-hosted ntfy base URL)
+      #   NTFY_TOPIC=your-topic
+      #   NTFY_TOKEN= (optional; for protected topics)
+      #
+      # Telegram:
+      #   TELEGRAM_BOT_TOKEN=
+      #   TELEGRAM_CHAT_ID=
+      NTFY_URL=https://ntfy.sh
+      NTFY_TOPIC=
+      NTFY_TOKEN=
+      TELEGRAM_BOT_TOKEN=
+      TELEGRAM_CHAT_ID=
+  when: >-
+    (myapps_digest_enabled | default(false) | bool)
+    or (myapps_jobs_refresh_enabled | default(false) | bool)
+
+- name: Install myapps notify env file from provided secrets
+  ansible.builtin.copy:
+    dest: "{{ myapps_digest_notify_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: true
+    content: |
+      # Managed by Ansible: ansible/playbooks/services/01-myapps-vm.yml
+      NTFY_URL={{ (myapps_digest_notify_ntfy_url_effective | default('https://ntfy.sh')) | quote }}
+      NTFY_TOPIC={{ (myapps_digest_notify_ntfy_topic_effective | default('')) | quote }}
+      NTFY_TOKEN={{ (myapps_digest_notify_ntfy_token_effective | default('')) | quote }}
+      TELEGRAM_BOT_TOKEN={{ (myapps_digest_notify_telegram_bot_token_effective | default('')) | quote }}
+      TELEGRAM_CHAT_ID={{ (myapps_digest_notify_telegram_chat_id_effective | default('')) | quote }}
+  no_log: true
+  when:
+    - >-
+      (myapps_digest_enabled | default(false) | bool)
+      or (myapps_jobs_refresh_enabled | default(false) | bool)
+    - >-
+      (myapps_digest_notify_ntfy_topic_effective | default('') | trim | length) > 0
+      or (
+        (myapps_digest_notify_telegram_bot_token_effective | default('') | trim | length) > 0
+        and (myapps_digest_notify_telegram_chat_id_effective | default('') | trim | length) > 0
+      )
+
+- name: Install notification-digest systemd service
+  ansible.builtin.template:
+    src: digest.service.j2
+    dest: /etc/systemd/system/digest.service
+    mode: "0644"
+  register: myapps_digest_service_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Install notification-digest systemd timer
+  ansible.builtin.template:
+    src: digest.timer.j2
+    dest: /etc/systemd/system/digest.timer
+    mode: "0644"
+  register: myapps_digest_timer_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Install notification-digest failure notification systemd service
+  ansible.builtin.template:
+    src: digest-notify.service.j2
+    dest: /etc/systemd/system/digest-notify.service
+    mode: "0644"
+  register: myapps_digest_notify_service_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - (myapps_digest_service_copy.changed | default(false))
+      or (myapps_digest_timer_copy.changed | default(false))
+      or (myapps_digest_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest timer
+  ansible.builtin.systemd:
+    name: digest.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# The overnight (00 UTC) and evening (18 UTC) window slots run the SAME cycle
+# as digest.service, with reader-facing channels suppressed via the app's
+# `hide:<channel>` argv. See myapps_digest_on_calendar's comment in
+# defaults/main.yml for the three-way split and why the two hidden slots hide
+# different channels. Looped rather than written out twice: the unit files are
+# identical in shape and differ only by name.
+- name: Install notification-digest hidden-slot systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - digest-overnight.service
+    - digest-overnight.timer
+    - digest-overnight-notify.service
+    - digest-evening.service
+    - digest-evening.timer
+    - digest-evening-notify.service
+  register: myapps_digest_hidden_units_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest hidden slots
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_hidden_units_copy.changed | default(false)
+
+- name: Enable and start notification-digest hidden-slot timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - digest-overnight.timer
+    - digest-evening.timer
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Retention hygiene + state.db snapshots (app review 2026-08-17, findings
+# #10/#11): tmpfiles.d ages the markdown archive (365d) and the snapshot
+# dir (7d); a daily oneshot timer takes an online .backup of state.db --
+# safe against the live DB because the app runs it in WAL mode (v0.17.0+).
+- name: Install notification-digest tmpfiles retention config
+  ansible.builtin.template:
+    src: digest-tmpfiles.conf.j2
+    dest: /etc/tmpfiles.d/digest.conf
+    mode: "0644"
+  register: myapps_digest_tmpfiles_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Apply notification-digest tmpfiles config (creates backup dir)
+  ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/digest.conf
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_digest_tmpfiles_copy.changed | default(false)
+  changed_when: true
+
+- name: Install notification-digest backup script
+  ansible.builtin.template:
+    src: digest-state-backup.py.j2
+    dest: /usr/local/bin/digest-state-backup
+    mode: "0755"
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Install notification-digest backup service
+  ansible.builtin.template:
+    src: digest-backup.service.j2
+    dest: /etc/systemd/system/digest-backup.service
+    mode: "0644"
+  register: myapps_digest_backup_service_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Install notification-digest backup timer
+  ansible.builtin.template:
+    src: digest-backup.timer.j2
+    dest: /etc/systemd/system/digest-backup.timer
+    mode: "0644"
+  register: myapps_digest_backup_timer_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Install notification-digest backup failure notification systemd service
+  ansible.builtin.template:
+    src: digest-backup-notify.service.j2
+    dest: /etc/systemd/system/digest-backup-notify.service
+    mode: "0644"
+  register: myapps_digest_backup_notify_service_copy
+  when: myapps_digest_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest backup units
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - (myapps_digest_backup_service_copy.changed | default(false))
+      or (myapps_digest_backup_timer_copy.changed | default(false))
+      or (myapps_digest_backup_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest backup timer
+  ansible.builtin.systemd:
+    name: digest-backup.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown: digest is one-shot and never part of `up -d`, so
+# `--remove-orphans` (which tears down netcheck/T3MP3ST on disable) never
+# touches it. Stop/disable/remove the timer+service explicitly if present.
+- name: Check for notification-digest timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest.timer
+  register: myapps_digest_timer_stat
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest timer when disabled
+  ansible.builtin.systemd:
+    name: digest.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_enabled | default(false) | bool)
+    - myapps_digest_timer_stat.stat.exists | default(false)
+
+# The timer only triggers digest.service; disabling/removing the timer does
+# not touch a run already in flight. Stop the service unit too so teardown
+# can't leave a digest.service run alive after its unit file is deleted.
+- name: Check for notification-digest service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest.service
+  register: myapps_digest_service_stat
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+- name: Stop notification-digest service when disabled
+  ansible.builtin.systemd:
+    name: digest.service
+    state: stopped
+  when:
+    - not (myapps_digest_enabled | default(false) | bool)
+    - myapps_digest_service_stat.stat.exists | default(false)
+
+# Same teardown for the two hidden window slots. Their -notify units, like
+# digest-notify.service, are only ever started as an OnFailure= target, so
+# there is nothing to stop for those -- only the unit files to remove below.
+- name: Stop and disable notification-digest hidden-slot timers when disabled
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - digest-overnight.timer
+    - digest-evening.timer
+  failed_when: false
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+# Disabling a timer does not touch a run already in flight, so stop the
+# service units too -- same reasoning as digest.service's own teardown above.
+- name: Stop notification-digest hidden-slot services when disabled
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - digest-overnight.service
+    - digest-evening.service
+  failed_when: false
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+# digest-notify.service is only ever started as digest.service's OnFailure=
+# target, never enabled/persistently running, so there is nothing to stop --
+# just remove the unit file below alongside the timer+service.
+- name: Check for notification-digest backup timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-backup.timer
+  register: myapps_digest_backup_timer_stat
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest backup timer when disabled
+  ansible.builtin.systemd:
+    name: digest-backup.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_enabled | default(false) | bool)
+    - myapps_digest_backup_timer_stat.stat.exists | default(false)
+
+- name: Check for notification-digest failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-notify.service
+  register: myapps_digest_notify_service_stat
+  when: not (myapps_digest_enabled | default(false) | bool)
+
+- name: Remove notification-digest systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/digest.timer
+    - /etc/systemd/system/digest.service
+    - /etc/systemd/system/digest-notify.service
+    - /etc/systemd/system/digest-overnight.timer
+    - /etc/systemd/system/digest-overnight.service
+    - /etc/systemd/system/digest-overnight-notify.service
+    - /etc/systemd/system/digest-evening.timer
+    - /etc/systemd/system/digest-evening.service
+    - /etc/systemd/system/digest-evening-notify.service
+    - /etc/systemd/system/digest-backup.timer
+    - /etc/systemd/system/digest-backup.service
+    - /etc/systemd/system/digest-backup-notify.service
+    - /usr/local/bin/digest-state-backup
+    - /etc/tmpfiles.d/digest.conf
+  register: myapps_digest_unit_removed
+  when:
+    - not (myapps_digest_enabled | default(false) | bool)
+    - (myapps_digest_timer_stat.stat.exists | default(false))
+      or (myapps_digest_service_stat.stat.exists | default(false))
+      or (myapps_digest_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after notification-digest teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_digest_enabled | default(false) | bool)
+    - myapps_digest_unit_removed.changed | default(false)
+
+# --- notification-digest daily brief ---
+# Second scheduled job on the SAME digest.env/compose service (`docker
+# compose run --rm digest daily`, notification-digest PR #30) -- a separate
+# timer/service/notify triple, gated independently of the window job above
+# so the daily brief can be toggled without touching myapps_digest_enabled.
+- name: Install notification-digest daily brief systemd service
+  ansible.builtin.template:
+    src: digest-daily.service.j2
+    dest: /etc/systemd/system/digest-daily.service
+    mode: "0644"
+  register: myapps_digest_daily_service_copy
+  when: myapps_digest_daily_enabled | default(false) | bool
+
+- name: Install notification-digest daily brief systemd timer
+  ansible.builtin.template:
+    src: digest-daily.timer.j2
+    dest: /etc/systemd/system/digest-daily.timer
+    mode: "0644"
+  register: myapps_digest_daily_timer_copy
+  when: myapps_digest_daily_enabled | default(false) | bool
+
+- name: Install notification-digest daily brief failure notification systemd service
+  ansible.builtin.template:
+    src: digest-daily-notify.service.j2
+    dest: /etc/systemd/system/digest-daily-notify.service
+    mode: "0644"
+  register: myapps_digest_daily_notify_service_copy
+  when: myapps_digest_daily_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest daily brief
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_daily_enabled | default(false) | bool
+    - (myapps_digest_daily_service_copy.changed | default(false))
+      or (myapps_digest_daily_timer_copy.changed | default(false))
+      or (myapps_digest_daily_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest daily brief timer
+  ansible.builtin.systemd:
+    name: digest-daily.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_daily_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown, mirroring notification-digest's own: the daily brief
+# is one-shot and never part of `up -d`, so `--remove-orphans` never touches
+# it. Stop/disable/remove the timer+service explicitly if present.
+- name: Check for notification-digest daily brief timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-daily.timer
+  register: myapps_digest_daily_timer_stat
+  when: not (myapps_digest_daily_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest daily brief timer when disabled
+  ansible.builtin.systemd:
+    name: digest-daily.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_daily_enabled | default(false) | bool)
+    - myapps_digest_daily_timer_stat.stat.exists | default(false)
+
+# The timer only triggers digest-daily.service; disabling/removing the timer
+# does not touch a run already in flight. Stop the service unit too so
+# teardown can't leave a digest-daily.service run alive after its unit file
+# is deleted.
+- name: Check for notification-digest daily brief service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-daily.service
+  register: myapps_digest_daily_service_stat
+  when: not (myapps_digest_daily_enabled | default(false) | bool)
+
+- name: Stop notification-digest daily brief service when disabled
+  ansible.builtin.systemd:
+    name: digest-daily.service
+    state: stopped
+  when:
+    - not (myapps_digest_daily_enabled | default(false) | bool)
+    - myapps_digest_daily_service_stat.stat.exists | default(false)
+
+# digest-daily-notify.service is only ever started as digest-daily.service's
+# OnFailure= target, never enabled/persistently running, so there is nothing
+# to stop -- just remove the unit file below alongside the timer+service.
+- name: Check for notification-digest daily brief failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-daily-notify.service
+  register: myapps_digest_daily_notify_service_stat
+  when: not (myapps_digest_daily_enabled | default(false) | bool)
+
+- name: Remove notification-digest daily brief systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/digest-daily.timer
+    - /etc/systemd/system/digest-daily.service
+    - /etc/systemd/system/digest-daily-notify.service
+  register: myapps_digest_daily_unit_removed
+  when:
+    - not (myapps_digest_daily_enabled | default(false) | bool)
+    - (myapps_digest_daily_timer_stat.stat.exists | default(false))
+      or (myapps_digest_daily_service_stat.stat.exists | default(false))
+      or (myapps_digest_daily_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after notification-digest daily brief teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_digest_daily_enabled | default(false) | bool)
+    - myapps_digest_daily_unit_removed.changed | default(false)
+
+# --- notification-digest Patreon collector ---
+# A FOURTH scheduled job on the SAME digest.env/compose service (`docker
+# compose run --rm digest patreon`), and the first outside the window ->
+# daily -> weekly cascade: it polls one paid Patreon campaign hourly and
+# posts each new post to its own Telegram topic. Gated independently, same
+# reasoning as the daily/weekly gates -- it must stay off while
+# myapps_digest_image predates the `patreon` argv mode.
+- name: Install notification-digest Patreon collector systemd service
+  ansible.builtin.template:
+    src: digest-patreon.service.j2
+    dest: /etc/systemd/system/digest-patreon.service
+    mode: "0644"
+  register: myapps_digest_patreon_service_copy
+  when: myapps_digest_patreon_enabled | default(false) | bool
+
+- name: Install notification-digest Patreon collector systemd timer
+  ansible.builtin.template:
+    src: digest-patreon.timer.j2
+    dest: /etc/systemd/system/digest-patreon.timer
+    mode: "0644"
+  register: myapps_digest_patreon_timer_copy
+  when: myapps_digest_patreon_enabled | default(false) | bool
+
+- name: Install notification-digest Patreon collector failure notification systemd service
+  ansible.builtin.template:
+    src: digest-patreon-notify.service.j2
+    dest: /etc/systemd/system/digest-patreon-notify.service
+    mode: "0644"
+  register: myapps_digest_patreon_notify_service_copy
+  when: myapps_digest_patreon_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest Patreon collector
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_patreon_enabled | default(false) | bool
+    - (myapps_digest_patreon_service_copy.changed | default(false))
+      or (myapps_digest_patreon_timer_copy.changed | default(false))
+      or (myapps_digest_patreon_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest Patreon collector timer
+  ansible.builtin.systemd:
+    name: digest-patreon.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_patreon_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown, mirroring the daily/weekly jobs': one-shot units are
+# never part of `up -d`, so `--remove-orphans` never touches them.
+- name: Check for notification-digest Patreon collector timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-patreon.timer
+  register: myapps_digest_patreon_timer_stat
+  when: not (myapps_digest_patreon_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest Patreon collector timer when disabled
+  ansible.builtin.systemd:
+    name: digest-patreon.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_patreon_enabled | default(false) | bool)
+    - myapps_digest_patreon_timer_stat.stat.exists | default(false)
+
+# The timer only triggers digest-patreon.service; removing the timer does
+# not touch a run already in flight. Stop the service unit too so teardown
+# cannot leave a run alive after its unit file is deleted.
+- name: Check for notification-digest Patreon collector service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-patreon.service
+  register: myapps_digest_patreon_service_stat
+  when: not (myapps_digest_patreon_enabled | default(false) | bool)
+
+- name: Stop notification-digest Patreon collector service when disabled
+  ansible.builtin.systemd:
+    name: digest-patreon.service
+    state: stopped
+  when:
+    - not (myapps_digest_patreon_enabled | default(false) | bool)
+    - myapps_digest_patreon_service_stat.stat.exists | default(false)
+
+# digest-patreon-notify.service is only ever started as
+# digest-patreon.service's OnFailure= target, never enabled or persistently
+# running, so there is nothing to stop -- just remove the unit file below.
+- name: Check for notification-digest Patreon collector failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-patreon-notify.service
+  register: myapps_digest_patreon_notify_service_stat
+  when: not (myapps_digest_patreon_enabled | default(false) | bool)
+
+- name: Remove notification-digest Patreon collector systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/digest-patreon.timer
+    - /etc/systemd/system/digest-patreon.service
+    - /etc/systemd/system/digest-patreon-notify.service
+  register: myapps_digest_patreon_unit_removed
+  when:
+    - not (myapps_digest_patreon_enabled | default(false) | bool)
+    - (myapps_digest_patreon_timer_stat.stat.exists | default(false))
+      or (myapps_digest_patreon_service_stat.stat.exists | default(false))
+      or (myapps_digest_patreon_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after notification-digest Patreon collector teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_digest_patreon_enabled | default(false) | bool)
+    - myapps_digest_patreon_unit_removed.changed | default(false)
+
+# --- notification-digest positions tracker ---
+# A FIFTH scheduled job on the SAME digest.env/compose service (`docker
+# compose run --rm digest positions`), and the second outside the window ->
+# daily -> weekly cascade. It tracks the projects the owner holds a position
+# in, on a 4-hourly clock, into its own Telegram topic.
+#
+# Gated independently, same reasoning as the daily/weekly/patreon gates --
+# it must stay off while myapps_digest_image predates the `positions` argv
+# mode. Note this flag is TWO-SIDED, unlike the others: enabling it also
+# REMOVES the tracked channels and accounts from the window briefing, since
+# the app excludes them from its own sweep so nothing is covered twice.
+- name: Install notification-digest positions tracker systemd service
+  ansible.builtin.template:
+    src: digest-positions.service.j2
+    dest: /etc/systemd/system/digest-positions.service
+    mode: "0644"
+  register: myapps_digest_positions_service_copy
+  when: myapps_digest_positions_enabled | default(false) | bool
+
+- name: Install notification-digest positions tracker systemd timer
+  ansible.builtin.template:
+    src: digest-positions.timer.j2
+    dest: /etc/systemd/system/digest-positions.timer
+    mode: "0644"
+  register: myapps_digest_positions_timer_copy
+  when: myapps_digest_positions_enabled | default(false) | bool
+
+- name: Install notification-digest positions tracker failure notification systemd service
+  ansible.builtin.template:
+    src: digest-positions-notify.service.j2
+    dest: /etc/systemd/system/digest-positions-notify.service
+    mode: "0644"
+  register: myapps_digest_positions_notify_service_copy
+  when: myapps_digest_positions_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest positions tracker
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_positions_enabled | default(false) | bool
+    - (myapps_digest_positions_service_copy.changed | default(false))
+      or (myapps_digest_positions_timer_copy.changed | default(false))
+      or (myapps_digest_positions_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest positions tracker timer
+  ansible.builtin.systemd:
+    name: digest-positions.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_positions_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown, mirroring the daily/weekly/patreon jobs': one-shot
+# units are never part of `up -d`, so `--remove-orphans` never touches them.
+- name: Check for notification-digest positions tracker timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-positions.timer
+  register: myapps_digest_positions_timer_stat
+  when: not (myapps_digest_positions_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest positions tracker timer when disabled
+  ansible.builtin.systemd:
+    name: digest-positions.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_positions_enabled | default(false) | bool)
+    - myapps_digest_positions_timer_stat.stat.exists | default(false)
+
+# The timer only triggers digest-positions.service; removing the timer does
+# not touch a run already in flight. Stop the service unit too so teardown
+# cannot leave a run alive after its unit file is deleted.
+- name: Check for notification-digest positions tracker service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-positions.service
+  register: myapps_digest_positions_service_stat
+  when: not (myapps_digest_positions_enabled | default(false) | bool)
+
+- name: Stop notification-digest positions tracker service when disabled
+  ansible.builtin.systemd:
+    name: digest-positions.service
+    state: stopped
+  when:
+    - not (myapps_digest_positions_enabled | default(false) | bool)
+    - myapps_digest_positions_service_stat.stat.exists | default(false)
+
+# digest-positions-notify.service is only ever started as
+# digest-positions.service's OnFailure= target, never enabled or
+# persistently running, so there is nothing to stop -- just remove the unit
+# file below.
+- name: Check for notification-digest positions tracker failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-positions-notify.service
+  register: myapps_digest_positions_notify_service_stat
+  when: not (myapps_digest_positions_enabled | default(false) | bool)
+
+- name: Remove notification-digest positions tracker systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/digest-positions.timer
+    - /etc/systemd/system/digest-positions.service
+    - /etc/systemd/system/digest-positions-notify.service
+  register: myapps_digest_positions_unit_removed
+  when:
+    - not (myapps_digest_positions_enabled | default(false) | bool)
+    - (myapps_digest_positions_timer_stat.stat.exists | default(false))
+      or (myapps_digest_positions_service_stat.stat.exists | default(false))
+      or (myapps_digest_positions_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after notification-digest positions tracker teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_digest_positions_enabled | default(false) | bool)
+    - myapps_digest_positions_unit_removed.changed | default(false)
+
+# --- notification-digest weekly brief ---
+# Third scheduled job on the SAME digest.env/compose service (`docker
+# compose run --rm digest weekly`, notification-digest PR #57) -- a separate
+# timer/service/notify triple, gated independently of the window job above
+# so the weekly brief can be toggled without touching myapps_digest_enabled
+# or the daily brief's own flag. Mirrors the daily triple above verbatim.
+- name: Install notification-digest weekly brief systemd service
+  ansible.builtin.template:
+    src: digest-weekly.service.j2
+    dest: /etc/systemd/system/digest-weekly.service
+    mode: "0644"
+  register: myapps_digest_weekly_service_copy
+  when: myapps_digest_weekly_enabled | default(false) | bool
+
+- name: Install notification-digest weekly brief systemd timer
+  ansible.builtin.template:
+    src: digest-weekly.timer.j2
+    dest: /etc/systemd/system/digest-weekly.timer
+    mode: "0644"
+  register: myapps_digest_weekly_timer_copy
+  when: myapps_digest_weekly_enabled | default(false) | bool
+
+- name: Install notification-digest weekly brief failure notification systemd service
+  ansible.builtin.template:
+    src: digest-weekly-notify.service.j2
+    dest: /etc/systemd/system/digest-weekly-notify.service
+    mode: "0644"
+  register: myapps_digest_weekly_notify_service_copy
+  when: myapps_digest_weekly_enabled | default(false) | bool
+
+- name: Reload systemd for notification-digest weekly brief
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_digest_weekly_enabled | default(false) | bool
+    - (myapps_digest_weekly_service_copy.changed | default(false))
+      or (myapps_digest_weekly_timer_copy.changed | default(false))
+      or (myapps_digest_weekly_notify_service_copy.changed | default(false))
+
+- name: Enable and start notification-digest weekly brief timer
+  ansible.builtin.systemd:
+    name: digest-weekly.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_digest_weekly_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown, mirroring notification-digest's own: the weekly brief
+# is one-shot and never part of `up -d`, so `--remove-orphans` never touches
+# it. Stop/disable/remove the timer+service explicitly if present.
+- name: Check for notification-digest weekly brief timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-weekly.timer
+  register: myapps_digest_weekly_timer_stat
+  when: not (myapps_digest_weekly_enabled | default(false) | bool)
+
+- name: Stop and disable notification-digest weekly brief timer when disabled
+  ansible.builtin.systemd:
+    name: digest-weekly.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_digest_weekly_enabled | default(false) | bool)
+    - myapps_digest_weekly_timer_stat.stat.exists | default(false)
+
+# The timer only triggers digest-weekly.service; disabling/removing the timer
+# does not touch a run already in flight. Stop the service unit too so
+# teardown can't leave a digest-weekly.service run alive after its unit file
+# is deleted.
+- name: Check for notification-digest weekly brief service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-weekly.service
+  register: myapps_digest_weekly_service_stat
+  when: not (myapps_digest_weekly_enabled | default(false) | bool)
+
+- name: Stop notification-digest weekly brief service when disabled
+  ansible.builtin.systemd:
+    name: digest-weekly.service
+    state: stopped
+  when:
+    - not (myapps_digest_weekly_enabled | default(false) | bool)
+    - myapps_digest_weekly_service_stat.stat.exists | default(false)
+
+# digest-weekly-notify.service is only ever started as digest-weekly.service's
+# OnFailure= target, never enabled/persistently running, so there is nothing
+# to stop -- just remove the unit file below alongside the timer+service.
+- name: Check for notification-digest weekly brief failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/digest-weekly-notify.service
+  register: myapps_digest_weekly_notify_service_stat
+  when: not (myapps_digest_weekly_enabled | default(false) | bool)
+
+- name: Remove notification-digest weekly brief systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/digest-weekly.timer
+    - /etc/systemd/system/digest-weekly.service
+    - /etc/systemd/system/digest-weekly-notify.service
+  register: myapps_digest_weekly_unit_removed
+  when:
+    - not (myapps_digest_weekly_enabled | default(false) | bool)
+    - (myapps_digest_weekly_timer_stat.stat.exists | default(false))
+      or (myapps_digest_weekly_service_stat.stat.exists | default(false))
+      or (myapps_digest_weekly_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after notification-digest weekly brief teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_digest_weekly_enabled | default(false) | bool)
+    - myapps_digest_weekly_unit_removed.changed | default(false)
+
+# --- jobs-refresh ---
+# One-shot container run on a schedule via `docker compose run --rm
+# jobs-refresh`, mirroring notification-digest's oneshot pattern. Unlike
+# digest (pulled from a private GHCR package), there is no published image to
+# pull, so jobs-refresh is built locally from node:22 + git + a pinned Claude
+# CLI -- mirroring T3MP3ST's build-locally pattern.
+# --- garmin-health (my-health-datas) ---
+# One image, two independent one-shot jobs (sync daily, report monthly). Same
+# deployment shape as notification-digest above: pinned private GHCR tag,
+# pre-pulled at deploy, `profiles: ["oneshot"]` so `up -d` never touches it,
+# systemd timers own the scheduling.
+#
+# Deliberately NOT behind digest-run's flock: that lock exists because four
+# digest modes share one Telethon session, which this service never opens.
+# jobs-refresh, the other non-digest Claude job, stays out of it too --
+# separation here is by schedule (see the calendars in defaults/main.yml).
+
+# The app's own claude timeout must fire BEFORE systemd kills the unit --
+# otherwise a slow call dies as an opaque "Result: timeout" with no error
+# message, instead of report.py's own "claude -p timed out after Ns". Same
+# class of bug the digest timeout assertion above exists to prevent.
+- name: Require the garmin-health report unit's TimeoutStartSec to cover its Claude budget
+  ansible.builtin.assert:
+    that:
+      - (myapps_garmin_health_report_timeout_start_sec | int)
+        > (myapps_garmin_health_claude_timeout_seconds | int)
+    fail_msg: >-
+      myapps_garmin_health_report_timeout_start_sec
+      ({{ myapps_garmin_health_report_timeout_start_sec }}) must exceed
+      myapps_garmin_health_claude_timeout_seconds
+      ({{ myapps_garmin_health_claude_timeout_seconds }}), leaving room for the
+      stats query and the Telegram uploads on top.
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+- name: Require a GHCR pull token when garmin-health is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_garmin_health_ghcr_pull_token_effective
+         | default(myapps_garmin_health_ghcr_pull_token) | trim | length) > 0
+    fail_msg: >-
+      myapps_garmin_health_enabled is true but no GHCR pull token is set.
+      ghcr.io/dezoxy/my-health-datas is a PRIVATE package: store a
+      read:packages PAT as the garmin-ghcr-pull-token Key Vault secret
+      (folder=garmin, envvar=GARMIN_GHCR_PULL_TOKEN) before enabling.
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+# community.docker is not in ansible/requirements.yml, so we shell out -- same
+# approach as digest above. The token travels only via stdin, never in argv
+# (where it would appear in `ps` output) and never in a log.
+#
+# NOTE: this runs AFTER digest's ghcr.io login, so its credential is the one
+# left in root's ~/.docker/config.json. That only matters if an image ever has
+# to be pulled outside a deploy; the pre-pull below means a normal timer fire
+# never pulls. Keep both tokens scoped to read:packages on the whole dezoxy
+# org rather than a single package, and the ordering stops mattering.
+- name: Log in to GHCR for the garmin-health image pull
+  ansible.builtin.command:
+    argv:
+      - docker
+      - login
+      - ghcr.io
+      - -u
+      - garmin-deploy
+      - --password-stdin
+    stdin: "{{ myapps_garmin_health_ghcr_pull_token_effective | default(myapps_garmin_health_ghcr_pull_token) }}"
+  no_log: true
+  changed_when: true
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+# Pull at DEPLOY time, not at first timer fire: the service sits behind
+# `profiles: ["oneshot"]` so `docker compose up -d` never pulls it. Without
+# this a bad token or a typo'd tag would first surface as a silent 03:30
+# failure in the journal instead of a loud, immediate deploy failure.
+- name: Pre-pull the garmin-health image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - "{{ myapps_garmin_health_image }}"
+  register: myapps_garmin_health_pull
+  changed_when: "'Downloaded newer image' in myapps_garmin_health_pull.stdout"
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+# uid/gid 1000 matches the image's non-root `garmin` user. mode 0750 rather
+# than 0755: this tree holds personal health data plus two live credential
+# directories (garth OAuth tokens, Claude CLI auth).
+- name: Ensure garmin-health directories owned by the container UID
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: 1000
+    group: 1000
+    mode: "0750"
+  loop:
+    - "{{ myapps_garmin_health_state_dir }}"
+    - "{{ myapps_garmin_health_reports_dir }}"
+    - "{{ myapps_garmin_health_garmin_tokens_dir }}"
+    - "{{ myapps_garmin_health_claude_home_dir }}"
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+- name: Install garmin-health environment file
+  ansible.builtin.template:
+    src: garmin-health.env.j2
+    dest: "{{ myapps_garmin_health_env_file }}"
+    mode: "0600"
+  no_log: true
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+# garmin-health's OnFailure= units point the shared notify script at THIS env
+# file instead of the myapps-wide one (see garmin-sync-notify.service.j2), so
+# health alerts land on the dedicated health bot. Rendered only when both
+# credentials are present -- a half-configured pair would leave the script
+# with no target, which it already treats as "nothing to do".
+- name: Install garmin-health notify env file
+  ansible.builtin.copy:
+    dest: "{{ myapps_garmin_health_notify_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: true
+    content: |
+      # Managed by Ansible: ansible/playbooks/services/01-myapps-vm.yml
+      # Dedicated health bot -- deliberately NOT the shared myapps alert bot.
+      TELEGRAM_BOT_TOKEN={{ (myapps_garmin_health_telegram_bot_token_effective | default('')) | quote }}
+      TELEGRAM_CHAT_ID={{ (myapps_garmin_health_telegram_chat_id_effective | default('')) | quote }}
+  no_log: true
+  when:
+    - myapps_garmin_health_enabled | default(false) | bool
+    - (myapps_garmin_health_telegram_bot_token_effective | default('') | trim | length) > 0
+    - (myapps_garmin_health_telegram_chat_id_effective | default('') | trim | length) > 0
+
+- name: Install garmin-health systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - garmin-sync.service
+    - garmin-sync.timer
+    - garmin-sync-notify.service
+    - garmin-report.service
+    - garmin-report.timer
+    - garmin-report-notify.service
+  register: myapps_garmin_health_units_copy
+  when: myapps_garmin_health_enabled | default(false) | bool
+
+- name: Reload systemd for garmin-health
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_garmin_health_enabled | default(false) | bool
+    - myapps_garmin_health_units_copy.changed | default(false)
+
+- name: Enable and start garmin-health timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - garmin-sync.timer
+    - garmin-report.timer
+  when:
+    - myapps_garmin_health_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# --- garmin-health teardown (when disabled) ---
+# Mirrors the digest teardown above: flipping the flag off must actually stop
+# the timers and remove the units, not just skip the install tasks and leave a
+# stale timer firing against a compose file that no longer defines the service.
+- name: Check for garmin-health timer units when disabled
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}"
+  register: myapps_garmin_health_timer_stat
+  loop:
+    - garmin-sync.timer
+    - garmin-report.timer
+  when: not (myapps_garmin_health_enabled | default(false) | bool)
+
+- name: Stop and disable garmin-health timers when disabled
+  ansible.builtin.systemd:
+    name: "{{ item.item }}"
+    enabled: false
+    state: stopped
+  loop: "{{ myapps_garmin_health_timer_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - not (myapps_garmin_health_enabled | default(false) | bool)
+    - myapps_manage_services | bool
+    - item.stat.exists | default(false)
+
+- name: Check for garmin-health service units when disabled
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}"
+  register: myapps_garmin_health_service_stat
+  loop:
+    - garmin-sync.service
+    - garmin-report.service
+  when: not (myapps_garmin_health_enabled | default(false) | bool)
+
+- name: Stop garmin-health services when disabled
+  ansible.builtin.systemd:
+    name: "{{ item.item }}"
+    state: stopped
+  loop: "{{ myapps_garmin_health_service_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - not (myapps_garmin_health_enabled | default(false) | bool)
+    - myapps_manage_services | bool
+    - item.stat.exists | default(false)
+
+# The env files go too: garmin-health.env holds the Telegram bot token, and a
+# disabled service has no reason to leave a live credential on disk. The state
+# dir under /srv/appdata is deliberately NOT removed -- it holds the immutable
+# raw dumps and both login dirs, none of which are re-creatable unattended.
+- name: Remove garmin-health units and env files when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/garmin-sync.service
+    - /etc/systemd/system/garmin-sync.timer
+    - /etc/systemd/system/garmin-sync-notify.service
+    - /etc/systemd/system/garmin-report.service
+    - /etc/systemd/system/garmin-report.timer
+    - /etc/systemd/system/garmin-report-notify.service
+    - "{{ myapps_garmin_health_env_file }}"
+    - "{{ myapps_garmin_health_notify_env_file }}"
+  register: myapps_garmin_health_units_removed
+  when: not (myapps_garmin_health_enabled | default(false) | bool)
+
+- name: Reload systemd after garmin-health teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_garmin_health_enabled | default(false) | bool)
+    - myapps_garmin_health_units_removed.changed | default(false)
+
+# --- withings-sync ---
+# Bridges the Withings scale into Garmin Connect so garmin-health's daily
+# fetch sees the weigh-ins. Same shape as garmin-health minus the env files:
+# it has no secrets, only the two token files in its state dir. Its failure
+# alerts reuse garmin-health's notify env file (dedicated health bot), which
+# is why it cannot be enabled without garmin-health.
+- name: Require garmin-health when withings-sync is enabled
+  ansible.builtin.assert:
+    that:
+      - myapps_garmin_health_enabled | default(false) | bool
+    fail_msg: >-
+      myapps_withings_sync_enabled is true but myapps_garmin_health_enabled is
+      not. withings-sync only exists to feed garmin-health, and its OnFailure=
+      alert goes through garmin-health's notify env file.
+  when: myapps_withings_sync_enabled | default(false) | bool
+
+- name: Require a Garmin username when withings-sync is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_withings_sync_garmin_username | default('') | trim | length) > 0
+    fail_msg: >-
+      myapps_withings_sync_enabled is true but
+      myapps_withings_sync_garmin_username is empty. Without it withings-sync
+      "succeeds" while uploading nothing — the username is the destination
+      selector, not a credential. Set it in host_vars.
+  when: myapps_withings_sync_enabled | default(false) | bool
+
+- name: Pre-pull the withings-sync image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - "{{ myapps_withings_sync_image }}"
+  register: myapps_withings_sync_pull
+  changed_when: "'Downloaded newer image' in myapps_withings_sync_pull.stdout"
+  when: myapps_withings_sync_enabled | default(false) | bool
+
+# uid/gid 1000 matches the image's non-root user. 0700: the directory holds
+# nothing but two live token files.
+# BOTH directories, explicitly. .garmin_session is where the Garmin token
+# mint (see the host_vars runbook) bind-mounts; if the role does not create
+# it, Docker auto-creates it root-owned on first mount and the uid-1000
+# container gets Permission denied writing tokens — observed live 2026-08-24,
+# costing a burned single-use MFA code.
+- name: Ensure withings-sync state directories owned by the container UID
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0700"
+  loop:
+    - "{{ myapps_withings_sync_state_dir }}"
+    - "{{ myapps_withings_sync_state_dir }}/.garmin_session"
+  when: myapps_withings_sync_enabled | default(false) | bool
+
+- name: Install withings-sync systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - withings-sync.service
+    - withings-sync.timer
+    - withings-sync-notify.service
+  register: myapps_withings_sync_units_copy
+  when: myapps_withings_sync_enabled | default(false) | bool
+
+- name: Reload systemd for withings-sync
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_withings_sync_enabled | default(false) | bool
+    - myapps_withings_sync_units_copy.changed | default(false)
+
+- name: Enable and start withings-sync timer
+  ansible.builtin.systemd:
+    name: withings-sync.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_withings_sync_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# --- withings-sync teardown (when disabled) ---
+- name: Check for the withings-sync timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/withings-sync.timer
+  register: myapps_withings_sync_timer_stat
+  when: not (myapps_withings_sync_enabled | default(false) | bool)
+
+- name: Stop and disable the withings-sync timer when disabled
+  ansible.builtin.systemd:
+    name: withings-sync.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_withings_sync_enabled | default(false) | bool)
+    - myapps_manage_services | bool
+    - myapps_withings_sync_timer_stat.stat.exists | default(false)
+
+- name: Check for the withings-sync service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/withings-sync.service
+  register: myapps_withings_sync_service_stat
+  when: not (myapps_withings_sync_enabled | default(false) | bool)
+
+- name: Stop the withings-sync service when disabled
+  ansible.builtin.systemd:
+    name: withings-sync.service
+    state: stopped
+  when:
+    - not (myapps_withings_sync_enabled | default(false) | bool)
+    - myapps_manage_services | bool
+    - myapps_withings_sync_service_stat.stat.exists | default(false)
+
+# The state dir stays: it holds the two login tokens, neither re-creatable
+# unattended.
+- name: Remove withings-sync units when disabled
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop:
+    - withings-sync.service
+    - withings-sync.timer
+    - withings-sync-notify.service
+  register: myapps_withings_sync_units_removed
+  when: not (myapps_withings_sync_enabled | default(false) | bool)
+
+- name: Reload systemd after withings-sync teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_withings_sync_enabled | default(false) | bool)
+    - myapps_withings_sync_units_removed.changed | default(false)
+
+- name: Ensure jobs-refresh directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ myapps_jobs_refresh_build_dir }}"
+      mode: "0755"
+    - path: "{{ myapps_jobs_refresh_repo_dir }}"
+      mode: "0755"
+    - path: "{{ myapps_jobs_refresh_employee_cv_dir }}"
+      mode: "0755"
+    - path: "{{ myapps_jobs_refresh_claude_home_dir }}"
+      mode: "0775"
+    - path: "{{ myapps_jobs_refresh_ssh_key_dir }}"
+      mode: "0700"
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+# The container runs as myapps_jobs_refresh_container_uid/_gid, not root
+# (see defaults/main.yml), so these three bind-mounted paths need to be
+# owned by that same uid:gid -- the checkout is written every run, and an
+# unwritable claude-home breaks Claude's token refresh. `recurse: true`
+# matters here beyond the moment of creation: on a host where this already
+# ran as root (a real checkout, a real hand-authenticated claude-home), the
+# existing content is root-owned too, and this fixes it in place without
+# deleting or recreating anything. build_dir (docker build context) and
+# ssh_key_dir (holds the root-owned deploy keys, fixed individually below)
+# are deliberately excluded -- the container never touches either directly.
+- name: Fix ownership of jobs-refresh bind-mounted paths for the non-root container user
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    recurse: true
+    owner: "{{ myapps_jobs_refresh_container_uid }}"
+    group: "{{ myapps_jobs_refresh_container_gid }}"
+  loop:
+    - "{{ myapps_jobs_refresh_repo_dir }}"
+    - "{{ myapps_jobs_refresh_employee_cv_dir }}"
+    - "{{ myapps_jobs_refresh_claude_home_dir }}"
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+# Ansible never generates/fetches these -- they're per-repo GitHub deploy
+# keys (dashboard: write, employee-cv: read-only) placed on the host
+# out-of-band. Fail loudly at deploy time rather than let jobs-refresh.timer
+# discover a missing key at 3am: the bind mount in myapps-compose.yml.j2
+# would otherwise silently create an empty directory at the container path
+# instead of the expected key file.
+- name: Check for jobs-refresh SSH deploy keys
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ myapps_jobs_refresh_ssh_key_dashboard_path }}"
+    - "{{ myapps_jobs_refresh_ssh_key_employee_cv_path }}"
+  register: myapps_jobs_refresh_ssh_key_stat
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Require jobs-refresh SSH deploy keys to exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+    fail_msg: >-
+      Missing SSH deploy key at {{ item.item }}. jobs-refresh needs a
+      write-access deploy key for Dezoxy/jobs-dashboard
+      (myapps_jobs_refresh_ssh_key_dashboard_path) and a read-only deploy
+      key for Dezoxy/employee-cv (myapps_jobs_refresh_ssh_key_employee_cv_path),
+      placed on this host out-of-band -- Ansible does not generate or fetch
+      them.
+  loop: "{{ myapps_jobs_refresh_ssh_key_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+# OpenSSH's client-side private-key loader independently refuses a key on
+# TWO checks: (1) group/other permission bits must be zero ("UNPROTECTED
+# PRIVATE KEY FILE"), and (2) the file's owning uid must match the calling
+# process's uid, UNLESS that process is uid 0. The container calls this as
+# myapps_jobs_refresh_container_uid (not root -- see defaults/main.yml), so
+# check (2) means the key must be OWNED by that uid, not merely root with a
+# permissive mode -- group-readable-by-root would satisfy nothing here and
+# still fail check (1). Ansible doesn't manage the key's content, but it's
+# cheap and safe to fix ownership/mode on whatever the operator dropped in.
+- name: Fix ownership and permissions on jobs-refresh SSH deploy keys for the non-root container user
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    owner: "{{ myapps_jobs_refresh_container_uid }}"
+    group: "{{ myapps_jobs_refresh_container_gid }}"
+    mode: "0600"
+  loop: "{{ myapps_jobs_refresh_ssh_key_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - item.stat.exists | default(false)
+
+- name: Install jobs-refresh Dockerfile
+  ansible.builtin.template:
+    src: jobs-refresh.Dockerfile.j2
+    dest: "{{ myapps_jobs_refresh_build_dir }}/Dockerfile"
+    mode: "0644"
+  register: myapps_jobs_refresh_dockerfile
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Install jobs-refresh build args marker
+  ansible.builtin.template:
+    src: jobs-refresh-build-args.env.j2
+    dest: "{{ myapps_jobs_refresh_build_dir }}/build-args.env"
+    mode: "0644"
+  register: myapps_jobs_refresh_build_args
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+# NOT baked into the image (see jobs-refresh.Dockerfile.j2's CMD comment) --
+# rendered onto the host and bind-mounted read-only at container run time,
+# so bootstrap-mechanics tweaks are a redeploy, not an image rebuild.
+- name: Install jobs-refresh bootstrap script
+  ansible.builtin.template:
+    src: jobs-refresh-bootstrap.sh.j2
+    dest: "{{ myapps_jobs_refresh_bootstrap_script }}"
+    mode: "0755"
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Check jobs-refresh image
+  ansible.builtin.command: docker image inspect "{{ myapps_jobs_refresh_image }}"
+  register: myapps_jobs_refresh_image_inspect
+  changed_when: false
+  failed_when: false
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Build jobs-refresh image
+  ansible.builtin.command: >-
+    docker build
+    -f {{ myapps_jobs_refresh_build_dir }}/Dockerfile
+    --build-arg CLAUDE_CLI_VERSION={{ myapps_jobs_refresh_claude_cli_version }}
+    -t {{ myapps_jobs_refresh_image }}
+    {{ myapps_jobs_refresh_build_dir }}
+  register: myapps_jobs_refresh_build
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - myapps_jobs_refresh_force_build | bool
+      or (myapps_jobs_refresh_dockerfile is defined and myapps_jobs_refresh_dockerfile is changed)
+      or (myapps_jobs_refresh_build_args is defined and myapps_jobs_refresh_build_args is changed)
+      or (myapps_jobs_refresh_image_inspect is defined and myapps_jobs_refresh_image_inspect.rc != 0)
+
+# Fail at deploy time, not as a silent runtime skip, when the tracker sync
+# URL is set but its Access service token did not resolve -- refresh-run.sh's
+# step 2b would log "skipping" every 6 hours and the feedback loop would be
+# quietly off. Same rationale as the GHCR assert above. The secret values
+# are never printed by assert.
+- name: Require the tracker service token when the tracker sync URL is set
+  ansible.builtin.assert:
+    that:
+      - (myapps_jobs_refresh_tracker_client_id_effective | default(myapps_jobs_refresh_tracker_client_id) | default('')) | length > 0
+      - (myapps_jobs_refresh_tracker_client_secret_effective | default(myapps_jobs_refresh_tracker_client_secret) | default('')) | length > 0
+    fail_msg: >-
+      myapps_jobs_refresh_tracker_sync_url is set but the Access service
+      token did not resolve. Store the jobs-tracker-client-id /
+      jobs-tracker-client-secret Key Vault secrets (folder=jobs-refresh,
+      envvar=JOBS_TRACKER_CLIENT_ID / JOBS_TRACKER_CLIENT_SECRET — minted by
+      cloudflare-terraform's jobs_refresh service token), and make sure
+      scripts/ci/target_secret_folders.sh lists jobs-refresh for this host.
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - (myapps_jobs_refresh_tracker_sync_url | default('') | trim) | length > 0
+
+# Fail at deploy time, not as a silent runtime skip, when the digest is
+# enabled but its credentials did not resolve -- refresh-run.sh would call
+# notify-telegram.sh, which exits 1 on a missing token, and every run would
+# end in the exit-9 undelivered-digest alert. Same rationale as the tracker
+# assert above. The secret values are never printed by assert.
+- name: Require Telegram credentials when the jobs-refresh digest is enabled
+  ansible.builtin.assert:
+    that:
+      - (myapps_jobs_refresh_telegram_bot_token_effective | default(myapps_jobs_refresh_telegram_bot_token) | default('')) | length > 0
+      - (myapps_jobs_refresh_telegram_chat_id_effective | default(myapps_jobs_refresh_telegram_chat_id) | default('')) | length > 0
+    fail_msg: >-
+      myapps_jobs_refresh_notify_enabled is true but the Telegram credentials
+      did not resolve. Store the jobs-telegram-bot-token /
+      jobs-telegram-chat-id Key Vault secrets (folder=jobs-refresh,
+      envvar=JOBS_REFRESH_TELEGRAM_BOT_TOKEN / JOBS_REFRESH_TELEGRAM_CHAT_ID)
+      — the "Job Agent" bot and the owner's private chat, NOT the
+      digest-notify alert bot.
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - myapps_jobs_refresh_notify_enabled | default(false) | bool
+
+# ANTHROPIC_MODEL isn't a secret, but the file still lands at 0600 (mirrors
+# digest.env.j2's env_file, kept out of the world-readable compose file).
+- name: Install jobs-refresh environment file
+  ansible.builtin.template:
+    src: jobs-refresh.env.j2
+    dest: "{{ myapps_jobs_refresh_env_file }}"
+    mode: "0600"
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+# The MCP config jobs-refresh's Claude CLI loads points at playwright-mcp by
+# name (see jobs-refresh-mcp-config.json.j2) -- enabling the browse step
+# without that server would hand refresh-run.sh a browser tool that can
+# never connect.
+- name: Require playwright-mcp to be enabled when jobs-refresh browser support is enabled
+  ansible.builtin.assert:
+    that:
+      - myapps_playwright_mcp_enabled | default(false) | bool
+    fail_msg: >-
+      myapps_jobs_refresh_browser_enabled requires myapps_playwright_mcp_enabled
+      -- the MCP config jobs-refresh loads points at the playwright-mcp
+      server (reached as chromium:{{ myapps_playwright_mcp_port }}); without it there is
+      nothing for the browse step to connect to.
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - myapps_jobs_refresh_browser_enabled | default(false) | bool
+
+# Contains no secrets (just a service-name URL), but 0644 also matters
+# functionally here: jobs-refresh's container runs as uid 1000, not root
+# (see myapps_jobs_refresh_container_uid above), and this file stays
+# root-owned -- 0644's "other" read bit is what makes it readable to that
+# uid, mirroring how jobs-refresh-bootstrap.sh (root-owned, 0755) is
+# readable/executable by the same non-root user.
+- name: Install jobs-refresh MCP config file
+  ansible.builtin.template:
+    src: jobs-refresh-mcp-config.json.j2
+    dest: "{{ myapps_jobs_refresh_mcp_config_path }}"
+    mode: "0644"
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - myapps_jobs_refresh_browser_enabled | default(false) | bool
+
+- name: Install jobs-refresh systemd service
+  ansible.builtin.template:
+    src: jobs-refresh.service.j2
+    dest: /etc/systemd/system/jobs-refresh.service
+    mode: "0644"
+  register: myapps_jobs_refresh_service_copy
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Install jobs-refresh systemd timer
+  ansible.builtin.template:
+    src: jobs-refresh.timer.j2
+    dest: /etc/systemd/system/jobs-refresh.timer
+    mode: "0644"
+  register: myapps_jobs_refresh_timer_copy
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Install jobs-refresh failure notification systemd service
+  ansible.builtin.template:
+    src: jobs-refresh-notify.service.j2
+    dest: /etc/systemd/system/jobs-refresh-notify.service
+    mode: "0644"
+  register: myapps_jobs_refresh_notify_service_copy
+  when: myapps_jobs_refresh_enabled | default(false) | bool
+
+- name: Reload systemd for jobs-refresh
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - (myapps_jobs_refresh_service_copy.changed | default(false))
+      or (myapps_jobs_refresh_timer_copy.changed | default(false))
+      or (myapps_jobs_refresh_notify_service_copy.changed | default(false))
+
+- name: Enable and start jobs-refresh timer
+  ansible.builtin.systemd:
+    name: jobs-refresh.timer
+    enabled: true
+    state: started
+  when:
+    - myapps_jobs_refresh_enabled | default(false) | bool
+    - myapps_manage_services | bool
+
+# Idempotent teardown, mirroring notification-digest's: jobs-refresh is
+# one-shot and never part of `up -d`, so `--remove-orphans` never touches it.
+- name: Check for jobs-refresh timer unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/jobs-refresh.timer
+  register: myapps_jobs_refresh_timer_stat
+  when: not (myapps_jobs_refresh_enabled | default(false) | bool)
+
+- name: Stop and disable jobs-refresh timer when disabled
+  ansible.builtin.systemd:
+    name: jobs-refresh.timer
+    enabled: false
+    state: stopped
+  when:
+    - not (myapps_jobs_refresh_enabled | default(false) | bool)
+    - myapps_jobs_refresh_timer_stat.stat.exists | default(false)
+
+- name: Check for jobs-refresh service unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/jobs-refresh.service
+  register: myapps_jobs_refresh_service_stat
+  when: not (myapps_jobs_refresh_enabled | default(false) | bool)
+
+- name: Stop jobs-refresh service when disabled
+  ansible.builtin.systemd:
+    name: jobs-refresh.service
+    state: stopped
+  when:
+    - not (myapps_jobs_refresh_enabled | default(false) | bool)
+    - myapps_jobs_refresh_service_stat.stat.exists | default(false)
+
+- name: Check for jobs-refresh failure notification unit when disabled
+  ansible.builtin.stat:
+    path: /etc/systemd/system/jobs-refresh-notify.service
+  register: myapps_jobs_refresh_notify_service_stat
+  when: not (myapps_jobs_refresh_enabled | default(false) | bool)
+
+- name: Remove jobs-refresh systemd units when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/jobs-refresh.timer
+    - /etc/systemd/system/jobs-refresh.service
+    - /etc/systemd/system/jobs-refresh-notify.service
+  register: myapps_jobs_refresh_unit_removed
+  when:
+    - not (myapps_jobs_refresh_enabled | default(false) | bool)
+    - (myapps_jobs_refresh_timer_stat.stat.exists | default(false))
+      or (myapps_jobs_refresh_service_stat.stat.exists | default(false))
+      or (myapps_jobs_refresh_notify_service_stat.stat.exists | default(false))
+
+- name: Reload systemd after jobs-refresh teardown
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - not (myapps_jobs_refresh_enabled | default(false) | bool)
+    - myapps_jobs_refresh_unit_removed.changed | default(false)
+
+- name: Prune dangling Docker images after myapps deploy
+  ansible.builtin.command:
+    argv:
+      - docker
+      - image
+      - prune
+      - -f
+  register: myapps_docker_image_prune
+  changed_when: "'Total reclaimed space: 0B' not in (myapps_docker_image_prune.stdout | default(''))"
+  when:
+    - myapps_manage_services | bool
+    - myapps_prune_images_after_deploy | bool
+    - myapps_deploy_changed | bool
+
+# Last, deliberately: see the note at the top of this role and in
+# local_state_backup/tasks/units.yml. The timer must not be startable until the
+# restore above has finished.
+- name: Install and enable the local state backup units
+  ansible.builtin.import_role:
+    name: local_state_backup
+    tasks_from: units

@@ -1,0 +1,196 @@
+---
+- name: Query pinned VM template config before build
+  ansible.builtin.command:
+    argv:
+      - qm
+      - config
+      - "{{ proxmox_image_resolution.image.template_vmid | string }}"
+  register: proxmox_image_vm_template_before
+  changed_when: false
+  failed_when: false
+
+- name: Verify existing pinned VM template config
+  ansible.builtin.assert:
+    that:
+      - "'template: 1' in proxmox_image_vm_template_before.stdout_lines"
+      - "('name: ' ~ proxmox_image_resolution.image.template_name) in proxmox_image_vm_template_before.stdout_lines"
+    fail_msg: >-
+      VMID {{ proxmox_image_resolution.image.template_vmid }} exists but does not
+      match pinned template {{ proxmox_image_resolution.image.template_name }}.
+      Stop before Terraform rather than reusing a conflicting VM/template.
+  when: proxmox_image_vm_template_before.rc == 0
+
+- name: Require Packer build permission for missing VM template
+  ansible.builtin.assert:
+    that:
+      - proxmox_image_build_missing_vm_template | bool
+    fail_msg: >-
+      Pinned VM template {{ proxmox_image_resolution.image_id }} is missing and
+      proxmox_image_build_missing_vm_template is disabled.
+  when: proxmox_image_vm_template_before.rc != 0
+
+- name: Require Packer runtime variables for missing VM template
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          lookup('env', 'PKR_VAR_proxmox_url')
+          | default(lookup('env', 'PROXMOX_API_URL'), true)
+          | length
+        ) > 0
+      - >-
+        (
+          lookup('env', 'PKR_VAR_proxmox_token_id')
+          | default(lookup('env', 'PROXMOX_TOKEN_ID'), true)
+          | length
+        ) > 0
+      - >-
+        (
+          lookup('env', 'PKR_VAR_proxmox_token_secret')
+          | default(lookup('env', 'PROXMOX_TOKEN_SECRET'), true)
+          | length
+        ) > 0
+      - lookup('env', 'PKR_VAR_ssh_public_key') | length > 0
+      - lookup('env', 'PKR_VAR_ssh_private_key_file') | length > 0
+    fail_msg: >-
+      Building a missing VM template requires Proxmox API values from either
+      PROXMOX_API_URL/PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET or their
+      PKR_VAR_proxmox_* Packer exports, plus PKR_VAR_ssh_public_key and
+      PKR_VAR_ssh_private_key_file on the Ansible controller.
+  delegate_to: localhost
+  become: false
+  when: proxmox_image_vm_template_before.rc != 0
+
+# Only images that pin a PRE-UPLOADED volume id need this. An image using
+# iso_url has Packer fetch and verify its own media, so it is self-healing;
+# iso_file names something a human put on the node by hand, and nothing stops
+# that being deleted later to reclaim space. Without this check the build fails
+# somewhere inside the Proxmox API with a message about a missing volume rather
+# than "upload the ISO first".
+- name: List available ISOs before building an image that pins a pre-uploaded one
+  ansible.builtin.command:
+    argv:
+      - pvesm
+      - list
+      - "{{ proxmox_image_resolution.image.packer_vars.iso_storage_pool }}"
+  register: proxmox_image_iso_list
+  changed_when: false
+  when:
+    - proxmox_image_vm_template_before.rc != 0
+    - proxmox_image_resolution.image.packer_vars.iso_file is defined
+
+- name: Require the pinned boot ISO to be present
+  ansible.builtin.assert:
+    that:
+      - proxmox_image_resolution.image.packer_vars.iso_file in proxmox_image_iso_list.stdout
+    fail_msg: >-
+      {{ proxmox_image_resolution.image_id }} pins
+      {{ proxmox_image_resolution.image.packer_vars.iso_file }}, which is not on
+      {{ proxmox_image_resolution.image.proxmox_node }}. It is a pre-uploaded
+      volume, not something Packer can fetch -- Microsoft serves Windows ISOs
+      through session-tokenized links that expire. Download the matching ISO and
+      stream it into the store, then re-run:
+      ssh <node> 'sudo -n tee /var/lib/vz/template/iso/<file> >/dev/null' < <local.iso>
+      Do NOT stage it via /tmp on that node; /tmp there is tmpfs.
+  when:
+    - proxmox_image_vm_template_before.rc != 0
+    - proxmox_image_resolution.image.packer_vars.iso_file is defined
+
+- name: Verify Packer is available for missing VM template
+  ansible.builtin.command:
+    argv:
+      - packer
+      - version
+  delegate_to: localhost
+  become: false
+  register: proxmox_image_packer_version
+  changed_when: false
+  when: proxmox_image_vm_template_before.rc != 0
+
+- name: Initialize Packer for missing VM template
+  ansible.builtin.command:
+    argv:
+      - packer
+      - init
+      - .
+    chdir: "{{ proxmox_image_repo_root }}/{{ proxmox_image_resolution.image.packer_dir }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  when: proxmox_image_vm_template_before.rc != 0
+
+- name: Build missing pinned VM template
+  ansible.builtin.command:
+    argv:
+      - packer
+      - build
+      - .
+    chdir: "{{ proxmox_image_repo_root }}/{{ proxmox_image_resolution.image.packer_dir }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    # Every key under the image's packer_vars becomes PKR_VAR_<key>, rather
+    # than the role naming each one. Two reasons:
+    #
+    #   - catalog.json already claims to be the source of truth for an image's
+    #     build inputs; hardcoding a subset here quietly made this file a
+    #     second, narrower one.
+    #   - the sets genuinely differ per image. Ubuntu needs six variables;
+    #     windows-11 needs the guest identity baked into its answer file
+    #     (hostname, address, locale, edition), which no Ubuntu build has.
+    #
+    # Byte-identical to the previous hardcoded block for ubuntu-2604, whose
+    # packer_vars holds exactly the six keys this replaced.
+    #
+    # Secret build inputs are deliberately NOT here: they stay out of the
+    # committed catalog and reach Packer as PKR_VAR_* already exported into the
+    # environment by scripts/dev/azure_kv_run.sh, which Ansible passes through.
+    proxmox_image_packer_vars_env: >-
+      {{
+        dict(
+          proxmox_image_resolution.image.packer_vars.keys()
+          | map('regex_replace', '^', 'PKR_VAR_')
+          | zip(proxmox_image_resolution.image.packer_vars.values() | map('string'))
+        )
+      }}
+  environment: >-
+    {{
+      {
+        'PKR_VAR_proxmox_url': (
+          lookup('env', 'PKR_VAR_proxmox_url')
+          | default(lookup('env', 'PROXMOX_API_URL'), true)
+        ),
+        'PKR_VAR_proxmox_token_id': (
+          lookup('env', 'PKR_VAR_proxmox_token_id')
+          | default(lookup('env', 'PROXMOX_TOKEN_ID'), true)
+        ),
+        'PKR_VAR_proxmox_token_secret': (
+          lookup('env', 'PKR_VAR_proxmox_token_secret')
+          | default(lookup('env', 'PROXMOX_TOKEN_SECRET'), true)
+        ),
+        'PKR_VAR_proxmox_node': proxmox_image_resolution.image.proxmox_node,
+        'PKR_VAR_vm_id': proxmox_image_resolution.image.template_vmid | string,
+        'PKR_VAR_template_name': proxmox_image_resolution.image.template_name,
+      }
+      | combine(proxmox_image_packer_vars_env)
+    }}
+  changed_when: true
+  when: proxmox_image_vm_template_before.rc != 0
+
+- name: Query pinned VM template config after build
+  ansible.builtin.command:
+    argv:
+      - qm
+      - config
+      - "{{ proxmox_image_resolution.image.template_vmid | string }}"
+  register: proxmox_image_vm_template_after
+  changed_when: false
+
+- name: Verify pinned VM template exists
+  ansible.builtin.assert:
+    that:
+      - "'template: 1' in proxmox_image_vm_template_after.stdout_lines"
+      - "('name: ' ~ proxmox_image_resolution.image.template_name) in proxmox_image_vm_template_after.stdout_lines"
+    fail_msg: >-
+      Expected VMID {{ proxmox_image_resolution.image.template_vmid }} to be
+      template {{ proxmox_image_resolution.image.template_name }} after image ensure.

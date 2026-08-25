@@ -1,0 +1,248 @@
+name: Platform / Deploy / Reusable
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: "JSON array of deployment targets"
+        required: true
+        type: string
+      deployment_mode:
+        description: "Deployment mode"
+        required: true
+        type: string
+      force_replace:
+        description: "Recreate infrastructure if needed (destructive)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    name: deploy (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+    concurrency:
+      group: platform-deploy-${{ matrix.target }}
+      cancel-in-progress: false
+    env:
+      TARGET: ${{ matrix.target }}
+      FORCE_REPLACE: ${{ inputs.force_replace }}
+      TF_IN_AUTOMATION: "true"
+      ANSIBLE_CONFIG: ansible/ansible.cfg
+      ANSIBLE_DEPRECATION_WARNINGS: "False"
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate explicit deployment mode
+        shell: bash
+        env:
+          DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
+        run: |
+          set -euo pipefail
+          case "${DEPLOYMENT_MODE}" in
+            "Full deploy"|"Infrastructure only"|"Configuration only") ;;
+            *)
+              echo "Invalid or missing deployment_mode: ${DEPLOYMENT_MODE}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve secret folders for target
+        shell: bash
+        run: |
+          # Assign first, then echo. Inlining the substitution into the echo
+          # discards its exit status -- echo succeeds regardless -- so an
+          # unmapped target silently set SECRET_FOLDERS empty, and the
+          # azure-secrets action reads empty as "fetch every secret".
+          set -euo pipefail
+          folders="$(bash scripts/ci/target_secret_folders.sh "$TARGET")"
+          echo "SECRET_FOLDERS=${folders}" >> "$GITHUB_ENV"
+
+      - name: Fetch deploy secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: ${{ env.SECRET_FOLDERS }}
+
+      - name: Export Terraform runtime environment
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh terraform
+
+      - id: tailscale
+        name: Export Tailscale runtime inputs
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh tailscale-outputs
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Connect to Tailscale (for LAN access)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ steps.tailscale.outputs.oauth_client_id }}
+          oauth-secret: ${{ steps.tailscale.outputs.oauth_secret }}
+          tags: tag:github-ci
+          version: ${{ env.TAILSCALE_VERSION }}
+          hostname: gh-${{ github.run_id }}-${{ matrix.target }}
+          args: --accept-dns=false
+
+      - name: Wait for Proxmox API reachability
+        if: ${{ inputs.deployment_mode != 'Configuration only' }}
+        shell: bash
+        run: bash scripts/ci/wait_for_proxmox_api.sh
+
+      - name: Resolve target
+        shell: bash
+        env:
+          RUN_TERRAFORM: ${{ inputs.deployment_mode != 'Configuration only' }}
+          RUN_ANSIBLE: ${{ inputs.deployment_mode != 'Infrastructure only' }}
+        run: bash scripts/ci/resolve_target.sh
+
+      - name: Ensure Terraform
+        if: ${{ inputs.deployment_mode != 'Configuration only' }}
+        shell: bash
+        run: bash scripts/ci/ensure_terraform.sh
+
+      - name: Ensure Ansible
+        shell: bash
+        run: bash scripts/ci/ensure_ansible.sh
+
+      - name: Prepare SSH keys
+        shell: bash
+        run: bash scripts/ci/prepare_ssh_keys.sh
+
+      - name: Setup Packer for VM base images
+        if: ${{ inputs.deployment_mode != 'Configuration only' && endsWith(matrix.target, '-vm') }}
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Ensure target base image
+        if: ${{ inputs.deployment_mode != 'Configuration only' }}
+        shell: bash
+        run: bash scripts/ci/ensure_target_image.sh
+
+      - name: Prepare existing guest SSH trust for pre-deploy snapshot
+        if: ${{ inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: ${{ inputs.deployment_mode == 'Full deploy' }}
+        shell: bash
+        env:
+          SSH_TRUST_ATTEST_ATTEMPTS: ${{ inputs.deployment_mode == 'Full deploy' && '1' || '24' }}
+        run: bash scripts/ci/prepare_attested_ssh_trust.sh
+
+      - name: Capture pre-deploy runtime state
+        if: ${{ inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/capture_deploy_runtime_state.py \
+            --inventory ansible/inventory.ini \
+            --target "${TARGET}" \
+            --phase before \
+            --output "${RUNNER_TEMP}/deploy-runtime-${TARGET}-before.json"
+
+      - name: Terraform apply
+        if: ${{ inputs.deployment_mode != 'Configuration only' }}
+        shell: bash
+        run: bash scripts/ci/terraform_apply.sh
+
+      - name: Prepare recreated guest SSH trust for configuration
+        if: ${{ inputs.deployment_mode == 'Full deploy' }}
+        shell: bash
+        run: bash scripts/ci/prepare_attested_ssh_trust.sh
+
+      - name: Upload Terraform logs (on failure)
+        if: ${{ failure() && inputs.deployment_mode != 'Configuration only' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-logs-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/terraform-apply*.log
+          if-no-files-found: ignore
+
+      - name: Debug Proxmox connectivity (on failure)
+        if: ${{ failure() && inputs.deployment_mode != 'Configuration only' }}
+        shell: bash
+        run: bash scripts/ci/debug_proxmox_connectivity.sh
+
+      - name: Run Ansible playbook
+        if: ${{ inputs.deployment_mode != 'Infrastructure only' }}
+        shell: bash
+        env:
+          ANSIBLE_RUN_EXPAND_ROOTFS: ${{ inputs.deployment_mode == 'Full deploy' && 'true' || 'false' }}
+          ANSIBLE_RUN_SYSTEM_UPDATES: ${{ inputs.deployment_mode == 'Full deploy' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/run_ansible.sh 2>&1 | tee "${RUNNER_TEMP}/ansible-${TARGET}.log"
+
+      - name: Capture post-deploy runtime state
+        if: ${{ always() && inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/capture_deploy_runtime_state.py \
+            --inventory ansible/inventory.ini \
+            --target "${TARGET}" \
+            --phase after \
+            --output "${RUNNER_TEMP}/deploy-runtime-${TARGET}-after.json"
+
+      - name: Build deploy Telegram summary
+        if: ${{ always() && inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/build_deploy_telegram_summary.py \
+            --target "${TARGET}" \
+            --deployment-mode "${{ inputs.deployment_mode }}" \
+            --status "${JOB_STATUS}" \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --branch "${GITHUB_REF_NAME}" \
+            --actor "${GITHUB_ACTOR}" \
+            --sha "${GITHUB_SHA}" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --before "${RUNNER_TEMP}/deploy-runtime-${TARGET}-before.json" \
+            --after "${RUNNER_TEMP}/deploy-runtime-${TARGET}-after.json" \
+            --ansible-log "${RUNNER_TEMP}/ansible-${TARGET}.log" \
+            --output "${RUNNER_TEMP}/deploy-summary-${TARGET}.txt"
+
+      - name: Upload deploy summary
+        if: ${{ always() && inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-summary-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/deploy-runtime-${{ matrix.target }}-before.json
+            ${{ runner.temp }}/deploy-runtime-${{ matrix.target }}-after.json
+            ${{ runner.temp }}/ansible-${{ matrix.target }}.log
+            ${{ runner.temp }}/deploy-summary-${{ matrix.target }}.txt
+          if-no-files-found: ignore
+
+      - name: Send deploy Telegram summary
+        if: ${{ always() && inputs.deployment_mode != 'Infrastructure only' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/notify_workflow_run_telegram.py \
+            --message-file "${RUNNER_TEMP}/deploy-summary-${TARGET}.txt"

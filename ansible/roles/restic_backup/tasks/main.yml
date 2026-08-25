@@ -1,0 +1,413 @@
+---
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] in ["Debian", "Ubuntu"]
+    fail_msg: "This playbook expects Debian or Ubuntu."
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Install Samba packages
+  ansible.builtin.apt:
+    name: "{{ backup_smb_packages }}"
+    state: present
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Ensure required mountpoint directory exists
+  ansible.builtin.file:
+    path: "{{ restic_appdata_source_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Check required mount target (avoid backing up an empty root filesystem path)
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, TARGET, -T, "{{ restic_appdata_source_dir }}"]
+  register: restic_appdata_mount_target
+  changed_when: false
+  when: (restic_appdata_backup_enabled | default(true)) | bool
+
+- name: Fail when /srv/appdata mount is missing
+  ansible.builtin.fail:
+    msg: >-
+      Path {{ restic_appdata_source_dir }} resolves to "/" inside the container, which means it is on the root filesystem.
+      Fix: ensure Proxmox mount_point/bind mount is configured so {{ restic_appdata_source_dir }} lands on host-owned storage.
+  when:
+    - (restic_appdata_backup_enabled | default(true)) | bool
+    - (restic_appdata_mount_target.stdout | trim) == "/"
+
+- name: Ensure restic config directory
+  ansible.builtin.file:
+    path: "{{ restic_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure restic cache directory
+  ansible.builtin.file:
+    path: "{{ restic_cache_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure restic textfile collector directory
+  ansible.builtin.file:
+    path: "{{ restic_textfile_directory }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install restic exclude file
+  ansible.builtin.copy:
+    dest: "{{ restic_appdata_exclude_file_effective }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ (restic_appdata_excludes | default([])) | join('\n') }}\n"
+
+- name: Ensure restic env file exists (do not overwrite)
+  ansible.builtin.copy:
+    dest: "{{ restic_appdata_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+    content: |
+      # Restic environment for appdata backups.
+      # Fill these in, then set restic_appdata_backup_enabled=true in ansible/host_vars/01-backup-lxc.yml and re-run Ansible.
+      RESTIC_REPOSITORY=
+      RESTIC_PASSWORD=
+      AWS_ACCESS_KEY_ID=
+      AWS_SECRET_ACCESS_KEY=
+      AWS_DEFAULT_REGION=us-east-1
+
+- name: Install restic env file from provided secrets
+  ansible.builtin.copy:
+    dest: "{{ restic_appdata_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: true
+    content: |
+      # Managed by Ansible: ansible/playbooks/services/01-backup-lxc.yml
+      RESTIC_REPOSITORY={{ restic_appdata_repository | quote }}
+      RESTIC_PASSWORD={{ restic_appdata_password | quote }}
+      AWS_ACCESS_KEY_ID={{ restic_appdata_aws_access_key_id | quote }}
+      AWS_SECRET_ACCESS_KEY={{ restic_appdata_aws_secret_access_key | quote }}
+      AWS_DEFAULT_REGION={{ restic_appdata_aws_default_region_effective | quote }}
+  no_log: true
+  when:
+    - (restic_appdata_repository | default('') | trim | length) > 0
+    - (restic_appdata_password | default('') | trim | length) > 0
+    - (restic_appdata_aws_access_key_id | default('') | trim | length) > 0
+    - (restic_appdata_aws_secret_access_key | default('') | trim | length) > 0
+
+- name: Ensure secondary restic env file exists (do not overwrite)
+  ansible.builtin.copy:
+    dest: "{{ restic_appdata_secondary_env_file_effective }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+    content: |
+      # Restic environment for optional secondary appdata backups.
+      # Fill these in, then re-run Ansible.
+      RESTIC_REPOSITORY=
+      RESTIC_PASSWORD=
+      AWS_ACCESS_KEY_ID=
+      AWS_SECRET_ACCESS_KEY=
+      AWS_DEFAULT_REGION=
+  when: restic_appdata_secondary_enabled_effective | bool
+
+- name: Install secondary restic env file from provided secrets
+  ansible.builtin.copy:
+    dest: "{{ restic_appdata_secondary_env_file_effective }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: true
+    content: |
+      # Managed by Ansible: ansible/playbooks/services/01-backup-lxc.yml
+      RESTIC_REPOSITORY={{ restic_appdata_secondary_repository_effective | quote }}
+      RESTIC_PASSWORD={{ restic_appdata_secondary_password_effective | quote }}
+      AWS_ACCESS_KEY_ID={{ restic_appdata_secondary_aws_access_key_id_effective | quote }}
+      AWS_SECRET_ACCESS_KEY={{ restic_appdata_secondary_aws_secret_access_key_effective | quote }}
+      AWS_DEFAULT_REGION={{ restic_appdata_secondary_aws_default_region_effective | quote }}
+  no_log: true
+  when:
+    - restic_appdata_secondary_enabled_effective | bool
+    - (restic_appdata_secondary_repository_effective | length) > 0
+    - (restic_appdata_secondary_password_effective | length) > 0
+    - (restic_appdata_secondary_aws_access_key_id_effective | length) > 0
+    - (restic_appdata_secondary_aws_secret_access_key_effective | length) > 0
+
+- name: Ensure restic notify env file exists (do not overwrite)
+  ansible.builtin.copy:
+    dest: "{{ restic_notify_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+    content: |
+      # Restic notification environment.
+      # Fill these in to receive notifications on backup failures.
+      # Ntfy:
+      #   NTFY_URL=https://ntfy.sh (or your self-hosted ntfy base URL)
+      #   NTFY_TOPIC=your-topic
+      #   NTFY_TOKEN= (optional; for protected topics)
+      #
+      # Telegram:
+      #   TELEGRAM_BOT_TOKEN=
+      #   TELEGRAM_CHAT_ID=
+      NTFY_URL=https://ntfy.sh
+      NTFY_TOPIC=
+      NTFY_TOKEN=
+      TELEGRAM_BOT_TOKEN=
+      TELEGRAM_CHAT_ID=
+
+- name: Install restic notify env file from provided secrets
+  ansible.builtin.copy:
+    dest: "{{ restic_notify_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: true
+    content: |
+      # Managed by Ansible: ansible/playbooks/services/01-backup-lxc.yml
+      NTFY_URL={{ (restic_notify_ntfy_url | default('https://ntfy.sh')) | quote }}
+      NTFY_TOPIC={{ (restic_notify_ntfy_topic | default('')) | quote }}
+      NTFY_TOKEN={{ (restic_notify_ntfy_token | default('')) | quote }}
+      TELEGRAM_BOT_TOKEN={{ (restic_notify_telegram_bot_token | default('')) | quote }}
+      TELEGRAM_CHAT_ID={{ (restic_notify_telegram_chat_id | default('')) | quote }}
+  no_log: true
+  when: >-
+    (restic_notify_ntfy_topic | default('') | trim | length) > 0
+    or (
+      (restic_notify_telegram_bot_token | default('') | trim | length) > 0
+      and (restic_notify_telegram_chat_id | default('') | trim | length) > 0
+    )
+
+- name: Install restic backup script
+  ansible.builtin.template:
+    src: restic-backup-appdata.sh.j2
+    dest: "{{ restic_appdata_backup_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install restic storage report helper
+  ansible.builtin.template:
+    src: restic-storage-report.sh.j2
+    dest: "{{ restic_storage_report_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install restic notify script
+  ansible.builtin.template:
+    src: restic-notify.sh.j2
+    dest: "{{ restic_notify_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install restic appdata systemd service
+  ansible.builtin.template:
+    src: restic-appdata-backup.service.j2
+    dest: "/etc/systemd/system/{{ restic_appdata_service_name }}.service"
+    mode: "0644"
+
+- name: Install restic appdata failure notification systemd service
+  ansible.builtin.template:
+    src: restic-appdata-backup-notify.service.j2
+    dest: "/etc/systemd/system/{{ restic_appdata_service_name }}-notify.service"
+    mode: "0644"
+
+- name: Install restic appdata systemd timer
+  ansible.builtin.template:
+    src: restic-appdata-backup.timer.j2
+    dest: "/etc/systemd/system/{{ restic_appdata_service_name }}.timer"
+    mode: "0644"
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Validate restic env file is populated (when enabling)
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -lc
+      - >-
+          set -euo pipefail;
+          set -a;
+          . "{{ restic_appdata_env_file }}";
+          set +a;
+          test -n "${RESTIC_REPOSITORY:-}";
+          test -n "${RESTIC_PASSWORD:-}";
+  changed_when: false
+  when: restic_appdata_backup_enabled | bool
+
+- name: Validate secondary restic env file is populated (when enabling)
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -lc
+      - >-
+          set -euo pipefail;
+          set -a;
+          . "{{ restic_appdata_secondary_env_file_effective }}";
+          set +a;
+          test -n "${RESTIC_REPOSITORY:-}";
+          test -n "${RESTIC_PASSWORD:-}";
+          test -n "${AWS_ACCESS_KEY_ID:-}";
+          test -n "${AWS_SECRET_ACCESS_KEY:-}";
+  changed_when: false
+  when:
+    - restic_appdata_backup_enabled | bool
+    - restic_appdata_secondary_enabled_effective | bool
+
+- name: Enable/disable restic appdata backup timer
+  ansible.builtin.systemd:
+    name: "{{ restic_appdata_service_name }}.timer"
+    enabled: "{{ restic_appdata_backup_enabled | bool }}"
+    state: "{{ 'started' if (restic_appdata_backup_enabled | bool) else 'stopped' }}"
+
+- name: Remove secondary restic success metric file when secondary backup is disabled
+  ansible.builtin.file:
+    path: "{{ restic_appdata_secondary_success_metric_file }}"
+    state: absent
+  when: not (restic_appdata_secondary_enabled_effective | bool)
+
+- name: Ensure backup SMB group exists
+  ansible.builtin.group:
+    name: "{{ backup_smb_group }}"
+    state: present
+    system: true
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Ensure backup SMB user exists
+  ansible.builtin.user:
+    name: "{{ backup_smb_user }}"
+    group: "{{ backup_smb_group }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+    system: true
+    state: present
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Ensure backup SMB share directory exists
+  ansible.builtin.file:
+    path: "{{ backup_smb_share_path_effective }}"
+    state: directory
+    owner: "{{ backup_smb_user }}"
+    group: "{{ backup_smb_group }}"
+    mode: "0700"
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Check for existing Samba account
+  ansible.builtin.command:
+    argv: [pdbedit, -L, -u, "{{ backup_smb_user }}"]
+  register: backup_smb_account_lookup
+  changed_when: false
+  failed_when: false
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Require Samba password for first backup SMB install
+  ansible.builtin.assert:
+    that:
+      - (backup_smb_password_effective | length > 0) or (backup_smb_account_lookup.rc | default(1)) == 0
+    fail_msg: >-
+      Missing Samba password. Provide backup_smb_password or BACKUP_SMB_PASSWORD for the first install,
+      or keep the existing Samba account for {{ backup_smb_user }}.
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Create Samba account for backup SMB user
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -lc
+      - printf '%s\n%s\n' "$SMB_PASSWORD" "$SMB_PASSWORD" | smbpasswd -s -a {{ backup_smb_user | quote }}
+  environment:
+    SMB_PASSWORD: "{{ backup_smb_password_effective }}"
+  no_log: true
+  register: backup_smb_account_add
+  changed_when: true
+  when:
+    - (backup_smb_enabled | default(false)) | bool
+    - (backup_smb_password_effective | length) > 0
+    - (backup_smb_account_lookup.rc | default(1)) != 0
+
+- name: Update Samba password for backup SMB user
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -lc
+      - printf '%s\n%s\n' "$SMB_PASSWORD" "$SMB_PASSWORD" | smbpasswd -s {{ backup_smb_user | quote }}
+  environment:
+    SMB_PASSWORD: "{{ backup_smb_password_effective }}"
+  no_log: true
+  register: backup_smb_account_update
+  changed_when: true
+  when:
+    - (backup_smb_enabled | default(false)) | bool
+    - (backup_smb_password_effective | length) > 0
+    - (backup_smb_account_lookup.rc | default(1)) == 0
+
+- name: Install Samba config for backup SMB share
+  ansible.builtin.template:
+    src: smb.conf.j2
+    dest: "{{ backup_smb_config_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "testparm -s %s"
+  register: backup_smb_config_copy
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Ensure Samba systemd override directory exists
+  ansible.builtin.file:
+    path: "{{ backup_smb_service_override_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Install Samba mount guard systemd override
+  ansible.builtin.template:
+    src: smbd-override.conf.j2
+    dest: "{{ backup_smb_service_override_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: backup_smb_service_override_copy
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Enable and start backup SMB service
+  ansible.builtin.systemd:
+    name: "{{ backup_smb_service_name }}"
+    enabled: true
+    daemon_reload: true
+    state: >-
+      {{
+        'restarted'
+        if ((backup_smb_config_copy is defined and backup_smb_config_copy is changed)
+            or (backup_smb_service_override_copy is defined and backup_smb_service_override_copy is changed))
+        else 'started'
+      }}
+  when: (backup_smb_enabled | default(false)) | bool
+
+- name: Enable and start Avahi daemon for Time Machine discovery
+  ansible.builtin.systemd:
+    name: "{{ backup_smb_avahi_service_name }}"
+    enabled: true
+    state: started
+  when:
+    - (backup_smb_enabled | default(false)) | bool
+    - (backup_smb_time_machine_enabled | default(true)) | bool

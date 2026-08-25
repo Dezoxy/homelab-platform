@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Managed by Ansible -- ansible/roles/cloudflare_ddns/templates/cloudflare-ddns.sh.j2
+#
+# Points one grey-clouded Cloudflare A record at this site's current WAN IP.
+#
+# Failure policy, deliberately asymmetric:
+#   - Cannot determine the WAN IP  -> exit NON-ZERO, change nothing. A wrong
+#     record is far worse than a stale one: the APs at least keep serving WiFi
+#     on a stale record, whereas pointing the name at a garbage address ends
+#     any chance of them finding their way home.
+#   - Cloudflare API rejects us     -> exit NON-ZERO and let systemd surface it.
+# Neither case is ever swallowed: a DDNS updater that fails quietly is
+# indistinguishable from one that works, right up until the IP changes.
+set -euo pipefail
+
+: "${CF_API_TOKEN:?CF_API_TOKEN not set}"
+: "${CF_ZONE_ID:?CF_ZONE_ID not set}"
+: "${CF_RECORD_NAME:?CF_RECORD_NAME not set}"
+
+STATE_FILE="{{ cloudflare_ddns_state_dir }}/last-ip"
+API="https://api.cloudflare.com/client/v4"
+
+# Not `date -Is`: that is a GNU extension. Spelling the format out keeps this
+# script runnable anywhere, including when debugging it on a Mac.
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+is_ipv4() {
+  [[ "${1:-}" =~ ^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$ ]]
+}
+
+detect_ip() {
+  local url raw ip
+  for url in {{ cloudflare_ddns_ip_sources | map('quote') | join(' ') }}; do
+    # -4 is load-bearing. This host has IPv6, and without forcing IPv4 the
+    # Cloudflare trace endpoint answers with the v6 address -- which is_ipv4
+    # then rejects, silently burning the primary source on every single run and
+    # leaving the whole updater leaning on the fallback. The record is an A
+    # record pointed at a v4 port-forward, so v4 is the only answer that means
+    # anything here.
+    raw="$(curl -4 -fsS --max-time 10 "${url}" 2>/dev/null || true)"
+    [ -z "${raw}" ] && continue
+    # cloudflare's /cdn-cgi/trace is key=value lines; ipify is a bare address.
+    if printf '%s' "${raw}" | grep -q '^ip='; then
+      ip="$(printf '%s' "${raw}" | awk -F= '/^ip=/{print $2; exit}')"
+    else
+      ip="$(printf '%s' "${raw}" | tr -d '[:space:]')"
+    fi
+    if is_ipv4 "${ip}"; then
+      printf '%s' "${ip}"
+      return 0
+    fi
+    log "WARN ${url} returned something that is not an IPv4 address; trying next source"
+  done
+  return 1
+}
+
+cf_get_record() {
+  curl -fsS --max-time 15 \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+    "${API}/zones/${CF_ZONE_ID}/dns_records?type=A&name=${CF_RECORD_NAME}"
+}
+
+if ! current_ip="$(detect_ip)"; then
+  log "ERROR could not determine WAN IP from any source; leaving the record untouched"
+  exit 1
+fi
+
+# Fast path: skip the API entirely when nothing moved. Keeps this off
+# Cloudflare's rate limits at a 5-minute cadence and keeps the journal quiet.
+if [ -r "${STATE_FILE}" ] && [ "$(cat "${STATE_FILE}")" = "${current_ip}" ]; then
+  exit 0
+fi
+
+if ! record_json="$(cf_get_record)"; then
+  log "ERROR Cloudflare API lookup failed for ${CF_RECORD_NAME}"
+  exit 1
+fi
+
+# python3 rather than jq: it ships with the base image, jq would be another pin.
+read -r record_id record_ip <<<"$(
+  printf '%s' "${record_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d.get("success"):
+    sys.exit("cloudflare API returned success=false: %s" % d.get("errors"))
+r = d.get("result") or []
+if len(r) != 1:
+    sys.exit("expected exactly 1 A record, got %d -- refusing to guess" % len(r))
+print(r[0]["id"], r[0]["content"])
+'
+)"
+
+if [ "${record_ip}" = "${current_ip}" ]; then
+  # Record already correct -- seed the cache so the next run takes the fast path.
+  printf '%s' "${current_ip}" >"${STATE_FILE}"
+  exit 0
+fi
+
+log "WAN IP changed: ${record_ip} -> ${current_ip}; updating ${CF_RECORD_NAME}"
+
+if ! curl -fsS --max-time 15 -X PATCH \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data "$(printf '{"content":"%s"}' "${current_ip}")" \
+  "${API}/zones/${CF_ZONE_ID}/dns_records/${record_id}" >/dev/null; then
+  log "ERROR Cloudflare API refused the update for ${CF_RECORD_NAME}"
+  exit 1
+fi
+
+printf '%s' "${current_ip}" >"${STATE_FILE}"
+log "OK ${CF_RECORD_NAME} now points at ${current_ip}"

@@ -1,0 +1,63 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Runtime data and volumes
+appdata/
+
+# Cloudflared artifacts
+cloudflared/config.yml
+cloudflared/*.pem
+cloudflared/*.json
+
+# Ansible local cache (created by ansible-lint)
+.ansible/
+ansible/.ansible/
+
+# Local CI tools (created by make setup / make install-tools)
+.venv/
+.local/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+.DS_Store
+out/
+__pycache__/
+*.pyc
+
+# Local agent workspaces
+.claude/
+.understand-anything/
+
+# Terraform local state/vars
+**/.terraform/
+**/terraform.tfvars
+**/*.auto.tfvars
+**/*.auto.tfvars.json
+**/*.tfstate
+**/*.tfstate.*
+**/tfplan
+
+# Packer local vars/downloads
+# Packer's media cache. Two directory names, because the plugin names them
+# after the field: `downloaded_iso_path` for the boot ISO, and
+# `downloaded_additional_iso_path_N` for each additional_iso_files entry --
+# which only the windows-11 build uses, for the virtio driver ISO. The
+# original pattern covered only the first, so a 768 MB driver ISO went
+# straight at the commit.
+infra-images/packer/**/downloaded_iso_path/
+infra-images/packer/**/downloaded_additional_iso_path_*/
+infra-images/packer/**/*.pkrvars.hcl
+
+# Local SSH keys
+keys/
+
+# Local secrets
+secrets/
+
+# Local compose overrides
+docker-compose.override.yml
+compose.override.yml

@@ -1,0 +1,207 @@
+---
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] in ["Debian", "Ubuntu"]
+    fail_msg: "This playbook expects Debian or Ubuntu."
+
+- name: Resolve Traefik architecture
+  ansible.builtin.set_fact:
+    traefik_arch: "{{ traefik_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+
+- name: Check for existing Cloudflare token env file
+  ansible.builtin.stat:
+    path: "{{ traefik_config_dir }}/cloudflare.env"
+  register: traefik_cloudflare_env
+  when: traefik_enable_tls | default(false)
+
+- name: Require TLS settings
+  ansible.builtin.assert:
+    that:
+      - traefik_acme_email | length > 0
+      - traefik_acme_email != "CHANGE_ME@example.com"
+      - (traefik_cloudflare_dns_token | default('') | length > 0) or (traefik_cloudflare_env.stat.exists | default(false))
+    fail_msg: >-
+      Set traefik_acme_email and provide traefik_cloudflare_dns_token when TLS is enabled
+      (or ensure {{ traefik_config_dir }}/cloudflare.env already exists).
+  when: traefik_enable_tls | default(false)
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Determine Traefik version requested
+  ansible.builtin.set_fact:
+    traefik_version_requested: "{{ traefik_version | default('latest') | trim }}"
+
+- name: Fetch latest Traefik version from GitHub
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/traefik/traefik/releases/latest
+    return_content: true
+    status_code: 200
+    headers:
+      Accept: application/vnd.github+json
+      User-Agent: ansible-traefik
+  register: traefik_latest_release
+  when: traefik_version_requested | lower == 'latest' or traefik_version_requested == ''
+
+- name: Set Traefik version effective (pinned)
+  ansible.builtin.set_fact:
+    traefik_version_effective: "{{ traefik_version_requested }}"
+  when: traefik_version_requested | lower != 'latest' and traefik_version_requested != ''
+
+- name: Set Traefik version effective (latest)
+  ansible.builtin.set_fact:
+    traefik_version_effective: "{{ traefik_latest_release.json.tag_name }}"
+  when: traefik_version_requested | lower == 'latest' or traefik_version_requested == ''
+
+- name: Set Traefik release version
+  ansible.builtin.set_fact:
+    traefik_release_version: "{{ traefik_version_effective | regex_replace('^v', '') }}"
+
+- name: Require Traefik version
+  ansible.builtin.assert:
+    that:
+      - traefik_release_version | length > 0
+    fail_msg: "Unable to determine Traefik version. Set traefik_version or use 'latest'."
+
+- name: Build Traefik archive name
+  ansible.builtin.set_fact:
+    traefik_archive: "traefik_v{{ traefik_release_version }}_linux_{{ traefik_arch }}.tar.gz"
+
+- name: Build Traefik download URL
+  ansible.builtin.set_fact:
+    traefik_download_url: "https://github.com/traefik/traefik/releases/download/v{{ traefik_release_version }}/{{ traefik_archive }}"
+
+- name: Ensure Traefik group
+  ansible.builtin.group:
+    name: "{{ traefik_group }}"
+    system: true
+
+- name: Ensure Traefik user
+  ansible.builtin.user:
+    name: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Create Traefik directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    mode: "0755"
+  loop:
+    - "{{ traefik_config_dir }}"
+    - "{{ traefik_dynamic_dir }}"
+    - "{{ traefik_data_dir }}"
+
+- name: Write Cloudflare DNS API token env
+  ansible.builtin.copy:
+    dest: "{{ traefik_config_dir }}/cloudflare.env"
+    owner: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    mode: "0600"
+    content: "CLOUDFLARE_DNS_API_TOKEN={{ traefik_cloudflare_dns_token }}\n"
+  no_log: true
+  when:
+    - traefik_enable_tls | default(false)
+    - traefik_cloudflare_dns_token | default('') | length > 0
+  notify: Restart Traefik
+
+- name: Ensure ACME storage file
+  ansible.builtin.file:
+    path: "{{ traefik_data_dir }}/acme.json"
+    state: touch
+    owner: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    mode: "0600"
+  when: traefik_enable_tls | default(false)
+
+# Fetching and unpacking a binary cannot be previewed: under --check, get_url
+# reports "changed" without writing and the mkdir does not happen, so unarchive
+# failed with "dest '/tmp/traefik-<version>' must be an existing dir" and aborted
+# the whole dry run. Skipped as a unit instead, with the intent reported.
+- name: Report the pending Traefik install without performing it
+  ansible.builtin.debug:
+    msg: >-
+      Traefik {{ traefik_release_version }} would be downloaded and installed to
+      {{ traefik_install_dir }}/traefik. Skipped: check mode cannot fetch the
+      archive it would unpack.
+  when: ansible_check_mode
+
+- name: Download, unpack and install Traefik {{ traefik_release_version }}
+  when: not ansible_check_mode
+  block:
+    - name: Download Traefik release
+      ansible.builtin.get_url:
+        url: "{{ traefik_download_url }}"
+        dest: "/tmp/{{ traefik_archive }}"
+        mode: "0644"
+
+    - name: Ensure Traefik extract directory
+      ansible.builtin.file:
+        path: "/tmp/traefik-{{ traefik_release_version }}"
+        state: directory
+        mode: "0755"
+
+    - name: Extract Traefik binary
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ traefik_archive }}"
+        dest: "/tmp/traefik-{{ traefik_release_version }}"
+        remote_src: true
+        creates: "/tmp/traefik-{{ traefik_release_version }}/traefik"
+
+    - name: Install Traefik binary
+      ansible.builtin.copy:
+        src: "/tmp/traefik-{{ traefik_release_version }}/traefik"
+        dest: "{{ traefik_install_dir }}/traefik"
+        mode: "0755"
+        remote_src: true
+      notify: Restart Traefik
+
+- name: Allow Traefik to bind privileged ports
+  ansible.builtin.command:
+    cmd: "setcap 'cap_net_bind_service=+ep' {{ traefik_install_dir }}/traefik"
+  changed_when: false
+
+- name: Write Traefik static config
+  ansible.builtin.template:
+    src: traefik.yml.j2
+    dest: "{{ traefik_config_dir }}/traefik.yml"
+    owner: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    mode: "0644"
+  notify: Restart Traefik
+
+- name: Write Traefik dynamic config
+  ansible.builtin.template:
+    src: traefik-dynamic.yml.j2
+    dest: "{{ traefik_dynamic_dir }}/services.yml"
+    owner: "{{ traefik_user }}"
+    group: "{{ traefik_group }}"
+    mode: "0644"
+
+- name: Install Traefik systemd unit
+  ansible.builtin.template:
+    src: traefik.service.j2
+    dest: /etc/systemd/system/traefik.service
+    mode: "0644"
+  notify: Restart Traefik
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start Traefik
+  ansible.builtin.systemd:
+    name: traefik
+    enabled: true
+    state: started

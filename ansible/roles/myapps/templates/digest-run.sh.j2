@@ -1,0 +1,83 @@
+#!/bin/sh
+# Runs one notification-digest mode under a shared lock. Installed by the
+# myapps role; every digest systemd unit calls this instead of invoking
+# `docker compose run` directly.
+#
+# WHY A LOCK AT ALL. Each digest mode has its own systemd .service, so
+# systemd serializes nothing between them -- it only refuses to run one
+# unit twice. Under the normal schedule the slots never overlap, but every
+# digest timer carries Persistent=true, so after an outage systemd fires
+# every missed timer at once on the next boot and they all start together.
+#
+# What breaks then is not SQLite -- state.db is WAL with busy_timeout=5000
+# and its writes are short -- it is TELEGRAM. Four of these modes open a
+# Telethon client with the SAME TG_SESSION StringSession, and a session used
+# by two clients at once can be invalidated by Telegram
+# (AuthKeyDuplicatedError, already handled as a fatal auth error in
+# collectors/telegram.py). Recovery is manual: re-run telegram_login.py and
+# rotate the Key Vault secret.
+#
+# WHY EVERY MODE, not only the Telethon ones. "One digest process at a time,
+# ever" is an invariant a future mode inherits for free; "the Telethon ones
+# serialize" is one every future mode has to remember to opt into. The modes
+# that never touch Telegram still share the Claude CLI config dir, the
+# subscription's usage limits, and the VM's memory, so serializing them
+# costs nothing under a schedule where they already never overlap.
+#
+# The lock lives on tmpfs, so a crash can never leave a stale one behind
+# across a reboot, and the kernel drops it if a holder is killed. fd 9 is
+# inherited across the exec below (shell redirections carry no FD_CLOEXEC),
+# so the lock is held for the whole run, not just while this script parses.
+set -eu
+
+LOCK_FILE={{ myapps_digest_lock_file }}
+LOCK_WAIT={{ myapps_digest_lock_wait_sec }}
+
+# Checked explicitly, because the failure is otherwise MISDIAGNOSED: with
+# flock absent, both calls below fail and the script reports "gave up
+# waiting for the lock" -- pointing at contention that does not exist while
+# every digest run fails. flock ships in util-linux, which is Essential on
+# Debian, so this should never fire; if it does, the message names the real
+# cause instead of sending the reader after a phantom stuck run.
+if ! command -v flock >/dev/null 2>&1; then
+    echo "digest-run: flock not found (util-linux); refusing to run unserialized" >&2
+    exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+
+# Try without blocking first, purely so that CONTENTION IS VISIBLE. A plain
+# blocking flock is silent -- a run stalled 40 minutes behind a boot storm
+# would look identical in the journal to one that started instantly, and the
+# Loki query for "why was this digest late" would have nothing to find.
+if ! flock --nonblock 9; then
+    echo "digest-run: another digest run holds $LOCK_FILE; waiting up to ${LOCK_WAIT}s" >&2
+    if ! flock --wait "$LOCK_WAIT" 9; then
+        # Bounded, not infinite: waiting forever would hide a wedged holder
+        # behind a unit that simply never returns. Exiting non-zero fires
+        # the unit's OnFailure= notification, which is the correct outcome --
+        # by this point something is genuinely stuck, not merely busy.
+        echo "digest-run: gave up after ${LOCK_WAIT}s waiting for $LOCK_FILE" >&2
+        exit 1
+    fi
+fi
+
+# --name, rather than the myapps-digest-run-<hash> compose generates: the
+# unit's ExecStopPost has to be able to NAME this container in order to tear it
+# down, and a random suffix cannot be named from a unit file.
+#
+# WHY THAT MATTERS. A `docker compose run` container is owned by dockerd, not by
+# the unit's cgroup. Stopping the unit kills this client, which releases the
+# flock on fd 9 -- but leaves the CONTAINER running against state.db. The lock
+# then guards nothing, because its whole premise is "client alive == run in
+# progress". On 2026-08-24 needrestart restarted digest.service mid-run from
+# apt's post-invoke hook: the lock was released instantly, a second run started,
+# and the two containers raced until the loser aborted on an integrity guard.
+#
+# The name is per-unit (MYAPPS_RUN_NAME=myapps-run-%N), deliberately NOT shared
+# across the digest modes. A shared name would let one mode's ExecStopPost tear
+# down a container another mode is still using -- the flock serializes ExecStart,
+# but it does not serialize one unit stopping while another runs.
+exec /usr/bin/docker compose -f {{ myapps_compose_file }} run --rm \
+    --name "${MYAPPS_RUN_NAME:-myapps-run-manual-$$}" \
+    digest "$@"

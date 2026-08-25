@@ -1,0 +1,16 @@
+# Managed by Ansible -- roles/unifi_os_server/templates/
+#
+# UniFi OS Server keeps its data in rootless Podman volumes on this VM's local
+# disk and offers no way to relocate them. This copies the .unf auto-backups
+# onto the VirtIO-FS share so 01-backup-lxc's restic job reaches them.
+[Unit]
+Description=Mirror UniFi OS Server auto-backups onto the appdata share
+After={{ unifi_os_server_service }}.service
+Requires=srv-appdata.mount
+
+[Service]
+Type=oneshot
+# --delete keeps this a true mirror: UniFi rotates its own auto-backups, and
+# restic already retains history, so accumulating here would only grow without
+# adding recovery points.
+ExecStart=/usr/bin/rsync -a --delete {{ unifi_os_source_backup_dir }}/ {{ unifi_os_backup_dir }}/

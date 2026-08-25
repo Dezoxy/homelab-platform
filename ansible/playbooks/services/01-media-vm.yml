@@ -1,0 +1,50 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Bootstrap 01-media-vm
+  hosts: 01-media-vm
+  become: true
+  vars:
+    docker_base_packages_extra:
+      - inotify-tools
+      - git
+      - rsync
+      # Plex hardware transcoding, via the iGPU passed through as hostpci0 and
+      # bound into the container as /dev/dri.
+      #
+      # Present on the 24.04 guest but never declared: `apt-mark showmanual`
+      # listed only intel-gpu-tools, so the rest arrived as its dependencies.
+      # A rebuilt VM would come up without them and Plex would fall back to CPU
+      # transcoding SILENTLY -- no error, no failed unit, just a hot CPU and
+      # stuttering playback. Load-bearing, not diagnostics.
+      - va-driver-all
+      - intel-media-va-driver
+      - vainfo
+      - intel-gpu-tools
+    docker_group_users:
+      - "{{ media_user }}"
+    docker_mount_wait_paths:
+      - "{{ appdata_mount }}"
+      - "{{ media_mount }}"
+    kometa_plex_token_effective: >-
+      {{
+        (kometa_plex_token | default('') | trim)
+        or (lookup('env', 'KOMETA_PLEX_TOKEN') | default('', true) | trim)
+      }}
+    kometa_tmdb_apikey_effective: >-
+      {{
+        (kometa_tmdb_apikey | default('') | trim)
+        or (lookup('env', 'KOMETA_TMDB_APIKEY') | default('', true) | trim)
+      }}
+
+  tasks:
+    - name: Import media_stack role
+      ansible.builtin.import_role:
+        name: media_stack

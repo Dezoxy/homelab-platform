@@ -1,0 +1,17 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+dns_lxc_vmid       = 161
+dns_lxc_name       = "01-dns-lxc"
+dns_lxc_ip_address = "192.168.1.3/24"
+dns_lxc_gateway    = "192.168.1.1"
+dns_lxc_ipv6_address = "auto" # SLAAC (requires router RA on LAN and working PVE host IPv6)
+dns_lxc_disk_gb    = 6
+dns_servers        = ["9.9.9.9", "8.8.8.8"]
+dns_lxc_username   = "toomhorvath"

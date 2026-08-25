@@ -1,0 +1,83 @@
+name: CI / Packer Validate
+on:
+  pull_request:
+    paths:
+      - "infra-images/packer/**"
+      - "scripts/ci/versions.sh"
+      - ".github/workflows/packer-validate.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        # Image-specific inputs live in extra_env rather than as matrix keys.
+        # The two templates genuinely need different variables -- Ubuntu fetches
+        # its ISO by URL, Windows takes a Proxmox volume id and additionally
+        # bakes guest identity into its answer file -- so a shared key set would
+        # have to be the union of both, with each entry leaving half of it
+        # unused and misleading.
+        include:
+          - name: ubuntu-2604
+            dir: infra-images/packer/ubuntu-2604
+            vm_id: 901
+            extra_env: |
+              PKR_VAR_iso_url=https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso
+              PKR_VAR_iso_checksum=sha256:dec49008a71f6098d0bcfc822021f4d042d5f2db279e4d75bdd981304f1ca5d9
+          - name: windows-11
+            dir: infra-images/packer/windows-11
+            vm_id: 902
+            # Placeholders: validate never contacts Proxmox or downloads media,
+            # it only type-checks the template and renders its templatefile()
+            # calls. The real values come from catalog.json and Key Vault.
+            extra_env: |
+              PKR_VAR_iso_file=local:iso/validation.iso
+              PKR_VAR_virtio_iso_checksum=sha256:e14cf2b94492c3e925f0070ba7fdfedeb2048c91eea9c5a5afb30232a3976331
+              PKR_VAR_guest_ip_address=192.168.1.76/24
+              PKR_VAR_admin_password=validation
+              PKR_VAR_admin_pubkey=ssh-ed25519 AAAAvalidation
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: ${{ env.PACKER_VERSION }}
+      - name: Prepare validation SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="${RUNNER_TEMP}/packer-validation"
+          ssh-keygen -t ed25519 -f "${key_path}" -N ""
+          {
+            echo "PKR_VAR_ssh_public_key<<EOF"
+            cat "${key_path}.pub"
+            echo "EOF"
+            echo "PKR_VAR_ssh_private_key_file=${key_path}"
+          } >> "${GITHUB_ENV}"
+      - name: Load image-specific Packer variables
+        shell: bash
+        env:
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: printf '%s' "${EXTRA_ENV}" >> "${GITHUB_ENV}"
+      - name: Packer fmt + validate
+        working-directory: ${{ matrix.dir }}
+        env:
+          PKR_VAR_proxmox_url: https://pve.example.invalid:8006/api2/json
+          PKR_VAR_proxmox_node: pve
+          PKR_VAR_proxmox_token_id: packer@pve!validation
+          PKR_VAR_proxmox_token_secret: validation
+          PKR_VAR_vm_id: ${{ matrix.vm_id }}
+          PKR_VAR_vm_storage_pool: local-lvm
+        run: |
+          set -euo pipefail
+          packer fmt -check .
+          packer init .
+          packer validate .

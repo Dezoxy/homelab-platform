@@ -1,0 +1,17 @@
+[Unit]
+Description=qbittorrent Docker Compose Stack
+After=docker.service
+Requires=docker.service
+RequiresMountsFor={{ qbittorrent_config_dir }} {{ qbittorrent_completed_dir }} {{ qbittorrent_staging_mount }}
+ConditionPathExists={{ qbittorrent_compose_file }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ qbittorrent_compose_dir }}
+ExecStart=/usr/bin/docker compose -f {{ qbittorrent_compose_file }} up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f {{ qbittorrent_compose_file }} down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

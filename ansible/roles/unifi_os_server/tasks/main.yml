@@ -1,0 +1,141 @@
+---
+# Verified against a real 5.1.21 install on 01-unifi-vm -- see docs/unifi.md.
+
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name: "{{ unifi_os_podman_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Read the installed Podman version
+  ansible.builtin.command:
+    argv: [podman, version, --format, "{{ '{{' }}.Client.Version{{ '}}' }}"]
+  register: unifi_os_podman_version
+  changed_when: false
+  # Reading a version changes nothing, and the assert below needs the answer in
+  # check mode too: command modules skip under --check, leaving stdout empty and
+  # the version test failing with "Input version value cannot be empty" rather
+  # than reporting anything useful.
+  check_mode: false
+
+# Ubiquiti's stated floor. Debian 12 ships 4.3; older distros ship 3.x, which
+# fails at runtime rather than at install time -- catch it here instead.
+- name: Require Podman >= the version UniFi OS Server supports
+  ansible.builtin.assert:
+    that:
+      - unifi_os_podman_version.stdout is version(unifi_os_podman_min_version, '>=')
+    fail_msg: >-
+      Podman {{ unifi_os_podman_version.stdout }} is older than
+      {{ unifi_os_podman_min_version }}, which UniFi OS Server requires.
+      Use a Debian 13 / Ubuntu 24.04 (or newer) base image for this VM.
+
+- name: Check whether UniFi OS Server is already installed
+  ansible.builtin.stat:
+    path: "{{ unifi_os_server_marker_path }}"
+  register: unifi_os_installed
+
+- name: Install UniFi OS Server
+  when: not unifi_os_installed.stat.exists
+  block:
+    - name: Require an explicit opt-in before running the installer
+      ansible.builtin.assert:
+        that:
+          - unifi_os_server_allow_install | bool
+        fail_msg: >-
+          UniFi OS Server is not installed and unifi_os_server_allow_install is
+          false. Set it to run the installer unattended (--non-interactive).
+
+    - name: Download the UniFi OS Server installer
+      ansible.builtin.get_url:
+        url: "{{ unifi_os_server_installer_url }}"
+        dest: /opt/unifi-os-server/installer-{{ unifi_os_server_version }}
+        checksum: "{{ ('sha256:' ~ unifi_os_server_installer_checksum) if unifi_os_server_installer_checksum | length > 0 else omit }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ~840 MB binary that unpacks and pulls container images; well past the
+    # default command timeout on a cold run.
+    - name: Run the UniFi OS Server installer
+      ansible.builtin.command:
+        argv: "{{ ['/opt/unifi-os-server/installer-' ~ unifi_os_server_version] + unifi_os_server_install_args }}"
+      register: unifi_os_install
+      changed_when: unifi_os_install.rc == 0
+
+- name: Ensure UniFi OS Server is enabled and running
+  ansible.builtin.systemd_service:
+    name: "{{ unifi_os_server_service }}"
+    enabled: true
+    state: started
+
+# --- Backup mirror -------------------------------------------------------
+# The appliance owns its data paths, so the share cannot be its backup target
+# directly. Copy the .unf auto-backups across instead.
+
+- name: Configure the auto-backup mirror
+  when: unifi_os_backup_mirror_enabled | bool
+  block:
+    - name: Ensure rsync is present
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+
+    - name: Ensure the mirror destination exists on the share
+      ansible.builtin.file:
+        path: "{{ unifi_os_backup_dir }}"
+        state: directory
+        owner: "{{ unifi_os_user }}"
+        group: "{{ unifi_os_user }}"
+        mode: "0750"
+
+    # Without this the directory above is silently created on the VM's local
+    # disk when the share is missing: backups look healthy and reach nothing.
+    - name: Confirm the mirror destination is on the VirtIO-FS share
+      when: unifi_os_require_backup_dir_on_share | bool
+      block:
+        - name: Read the filesystem type behind the mirror destination
+          ansible.builtin.command:
+            argv: [findmnt, -n, -o, FSTYPE, -T, "{{ unifi_os_backup_dir }}"]
+          register: unifi_os_backup_fstype
+          changed_when: false
+          # findmnt only reads. Needed under --check as well, or the guard below
+          # compares against an empty string and fails the dry run claiming the
+          # share is missing when it is mounted perfectly well.
+          check_mode: false
+
+        - name: Fail when the mirror destination is not on VirtIO-FS
+          ansible.builtin.fail:
+            msg: >-
+              {{ unifi_os_backup_dir }} is on "{{ unifi_os_backup_fstype.stdout | trim }}",
+              not virtiofs. Mirrored backups would stay on this VM's local disk and
+              never reach 01-backup-lxc's restic job.
+              Fix: check virtiofs_mounts in host_vars and the Proxmox directory mapping.
+          when: (unifi_os_backup_fstype.stdout | trim) != "virtiofs"
+
+    - name: Install the backup mirror service
+      ansible.builtin.template:
+        src: unifi-os-backup-mirror.service.j2
+        dest: /etc/systemd/system/{{ unifi_os_backup_mirror_service }}.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Install the backup mirror timer
+      ansible.builtin.template:
+        src: unifi-os-backup-mirror.timer.j2
+        dest: /etc/systemd/system/{{ unifi_os_backup_mirror_service }}.timer
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Flush handlers so the timer starts against current unit files
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable the backup mirror timer
+      ansible.builtin.systemd_service:
+        name: "{{ unifi_os_backup_mirror_service }}.timer"
+        enabled: true
+        state: started

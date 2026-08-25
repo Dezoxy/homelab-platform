@@ -1,0 +1,68 @@
+name: CI / Pre-commit Fast Checks
+
+on:
+  pull_request:
+  # Post-merge safety net: PR checks can be merged past while still pending.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs, but never cancel a main validation: two quick
+  # merges would otherwise leave the first commit silently unvalidated, which
+  # is the exact gap this push trigger exists to close.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install pre-commit
+        shell: bash
+        run: pip install --quiet pre-commit --break-system-packages
+
+      - name: Run fast hooks on changed files
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # See shellcheck.yml: no PR diff exists on push, and a post-merge gate
+          # should validate the merged result in full.
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "Push to ${GITHUB_REF_NAME}: validating the full repository baseline."
+            scope_args=(--all-files)
+          else
+            scope_args=(--from-ref "${BASE_SHA}" --to-ref "${HEAD_SHA}")
+            if ! git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- \
+              .pre-commit-config.yaml .github/workflows/pre-commit.yml; then
+              echo "Pre-commit configuration changed; validating the full repository baseline."
+              scope_args=(--all-files)
+            fi
+          fi
+          hooks=(
+            trailing-whitespace
+            end-of-file-fixer
+            check-yaml
+            check-json
+            check-toml
+            check-added-large-files
+            check-case-conflict
+            check-merge-conflict
+            detect-private-key
+            check-executables-have-shebangs
+            check-shebang-scripts-are-executable
+            mixed-line-ending
+            ruff-check
+            ruff-format
+            ssh-trust-metadata
+          )
+          for hook in "${hooks[@]}"; do
+            pre-commit run "${hook}" "${scope_args[@]}"
+          done

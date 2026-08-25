@@ -1,0 +1,99 @@
+name: CI / Actions Lint
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - "scripts/ci/versions.sh"
+  # Post-merge safety net: PR checks can be merged past while still pending.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/ci/versions.sh"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs, but never cancel a main validation: two quick
+  # merges would otherwise leave the first commit silently unvalidated, which
+  # is the exact gap this push trigger exists to close.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      # actionlint shells out to shellcheck to lint `run:` blocks. It is
+      # preinstalled on the ubuntu-24.04 image, so we assert it rather than
+      # install it: `apt-get update` here once hung a run for two hours and
+      # burned ~4h of Actions minutes across two PRs.
+      - name: Verify shellcheck is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null; then
+            echo "shellcheck missing from the runner image" >&2
+            exit 1
+          fi
+          shellcheck --version
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${ACTIONLINT_VERSION}"
+          arch="$(uname -m)"
+          case "${arch}" in
+            x86_64) archive_arch="amd64" ;;
+            aarch64|arm64) archive_arch="arm64" ;;
+            *)
+              echo "Unsupported architecture: ${arch}" >&2
+              exit 1
+              ;;
+          esac
+          archive="${RUNNER_TEMP}/actionlint.tgz"
+          bin_dir="${RUNNER_TEMP}/actionlint-bin"
+          mkdir -p "${bin_dir}"
+          curl -fsSL -o "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_${archive_arch}.tar.gz"
+          tar -xzf "${archive}" -C "${bin_dir}" actionlint
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+
+      - name: Run actionlint on changed workflows
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # See shellcheck.yml: no PR diff exists on push, and a post-merge gate
+          # should validate the merged result in full.
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "Push to ${GITHUB_REF_NAME}: validating all workflows."
+            actionlint -color
+            exit 0
+          fi
+          if ! git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- .github/workflows/actionlint.yml \
+            || git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- scripts/ci/versions.sh \
+              | grep -Eq '^[+-]ACTIONLINT_VERSION='; then
+            echo "Actionlint workflow or tool pin changed; validating all workflows."
+            actionlint -color
+            exit 0
+          fi
+          mapfile -d '' files < <(
+            git diff --name-only --diff-filter=ACMR -z \
+              "${BASE_SHA}" "${HEAD_SHA}" -- '.github/workflows/*.yml' '.github/workflows/*.yaml'
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed GitHub Actions workflows to lint."
+            exit 0
+          fi
+          actionlint -color "${files[@]}"

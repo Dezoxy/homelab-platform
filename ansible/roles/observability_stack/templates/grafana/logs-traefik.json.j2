@@ -1,0 +1,46 @@
+{
+  "annotations": { "list": [{ "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" }] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Traefik Journal Lines / 5m",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum(count_over_time({job=\"systemd-journal\",host=\"01-reverse-proxy-lxc\",unit=\"traefik.service\"}[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Traefik Error-like Lines / 5m",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum(count_over_time(({job=\"systemd-journal\",host=\"01-reverse-proxy-lxc\",unit=\"traefik.service\"} |~ \"(?i)\\\\b(error|failed|failure|fail|panic|fatal|exception|traceback)\\\\b\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 3,
+      "type": "logs",
+      "title": "Traefik Systemd Logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 17, "w": 24, "x": 0, "y": 7 },
+      "targets": [{ "expr": "{job=\"systemd-journal\",host=\"01-reverse-proxy-lxc\",unit=\"traefik.service\"}", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["homelab", "logs", "traefik", "provisioned"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "title": "Logs - Traefik",
+  "uid": "logs-traefik",
+  "version": 1,
+  "weekStart": ""
+}

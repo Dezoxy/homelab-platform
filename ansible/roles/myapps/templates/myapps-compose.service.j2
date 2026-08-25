@@ -1,0 +1,16 @@
+[Unit]
+Description=myapps Docker Compose Stack
+After=docker.service
+Requires=docker.service
+ConditionPathExists={{ myapps_compose_file }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ myapps_compose_dir }}
+ExecStart=/usr/bin/docker compose -f {{ myapps_compose_file }} up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f {{ myapps_compose_file }} down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

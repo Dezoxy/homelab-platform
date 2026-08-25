@@ -1,0 +1,72 @@
+---
+- name: Import nodejs role
+  ansible.builtin.import_role:
+    name: nodejs
+  when: agent_cli_enabled | bool
+
+# The bind mount is provided by Terraform; if it is missing, writing here would
+# silently create a directory on the container rootfs instead and the auth
+# state would vanish on the next rebuild -- the exact failure this role exists
+# to prevent. Fail loudly instead.
+- name: Assert the appdata bind mount is present
+  ansible.builtin.stat:
+    path: "{{ agent_cli_state_dir }}"
+  register: agent_cli_state_stat
+  when: agent_cli_enabled | bool
+
+- name: Require the appdata bind mount
+  ansible.builtin.assert:
+    that:
+      - agent_cli_state_stat.stat.exists
+      - agent_cli_state_stat.stat.isdir
+    fail_msg: >-
+      {{ agent_cli_state_dir }} is not a directory. It is the Terraform bind
+      mount from the Proxmox host ({{ agent_cli_state_dir }} on pve). Without
+      it, CLI auth state would be written to the container rootfs and lost on
+      the next rebuild. Check mount_points in
+      infra-proxmox/terraform/01-code-lxc.
+  when: agent_cli_enabled | bool
+
+- name: Ensure CLI state directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ agent_cli_user }}"
+    group: "{{ agent_cli_user }}"
+    mode: "0700"
+  loop:
+    - "{{ agent_claude_config_dir }}"
+    - "{{ agent_codex_home }}"
+  when: agent_cli_enabled | bool
+
+- name: Install the agent CLIs at pinned versions
+  community.general.npm:
+    name: "{{ item.name }}"
+    version: "{{ item.version }}"
+    global: true
+    state: present
+  loop:
+    - { name: "{{ agent_claude_package }}", version: "{{ agent_claude_version }}" }
+    - { name: "{{ agent_codex_package }}", version: "{{ agent_codex_version }}" }
+  loop_control:
+    label: "{{ item.name }}@{{ item.version }}"
+  when: agent_cli_enabled | bool
+
+- name: Point both CLIs at the appdata mount for every login shell
+  ansible.builtin.template:
+    src: agent-cli.sh.j2
+    dest: "{{ agent_cli_profile_script }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: agent_cli_enabled | bool
+  notify: restart code-server
+
+- name: Verify both CLIs are on PATH
+  ansible.builtin.command: "{{ item }} --version"
+  register: agent_cli_versions
+  changed_when: false
+  loop:
+    - claude
+    - codex
+  when: agent_cli_enabled | bool

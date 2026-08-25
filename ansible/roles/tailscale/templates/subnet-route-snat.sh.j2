@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+lan_if="{{ tailscale_lan_interface_effective }}"
+{% for route in tailscale_advertise_routes %}
+iptables -t nat -C POSTROUTING -s {{ tailscale_subnet_snat_source_cidr }} -d {{ route }} -o "$lan_if" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -s {{ tailscale_subnet_snat_source_cidr }} -d {{ route }} -o "$lan_if" -j MASQUERADE
+{% endfor %}

@@ -1,0 +1,81 @@
+---
+# --- General ---
+unifi_os_user: toomhorvath
+unifi_os_timezone: Europe/Budapest
+
+# --- Installer ---
+# Ubiquiti ships UniFi OS Server as a standalone binary, not an apt repo, so
+# there is nothing for Renovate to track: bump this by hand from
+# https://ui.com/download/releases/software and update the checksum with it.
+#
+# NOTE the two independent version lines. 5.1.21 is the *UniFi OS* version
+# (the same line the UDM/Cloud Key consoles run). The bundled *Network*
+# application is 10.4.57 -- that is the number
+# scripts/ops/unifi_backup_version_check.py compares against, never this one.
+unifi_os_server_version: "5.1.21"
+unifi_os_server_bundled_network_version: "10.4.57"
+unifi_os_server_installer_url: >-
+  https://fw-download.ubnt.com/data/unifi-os-server/f5e2-linux-x64-5.1.21-a400c9c6-8328-4634-b223-ebfcf742720a.21-x64
+# sha256 of the installer. Empty skips verification -- fill this in before any
+# unattended run: the role downloads and executes a binary off the internet,
+# and the URL carries no signature of its own.
+unifi_os_server_installer_checksum: "77e3feac1595779402dd87ff8d20d66faa39c87b572646f86ff0006711262445"
+unifi_os_server_installer_path: "/opt/unifi-os-server/installer-{{ unifi_os_server_version }}"
+
+# Verified on 5.1.21: `installer --help` documents --non-interactive, alongside
+# --force-install, --network-mode <slirp4nets|pasta>, --web-port and --uninstall.
+# The gate below existed only because that switch was unknown, so it now
+# defaults on.
+unifi_os_server_install_args:
+  - --non-interactive
+unifi_os_server_allow_install: true
+
+# --- Service ---
+# Verified: the installer lays down uosserver.service (plus a separate
+# uosserver-updater.service, which self-updates the appliance -- see the
+# version-drift note in docs/unifi.md). "unifi-os-server" does not exist.
+unifi_os_server_service: uosserver
+
+# Installed-state marker. The installer binary is not kept, so its presence is
+# not a reliable check; the service helper is.
+unifi_os_server_marker_path: /var/lib/uosserver/bin/uosserver-service
+
+# --- Persistent state ---
+# UniFi OS Server does NOT let you choose where it stores data. Verified on
+# 5.1.21: the installer runs a rootless Podman container as the `uosserver`
+# user and keeps everything in named volumes under that account's home --
+# uosserver_var_lib_unifi, uosserver_var_lib_mongodb, uosserver_persistent, ...
+# So the earlier plan (point its backup directory at the VirtIO-FS share) is
+# not available; the appliance owns those paths.
+#
+# The layout inside uosserver_var_lib_unifi mirrors the LXC's /config/data
+# exactly -- backup/, db/, keystore, system.properties -- so the .unf
+# auto-backups land here:
+unifi_os_volume_root: /home/uosserver/.local/share/containers/storage/volumes
+unifi_os_unifi_data_dir: "{{ unifi_os_volume_root }}/uosserver_var_lib_unifi/_data"
+unifi_os_source_backup_dir: "{{ unifi_os_unifi_data_dir }}/backup"
+
+# ...and are mirrored onto the share, which is the same split 01-media-vm uses
+# in homelab_local_state_paths: live database on local disk, backups copied to
+# /srv/appdata so 01-backup-lxc's restic job picks them up. The .unf files are
+# the only artefact a restore consumes, so mirroring them is sufficient.
+unifi_os_appdata_dir: /srv/appdata/unifi-os
+unifi_os_backup_dir: "{{ unifi_os_appdata_dir }}/backup"
+
+# Refuse to run unless the mirror destination really is on the VirtIO-FS share.
+# A silent fallback to local disk would look healthy and back up nothing
+# offsite -- the exact failure 01-myapps-vm demonstrates.
+unifi_os_require_backup_dir_on_share: true
+
+# Mirror schedule. Auto-backups are daily, so hourly is generous and cheap.
+unifi_os_backup_mirror_enabled: true
+unifi_os_backup_mirror_service: unifi-os-backup-mirror
+unifi_os_backup_mirror_oncalendar: hourly
+
+# --- Podman ---
+# Ubiquiti requires Podman >= 4.3 and does not support Docker. This is why
+# this guest is a VM and is NOT in the docker_hosts inventory group.
+unifi_os_podman_min_version: "4.3"
+unifi_os_podman_packages:
+  - podman
+  - uidmap

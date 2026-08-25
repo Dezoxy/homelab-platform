@@ -1,0 +1,40 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Deploy UniFi OS Server on 01-unifi-vm
+  hosts: 01-unifi-vm
+  become: true
+  vars:
+    # Dedicated Cloudflare token, scoped Zone:DNS:Edit on example.net only.
+    # The _override suffix is load-bearing: reading the same name that gets
+    # passed into the role would be a self-reference and Ansible fails the play
+    # with "Recursive loop detected in template". Same reasoning as
+    # 01-unifi-lxc.yml, which is where that was learned.
+    unifi_ddns_cf_api_token_effective: >-
+      {{
+        (unifi_ddns_cf_api_token_override | default('') | trim)
+        or (lookup('env', 'UNIFI_DDNS_CF_API_TOKEN') | default('', true) | trim)
+      }}
+  tasks:
+    - name: Import unifi_os_server role
+      ansible.builtin.import_role:
+        name: unifi_os_server
+
+    # Same coupling as the LXC had: the DDNS record exists only to point the
+    # remote APs at this controller, so the updater lives beside it. Enabled at
+    # cutover (2026-08-19) once the router forwards moved to this host; the
+    # LXC's timer is disabled in the same change so only one host owns the
+    # record.
+    - name: Import cloudflare_ddns role
+      ansible.builtin.import_role:
+        name: cloudflare_ddns
+      vars:
+        cloudflare_ddns_api_token: "{{ unifi_ddns_cf_api_token_effective }}"
+      when: unifi_vm_manage_ddns | default(false) | bool

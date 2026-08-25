@@ -1,0 +1,20 @@
+[Unit]
+Description=Observability Docker Compose Stack
+After=docker.service
+Requires=docker.service
+RequiresMountsFor={{ observability_appdata_dir }}
+ConditionPathIsMountPoint={{ observability_appdata_dir }}
+ConditionPathExists={{ observability_compose_file }}
+ConditionPathExists={{ observability_env_file }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ observability_compose_dir }}
+EnvironmentFile=-{{ observability_env_file }}
+ExecStart=/usr/bin/docker compose -f {{ observability_compose_file }} up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f {{ observability_compose_file }} down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

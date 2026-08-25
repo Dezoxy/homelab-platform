@@ -1,0 +1,52 @@
+# Managed by Ansible. Hungarian overlays for movie libraries.
+
+overlays:
+  hu_audio:
+    overlay:
+      name: text({{ kometa_hu_overlay_audio_text | default('SZINKRONOS') }})
+      group: hu_language_state
+      weight: 300
+      horizontal_offset: {{ kometa_hu_overlay_horizontal_offset | default(20) }}
+      horizontal_align: {{ (kometa_hu_overlay_horizontal_align | default('left')) | to_json }}
+      vertical_offset: {{ kometa_hu_overlay_vertical_offset | default(20) }}
+      vertical_align: {{ (kometa_hu_overlay_vertical_align | default('top')) | to_json }}
+      font_size: {{ kometa_hu_overlay_font_size | default(60) }}
+      font_color: {{ (kometa_hu_overlay_font_color | default('#FFFFFF')) | to_json }}
+      back_color: {{ (kometa_hu_overlay_hu_back_color | default('#0B6E4FEE')) | to_json }}
+      back_radius: {{ kometa_hu_overlay_back_radius | default(24) }}
+      back_padding: {{ kometa_hu_overlay_back_padding | default(18) }}
+    plex_search:
+      audio_language: {{ (kometa_hu_movie_language_values | default(['hu'])) | first | to_json }}
+
+  hu_subtitle_only:
+    overlay:
+      name: text({{ kometa_hu_overlay_subtitle_text | default('FELIRATOS') }})
+      group: hu_language_state
+      weight: 200
+      horizontal_offset: {{ kometa_hu_overlay_horizontal_offset | default(20) }}
+      horizontal_align: {{ (kometa_hu_overlay_horizontal_align | default('left')) | to_json }}
+      vertical_offset: {{ kometa_hu_overlay_vertical_offset | default(20) }}
+      vertical_align: {{ (kometa_hu_overlay_vertical_align | default('top')) | to_json }}
+      font_size: {{ kometa_hu_overlay_font_size | default(60) }}
+      font_color: {{ (kometa_hu_overlay_font_color | default('#FFFFFF')) | to_json }}
+      back_color: {{ (kometa_hu_overlay_sub_back_color | default('#1565C0EE')) | to_json }}
+      back_radius: {{ kometa_hu_overlay_back_radius | default(24) }}
+      back_padding: {{ kometa_hu_overlay_back_padding | default(18) }}
+    plex_search:
+      subtitle_language: {{ (kometa_hu_movie_language_values | default(['hu'])) | first | to_json }}
+
+  hu_none:
+    overlay:
+      name: text({{ kometa_hu_overlay_none_text | default('EREDETI') }})
+      group: hu_language_state
+      weight: 100
+      horizontal_offset: {{ kometa_hu_overlay_horizontal_offset | default(20) }}
+      horizontal_align: {{ (kometa_hu_overlay_horizontal_align | default('left')) | to_json }}
+      vertical_offset: {{ kometa_hu_overlay_vertical_offset | default(20) }}
+      vertical_align: {{ (kometa_hu_overlay_vertical_align | default('top')) | to_json }}
+      font_size: {{ kometa_hu_overlay_font_size | default(60) }}
+      font_color: {{ (kometa_hu_overlay_font_color | default('#FFFFFF')) | to_json }}
+      back_color: {{ (kometa_hu_overlay_no_hu_back_color | default('#9C1C1CEE')) | to_json }}
+      back_radius: {{ kometa_hu_overlay_back_radius | default(24) }}
+      back_padding: {{ kometa_hu_overlay_back_padding | default(18) }}
+    plex_all: true

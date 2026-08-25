@@ -1,0 +1,138 @@
+---
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+
+repos:
+  # ── basic file hygiene (runs on every commit) ──────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace    # removes trailing spaces from every line
+        stages: [pre-commit]
+      - id: end-of-file-fixer      # ensures every file ends with a newline
+        stages: [pre-commit]
+      - id: check-yaml             # validates YAML syntax
+        args: [--unsafe]           # allow custom YAML tags used in Ansible
+        stages: [pre-commit]
+      - id: check-json             # validates JSON syntax
+        stages: [pre-commit]
+      - id: check-toml             # validates TOML syntax
+        stages: [pre-commit]
+      - id: check-added-large-files
+        args: [--enforce-all]
+        stages: [pre-commit]
+      - id: check-case-conflict
+        stages: [pre-commit]
+      - id: check-merge-conflict   # fails if any <<<< conflict markers are left in files
+        stages: [pre-commit]
+      - id: detect-private-key
+        stages: [pre-commit]
+      - id: check-executables-have-shebangs
+        stages: [pre-commit]
+      - id: check-shebang-scripts-are-executable
+        exclude: ^ansible/roles/
+        stages: [pre-commit]
+      - id: mixed-line-ending      # normalises all line endings to LF
+        args: [--fix=lf]
+        stages: [pre-commit]
+
+  # ── secret scanning (runs on every commit) ─────────────────────────────────
+  # scans the diff for hardcoded passwords, tokens, API keys, etc.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args: [--config=.gitleaks.toml]
+        stages: [pre-commit]
+
+  # ── shell script linting (runs on every commit) ────────────────────────────
+  # static analysis for bash/sh scripts — catches common bugs and bad patterns
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=warning]
+        stages: [pre-commit]
+
+  # ── Python linting and formatting (runs on every commit) ───────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        stages: [pre-commit]
+      - id: ruff-format
+        stages: [pre-commit]
+
+  # ── GitHub Actions workflow linting (runs on every commit) ─────────────────
+  # validates workflow YAML syntax and catches invalid action references
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        stages: [pre-commit]
+
+  # ── Terraform formatting (runs on every commit) ────────────────────────────
+  # auto-formats .tf files to canonical style (like gofmt for Terraform)
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.109.0
+    hooks:
+      - id: terraform_fmt
+        stages: [pre-commit]
+
+  # ── Repository-local validation ─────────────────────────────────────────────
+  - repo: local
+    hooks:
+      - id: ssh-trust-metadata
+        name: validate SSH trust metadata
+        language: system
+        entry: python3 scripts/ci/validate_ssh_known_hosts.py
+        pass_filenames: false
+        files: ^(ansible/(inventory(-proxmox)?\.ini|ssh_known_hosts|proxmox_guest_ssh_attestation\.json)|scripts/ci/(build_attested_ssh_known_hosts|validate_ssh_known_hosts)\.py)$
+        stages: [pre-commit]
+
+      # Uses the pinned Make-managed virtualenv to avoid local/CI dependency drift.
+      - id: ansible-lint
+        name: ansible-lint
+        language: script
+        entry: scripts/ci/hooks/ansible_lint.sh
+        pass_filenames: false
+        files: ^(ansible/|scripts/ci/(hooks/ansible_lint\.sh|versions\.sh)$)
+        stages: [pre-commit]
+
+      - id: packer-fmt
+        name: packer fmt
+        language: script
+        entry: scripts/ci/hooks/packer_fmt.sh
+        pass_filenames: false
+        files: ^(infra-images/packer/|scripts/ci/(hooks/packer_fmt\.sh|versions\.sh)$)
+        stages: [pre-commit]
+
+      # Terraform deep linting + security scans run on push only.
+      # tflint: catches Terraform type errors, deprecated syntax, provider-specific rules
+      # requires `make install-tools` to download the binary to .local/bin/
+      - id: tflint
+        name: tflint
+        language: script
+        entry: scripts/ci/hooks/tflint.sh
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(infra-proxmox/terraform/|\.tflint\.hcl$|scripts/ci/(build_terraform_stack_matrix\.py|hooks/tflint\.sh|versions\.sh)$)
+
+      # checkov: security and compliance scanner — checks for misconfigs
+      # e.g. open security groups, unencrypted disks, missing tags
+      - id: checkov
+        name: checkov
+        language: script
+        entry: scripts/ci/hooks/checkov.sh
+        args:
+          - --directory=infra-proxmox/terraform
+          - --framework=terraform
+          - --compact
+          - --quiet
+          - --skip-check=CKV_TF_1
+          - --output=cli
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(infra-proxmox/terraform/|scripts/ci/(hooks/checkov\.sh|versions\.sh)$)

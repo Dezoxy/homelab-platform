@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply SNAT for Tailscale subnet routes
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart={{ tailscale_subnet_snat_script_path }}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

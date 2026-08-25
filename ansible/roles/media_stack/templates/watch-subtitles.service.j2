@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch media folders and sanitize SRT subtitles
+RequiresMountsFor={{ media_mount }}
+After=local-fs.target
+
+[Service]
+Type=simple
+Environment=SANITIZE_DELAY_SECONDS={{ subtitle_sanitizer_delay_seconds | default(30) }}
+Environment=SANITIZE_BACKUP={{ 'true' if (subtitle_sanitizer_auto_backup | default(true)) else 'false' }}
+Environment=SANITIZE_LANGUAGE_CODE={{ subtitle_sanitizer_language_code | default('hu') }}
+Environment=SANITIZE_SELF_EVENT_IGNORE_SECONDS={{ subtitle_sanitizer_self_event_ignore_seconds | default(10) }}
+ExecStart=/usr/local/bin/watch-subtitles {{ media_mount }}/movies {{ media_mount }}/series
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

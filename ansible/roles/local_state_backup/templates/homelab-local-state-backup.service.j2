@@ -1,0 +1,13 @@
+[Unit]
+Description=Snapshot local homelab state into shared appdata for restic
+RequiresMountsFor={{ homelab_local_state_root }} {{ local_state_share_mount }}
+ConditionPathExists={{ homelab_local_state_backup_script }}
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart={{ homelab_local_state_backup_script }}
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

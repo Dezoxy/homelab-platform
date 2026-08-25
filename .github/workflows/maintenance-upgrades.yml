@@ -1,0 +1,257 @@
+name: Platform / Maintenance / Upgrades
+run-name: Maintenance / Upgrades
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_all:
+        description: "Run on all hosts"
+        type: boolean
+        default: false
+      target_01_edge_lxc:
+        description: "01-edge-lxc"
+        type: boolean
+        default: false
+      target_01_dns_lxc:
+        description: "01-dns-lxc"
+        type: boolean
+        default: false
+      target_01_reverse_proxy_lxc:
+        description: "01-reverse-proxy-lxc"
+        type: boolean
+        default: false
+      target_01_torrent_lxc:
+        description: "01-torrent-lxc"
+        type: boolean
+        default: false
+      target_01_observability_lxc:
+        description: "01-observability-lxc"
+        type: boolean
+        default: false
+      target_01_backup_lxc:
+        description: "01-backup-lxc"
+        type: boolean
+        default: false
+      target_01_tailscale_lxc:
+        description: "01-tailscale-lxc"
+        type: boolean
+        default: false
+      target_01_media_vm:
+        description: "01-media-vm"
+        type: boolean
+        default: false
+      target_01_myapps_vm:
+        description: "01-myapps-vm"
+        type: boolean
+        default: false
+      target_01_unifi_vm:
+        description: "01-unifi-vm"
+        type: boolean
+        default: false
+      auto_reboot:
+        description: "Reboot guests that require it after upgrades"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "30 3 * * 0"
+
+concurrency:
+  group: platform-maintenance-upgrades
+  cancel-in-progress: false
+
+jobs:
+  upgrades:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ANSIBLE_CONFIG: ansible/ansible.cfg
+      ANSIBLE_DEPRECATION_WARNINGS: "False"
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+      AUTO_REBOOT: ${{ github.event.inputs.auto_reboot || 'false' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Fetch Tailscale secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: tailscale
+
+      - name: Fetch SSH secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: ssh
+
+      - id: tailscale
+        name: Export Tailscale runtime inputs
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh tailscale-outputs
+
+      - name: Connect to Tailscale (for LAN access)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ steps.tailscale.outputs.oauth_client_id }}
+          oauth-secret: ${{ steps.tailscale.outputs.oauth_secret }}
+          tags: tag:github-ci
+          version: ${{ env.TAILSCALE_VERSION }}
+          hostname: "gh-${{ github.run_id }}-upg"
+          args: --accept-dns=false
+
+      - name: Ensure Ansible
+        shell: bash
+        run: bash scripts/ci/ensure_ansible.sh
+
+      - name: Prepare SSH keys
+        shell: bash
+        run: bash scripts/ci/prepare_ssh_keys.sh
+
+      - name: Resolve maintenance targets
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_ALL: ${{ inputs.target_all || 'false' }}
+          TARGET_01_EDGE_LXC: ${{ inputs.target_01_edge_lxc || 'false' }}
+          TARGET_01_DNS_LXC: ${{ inputs.target_01_dns_lxc || 'false' }}
+          TARGET_01_REVERSE_PROXY_LXC: ${{ inputs.target_01_reverse_proxy_lxc || 'false' }}
+          TARGET_01_TORRENT_LXC: ${{ inputs.target_01_torrent_lxc || 'false' }}
+          TARGET_01_OBSERVABILITY_LXC: ${{ inputs.target_01_observability_lxc || 'false' }}
+          TARGET_01_BACKUP_LXC: ${{ inputs.target_01_backup_lxc || 'false' }}
+          TARGET_01_TAILSCALE_LXC: ${{ inputs.target_01_tailscale_lxc || 'false' }}
+          TARGET_01_MEDIA_VM: ${{ inputs.target_01_media_vm || 'false' }}
+          TARGET_01_MYAPPS_VM: ${{ inputs.target_01_myapps_vm || 'false' }}
+          TARGET_01_UNIFI_VM: ${{ inputs.target_01_unifi_vm || 'false' }}
+        run: bash scripts/ci/resolve_maintenance_targets.sh
+
+      - name: Prepare attested SSH trust for selected guests
+        shell: bash
+        run: bash scripts/ci/prepare_attested_ssh_trust.sh
+
+      - name: Create report directories
+        shell: bash
+        run: mkdir -p reports/tree-before reports/tree-after reports/package-diff reports
+
+      - name: Probe selected host connectivity before wait
+        shell: bash
+        run: |
+          bash scripts/ci/debug_ssh_connectivity.sh ansible/inventory.ini "${MAINTENANCE_LIMIT}" \
+            | tee reports/connectivity-preflight.log
+
+      - name: Wait for selected hosts before pre-upgrade snapshot
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-wait-for-connection.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "maintenance_wait_timeout=600 maintenance_wait_sleep=5"
+
+      - name: Snapshot package versions before upgrades
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-package-snapshot.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "package_snapshot_output_dir=${PWD}/reports/tree-before"
+
+      - name: Run system upgrades on selected guests
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-upgrade-all.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "auto_upgrade=true auto_upgrade_reboot=${AUTO_REBOOT}" \
+            | tee reports/ansible-upgrade.log
+
+      - name: Wait for selected guests to become reachable after upgrades
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-wait-for-connection.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "maintenance_wait_timeout=600 maintenance_wait_sleep=5"
+
+      - name: Snapshot package versions after upgrades
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-package-snapshot.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "package_snapshot_output_dir=${PWD}/reports/tree-after"
+
+      - name: Build upgrade report
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          before_dir = Path('reports/tree-before')
+          after_dir = Path('reports/tree-after')
+          out_dir = Path('reports/package-diff')
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          def parse_host(path: Path):
+            if not path.exists():
+              return {}
+            data = json.loads(path.read_text())
+            lines = data.get('stdout_lines') or []
+            versions = {}
+            for line in lines:
+              parts = line.split('\t', 1)
+              if len(parts) == 2:
+                versions[parts[0]] = parts[1]
+            return versions
+
+          hosts = sorted({p.name for p in before_dir.glob('*')} | {p.name for p in after_dir.glob('*')})
+          summary_lines = []
+          for host in hosts:
+            before = parse_host(before_dir / host)
+            after = parse_host(after_dir / host)
+            changed = []
+            for pkg in sorted(set(before) | set(after)):
+              b = before.get(pkg)
+              a = after.get(pkg)
+              if b != a:
+                changed.append((pkg, b, a))
+
+            summary_lines.append(f"{host}: {len(changed)} package changes")
+            md = [f"# {host}", "", f"Changed packages: **{len(changed)}**", ""]
+            if changed:
+              md.append("| Package | Before | After |")
+              md.append("| --- | --- | --- |")
+              for pkg, b, a in changed:
+                md.append(f"| `{pkg}` | `{b or '-'} ` | `{a or '-'} ` |")
+            else:
+              md.append("No package version changes detected.")
+            (out_dir / f"{host}.md").write_text("\n".join(md) + "\n")
+
+          Path('reports/upgrade-summary.txt').write_text("\n".join(summary_lines) + "\n")
+          PY
+
+      - name: Debug selected host connectivity (on failure)
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          mkdir -p reports
+          bash scripts/ci/debug_ssh_connectivity.sh ansible/inventory.ini "${MAINTENANCE_LIMIT}" \
+            | tee reports/connectivity-debug.log
+
+      - name: Upload upgrade report artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: maintenance-upgrades-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: warn

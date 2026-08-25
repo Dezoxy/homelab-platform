@@ -1,0 +1,17 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Configure cloudflared in 01-edge-lxc
+  hosts: 01-edge-lxc
+  become: true
+  tasks:
+    - name: Import cloudflared role
+      ansible.builtin.import_role:
+        name: cloudflared

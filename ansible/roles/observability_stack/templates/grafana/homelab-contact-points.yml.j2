@@ -1,0 +1,15 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: homelab-telegram
+    receivers:
+      - uid: homelab_telegram
+        type: telegram
+        disableResolveMessage: false
+        settings:
+          chatid: {{ observability_grafana_alert_telegram_chat_id_runtime | to_json }}
+          message: |
+            {{ "{{ template \"default.message\" . }}" }}
+        secure_settings:
+          bottoken: {{ observability_grafana_alert_telegram_bot_token_runtime | to_json }}

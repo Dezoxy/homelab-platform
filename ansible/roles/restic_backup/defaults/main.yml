@@ -1,0 +1,86 @@
+---
+base_packages:
+  - ca-certificates
+  - curl
+  - restic
+  - util-linux
+
+backup_smb_packages:
+  - samba
+  - avahi-daemon
+
+restic_config_dir: /etc/restic
+restic_cache_dir: /var/cache/restic
+restic_lock_file: /var/lock/restic-appdata.lock
+restic_appdata_service_name: restic-appdata-backup
+restic_storage_report_script: /usr/local/sbin/restic-storage-report
+restic_notify_env_file: "{{ restic_config_dir }}/notify.env"
+restic_notify_script: /usr/local/sbin/restic-notify
+restic_textfile_directory: "{{ node_exporter_textfile_directory | default('/var/lib/prometheus/node-exporter-textfile') }}"
+restic_appdata_primary_success_metric_file: "{{ restic_textfile_directory }}/restic-appdata-b2.prom"
+restic_appdata_secondary_success_metric_file: "{{ restic_textfile_directory }}/restic-appdata-aws.prom"
+
+restic_appdata_aws_default_region_effective: "{{ restic_appdata_aws_default_region | default('us-east-1') }}"
+restic_appdata_exclude_file_effective: "{{ restic_appdata_exclude_file | default(restic_config_dir + '/appdata.excludes') }}"
+# AWS secondary restic backups are intentionally disabled unless re-enabled
+# through explicit Ansible variables. Do not auto-enable from AWS_* env vars.
+restic_appdata_secondary_enabled_effective: "{{ restic_appdata_secondary_enabled | default(false) | bool }}"
+restic_appdata_secondary_env_file_effective: "{{ restic_appdata_secondary_env_file | default(restic_config_dir + '/appdata-aws.env') }}"
+restic_appdata_secondary_repository_effective: "{{ restic_appdata_secondary_repository | default('') | trim }}"
+restic_appdata_secondary_password_effective: >-
+  {{
+    (restic_appdata_secondary_password | default('') | trim)
+    or (restic_appdata_password | default('') | trim)
+  }}
+restic_appdata_secondary_aws_access_key_id_effective: "{{ restic_appdata_secondary_aws_access_key_id | default('') | trim }}"
+restic_appdata_secondary_aws_secret_access_key_effective: "{{ restic_appdata_secondary_aws_secret_access_key | default('') | trim }}"
+restic_appdata_secondary_aws_default_region_effective: "{{ restic_appdata_secondary_aws_default_region | default('') | trim }}"
+
+backup_smb_password_effective: >-
+  {{
+    (backup_smb_password | default('') | trim)
+    or (lookup('env', 'BACKUP_SMB_PASSWORD') | default('', true) | trim)
+  }}
+backup_smb_share_path_effective: "{{ backup_smb_share_path | default(restic_appdata_source_dir + '/macbook-backup') }}"
+backup_smb_service_name: smbd
+backup_smb_service_override_dir: "/etc/systemd/system/{{ backup_smb_service_name }}.service.d"
+backup_smb_service_override_file: "{{ backup_smb_service_override_dir }}/override.conf"
+backup_smb_config_file: /etc/samba/smb.conf
+backup_smb_avahi_service_name: avahi-daemon
+backup_smb_time_machine_max_size_directive: >-
+  {{
+    'fruit:time machine max size = ' ~ (backup_smb_time_machine_max_size | trim)
+    if (backup_smb_time_machine_max_size | default('') | trim | length) > 0
+    else '# fruit:time machine max size = auto'
+  }}
+
+# Backup source and target
+restic_appdata_source_dir: /srv/appdata
+restic_appdata_env_file: /etc/restic/appdata.env
+restic_appdata_backup_script: /usr/local/sbin/restic-backup-appdata
+
+# Backup SMB (Time Machine)
+backup_smb_enabled: false
+backup_smb_share_name: macbook-backup
+backup_smb_user: tmuser
+backup_smb_group: tmuser
+backup_smb_workgroup: WORKGROUP
+backup_smb_time_machine_enabled: true
+
+# S3 tuning
+restic_appdata_s3_connections: 0
+
+# Retention policy
+restic_appdata_keep_daily: 7
+restic_appdata_keep_weekly: 4
+restic_appdata_keep_monthly: 6
+
+# Systemd timer schedule
+restic_appdata_on_calendar: "*-*-* 01:30:00"
+restic_appdata_randomized_delay_sec: "30m"
+
+# Enable/disable
+restic_appdata_backup_enabled: false
+
+# Excludes and extras
+restic_appdata_excludes: []

@@ -1,0 +1,11 @@
+[Unit]
+Description=jobs-refresh (timer)
+
+[Timer]
+OnCalendar={{ myapps_jobs_refresh_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_jobs_refresh_randomized_delay_sec }}
+Unit=jobs-refresh.service
+
+[Install]
+WantedBy=timers.target

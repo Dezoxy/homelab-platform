@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+sanitize_bin="${SANITIZE_SRT_BIN:-/usr/local/bin/sanitize-srt}"
+default_root="${FIX_HU_SUBS_ROOT:-/srv/media}"
+
+if [[ ! -x "$sanitize_bin" ]]; then
+  echo "$sanitize_bin is required but not installed" >&2
+  exit 1
+fi
+
+args=(--backup --language-code hu)
+has_path=false
+saw_double_dash=false
+
+for arg in "$@"; do
+  if [[ "$arg" == "--" ]]; then
+    saw_double_dash=true
+    continue
+  fi
+
+  if [[ "$saw_double_dash" == true || "$arg" != -* ]]; then
+    has_path=true
+  fi
+done
+
+args+=("$@")
+
+if [[ "$has_path" == false ]]; then
+  args+=("$default_root")
+fi
+
+exec "$sanitize_bin" "${args[@]}"

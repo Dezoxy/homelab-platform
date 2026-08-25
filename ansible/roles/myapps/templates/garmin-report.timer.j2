@@ -1,0 +1,11 @@
+[Unit]
+Description=garmin-health monthly report (timer)
+
+[Timer]
+OnCalendar={{ myapps_garmin_health_report_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_garmin_health_report_randomized_delay_sec }}
+Unit=garmin-report.service
+
+[Install]
+WantedBy=timers.target

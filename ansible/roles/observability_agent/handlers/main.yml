@@ -1,0 +1,11 @@
+- name: Restart alloy
+  ansible.builtin.systemd:
+    name: alloy
+    state: restarted
+  when: observability_manage_services | bool
+
+- name: Restart node exporter
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    state: restarted
+  when: observability_manage_services | bool

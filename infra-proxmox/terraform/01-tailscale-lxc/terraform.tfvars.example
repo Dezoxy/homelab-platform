@@ -1,0 +1,16 @@
+# Proxmox connection/auth are supplied via TF_VAR_* env (GitHub Actions).
+# Uncomment for local-only overrides if needed.
+# proxmox_url  = "https://192.168.1.239:8006/api2/json"
+# proxmox_node = "pve"
+# proxmox_token_id     = "terraform@pve!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+# proxmox_username = "root@pam"
+# proxmox_password = "REPLACE_ME"
+
+tailscale_lxc_vmid       = 165
+tailscale_lxc_name       = "01-tailscale-lxc"
+tailscale_lxc_ip_address = "192.168.1.7/24"
+tailscale_lxc_gateway    = "192.168.1.1"
+tailscale_lxc_username   = "toomhorvath"
+# Keep this privileged unless you explicitly configure /dev/net/tun for unprivileged LXCs.
+tailscale_lxc_unprivileged = false

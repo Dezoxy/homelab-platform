@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generic failure-notification script shared by every myapps scheduled job
+# (notification-digest, jobs-refresh, garmin-health, ...). The caller passes
+# the failed systemd unit name as $1 -- see digest-notify.service.j2 and
+# jobs-refresh-notify.service.j2, both of which are OnFailure= targets that
+# invoke this same script with a different unit name.
+#
+# $2 optionally overrides the notify env file, i.e. which bot/chat the alert
+# goes to. Omitted (digest, jobs-refresh) it stays the shared myapps alert
+# channel. garmin-health passes its own: health alerts ship a journal tail
+# that can carry the owner's Garmin account name and data dates, which does
+# not belong in the same group as the news digest's ops noise.
+FAILED_UNIT="${1:-unknown.service}"
+ENV_FILE="${2:-{{ myapps_digest_notify_env_file }}}"
+
+if [ -r "${ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  set -a
+  . "${ENV_FILE}"
+  set +a
+fi
+
+NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
+NTFY_TOPIC="${NTFY_TOPIC:-}"
+NTFY_TOKEN="${NTFY_TOKEN:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+hostname="$(hostname -f 2>/dev/null || hostname)"
+ts="$(date -Is 2>/dev/null || date)"
+
+journal="$(journalctl -u "${FAILED_UNIT}" -n 120 --no-pager -o short-iso 2>/dev/null || true)"
+status="$(systemctl status "${FAILED_UNIT}" --no-pager -l 2>/dev/null || true)"
+
+# Per-unit advisory override (added 2026-08-12).
+#
+# The default wording -- "the timer retries automatically, this is not urgent"
+# -- is right for a transient failure and actively misleading for one a retry
+# cannot clear. jobs-refresh exit 6 is the second kind: publish.sh refuses to
+# push onto a diverged origin/main, and the next run's bootstrap then fails its
+# own 'git pull --ff-only' the same way, forever, until a human intervenes. A
+# notification that calls that "not urgent" buys silence, not calm. Observed
+# 2026-08-12: a refresh commit sat unpushed and the job would have failed on
+# every subsequent fire.
+#
+# Keyed on unit:exit-status, not the exit code alone -- this script is shared
+# by every myapps job, and 6 means divergence for jobs-refresh and nothing in
+# particular elsewhere. Units not listed keep the original text, so the table
+# can stay small without misfiring.
+exit_status="$(systemctl show "${FAILED_UNIT}" -p ExecMainStatus --value 2>/dev/null || true)"
+
+advisory="A myapps scheduled job failed. The corresponding timer retries automatically
+on its next scheduled fire, so this is not urgent -- investigate when
+convenient; no immediate action is required."
+
+case "${FAILED_UNIT}:${exit_status}" in
+  jobs-refresh.service:6)
+    advisory="ACTION REQUIRED -- the automatic retry will NOT clear this.
+
+scripts/publish.sh found commits on origin/main that this checkout does not
+have, and refused to push or merge them automatically. The bootstrap's
+'git pull --ff-only' fails on the same divergence, so every scheduled run
+from here on stops at this point until a human resolves it.
+
+The run's work is not lost: its data commit is committed locally, just not
+pushed. Resolve by rebasing that commit onto origin/main and pushing it."
+    ;;
+  jobs-refresh.service:10)
+    advisory="The merge step exited 0 but wrote nothing, twice in a row -- refresh-run.sh
+step 5b caught it and failed the run rather than letting an empty run report
+success. NOTHING was published this cycle; the dashboard still shows the
+previous run's data. No git state is stranded and no cleanup is needed.
+
+refresh-run.sh already retried the merge once by itself before this fired
+(JOBS_REFRESH_MERGE_ATTEMPTS, default 2), restoring the data files in
+between. A single flaky return is therefore invisible here -- it self-heals
+and the run publishes normally. Reaching this alert means TWO consecutive
+attempts returned 0 having written nothing, which is not the flaky case.
+
+So the retry will NOT clear this, and neither will the next scheduled run.
+Look at the merge agent's output in the journal above:
+
+  - denied writes, or no mention of public/data at all: a permission or
+    config fault. Every run fails here identically until it is fixed.
+  - the agent narrating work it never did (a backgrounded sweep, a drafted
+    merge script, \"nothing written to disk yet\") on BOTH attempts: the
+    liveness sweep was hoisted into the shell on 2026-08-22 precisely to
+    remove that trigger, so seeing it again means a new one -- check what
+    the agent says it was waiting on.
+
+ACTION REQUIRED either way."
+    ;;
+  jobs-refresh.service:8)
+    advisory="Exit 8 means one of two different things. The journal above says which,
+in its last line.
+
+If it starts with RUN SUCCEEDED: the run is fine. Fetch, merge, npm run
+check and publish all completed and the data is live. The non-zero exit
+exists only to flag that the LinkedIn collection came back degraded, which
+no other channel would report -- the machine feeds are unaffected, so the
+dashboard looks entirely normal. Three causes, and the message names which:
+
+  - session not confirmed (undetermined/unreported): the login check could
+    not complete, usually an unrendered page rather than a bad session. Look
+    before re-authenticating; a broken render is not evidence of a logout.
+  - too few rows collected: the session is fine and the page rendered, but
+    paging or a DOM change cut the sweep short. Compare the browse-step log
+    against the selector notes in docs/refresh-task.md.
+  - no row carried a title: the deterministic vetoes judged an empty string
+    and kept everything, so only the ledger applied and the merge agent
+    re-judged by hand what the regexes exist to drop. The browse step must
+    write a title per row; see the Output section of docs/refresh-task.md.
+
+If it starts with filter-browser failed: the opposite -- the run ABORTED
+before merging, and nothing was published this cycle. That is deliberate,
+because merging unfiltered rows re-admits ledgered ads, bumps their lastSeen
+and stops them ever archiving. The next scheduled run retries from scratch;
+if it fails the same way, the fault is in scripts/filter-browser.mjs or its
+input and needs a human."
+    ;;
+  jobs-refresh.service:9)
+    advisory="The run itself SUCCEEDED -- fetch, merge, npm run check and publish all
+completed normally, and the data is live on the dashboard. This exit exists
+only to report that the Telegram digest for that run was not delivered.
+
+The automatic retry does NOT resend it. The next run diffs against its own
+parent commit, so the rows this run added are no longer new by then and are
+never announced -- they are on the dashboard, just absent from Telegram.
+
+Cause is in the journal above, from scripts/notify-telegram.sh: exit 1 is a
+missing or rejected token (check the jobs-telegram-* Key Vault secrets,
+folder=jobs-refresh), exit 2 is the Telegram API call itself failing, with
+the response body logged on the line before it.
+
+To send the missed digest by hand, from /opt/myapps:
+  docker compose -f compose.yml run --rm --entrypoint bash jobs-refresh \\
+    -lc 'cd /data/jobs-dashboard && ./scripts/notify-telegram.sh <commit-before-the-missed-one>'"
+    ;;
+esac
+
+title="myapps job FAILED: ${FAILED_UNIT} on ${hostname}"
+body="$(
+  cat <<EOF
+Time: ${ts}
+Host: ${hostname}
+Unit: ${FAILED_UNIT}
+
+${advisory}
+
+Exit status: ${exit_status}
+Details: journalctl -u ${FAILED_UNIT} -n 120
+
+Last logs (journalctl -n 120):
+${journal}
+
+Status (systemctl status):
+${status}
+EOF
+)"
+
+# Telegram hard-limits messages to 4096 characters; keep it comfortably under.
+truncate_telegram() {
+  local max=3900
+  if [ "{% raw %}${#body}{% endraw %}" -le "${max}" ]; then
+    printf '%s' "${body}"
+    return 0
+  fi
+  # Truncate from the MIDDLE, not the tail. body runs advisory -> journal ->
+  # systemctl status, and the journal is chronological, so cutting the end
+  # always drops the lines describing how the run actually died -- the most
+  # useful part of the alert, and the part that would contradict a wrong
+  # advisory. Observed 2026-08-22: the tail was cut at 13:04 on a 19:13
+  # failure, hiding the real cause entirely. Keep the head (advisory, unit,
+  # host) and the tail (the failure itself).
+  local head=1400 tail=$(( max - 1400 - 60 ))
+  printf '%s\n\n[... middle elided, %s chars total ...]\n\n%s' \
+    "${body:0:${head}}" "{% raw %}${#body}{% endraw %}" "${body: -${tail}}"
+}
+
+send_ntfy() {
+  local url="${NTFY_URL%/}/${NTFY_TOPIC}"
+  local -a args
+  args=(curl -fsS -X POST -H "Title: ${title}" -H "Tags: warning,myapps")
+  if [ -n "${NTFY_TOKEN}" ]; then
+    args+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+  fi
+  args+=(-d "${body}" "${url}")
+  "${args[@]}" >/dev/null 2>&1 || true
+}
+
+send_telegram() {
+  local api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+  local msg telegram_text
+  msg="$(truncate_telegram)"
+  telegram_text="${title}"$'\n\n'"${msg}"
+  curl -fsS -X POST "${api}" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${telegram_text}" \
+    -d "disable_web_page_preview=true" >/dev/null 2>&1 || true
+}
+
+sent=false
+if [ -n "${NTFY_TOPIC}" ]; then
+  send_ntfy
+  sent=true
+fi
+if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+  send_telegram
+  sent=true
+fi
+
+# No notification target configured; nothing to do.
+if [ "${sent}" = false ]; then
+  exit 0
+fi
+
+exit 0

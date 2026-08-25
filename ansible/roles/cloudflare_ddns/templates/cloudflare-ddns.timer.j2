@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Cloudflare DDNS update for {{ cloudflare_ddns_record_name }} every {{ cloudflare_ddns_interval }}
+
+[Timer]
+# Run shortly after boot too: an IP change during a power cut is exactly when
+# the record is most likely to be stale and nobody is watching.
+OnBootSec=2min
+OnUnitActiveSec={{ cloudflare_ddns_interval }}
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

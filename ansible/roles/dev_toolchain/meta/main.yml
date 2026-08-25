@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: dev_toolchain
+  author: toomhorvath
+  description: "Installs the repo's own toolchain (make, python3.13, terraform, azure-cli)."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies: []

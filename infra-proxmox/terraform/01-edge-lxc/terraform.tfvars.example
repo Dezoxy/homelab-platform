@@ -1,0 +1,15 @@
+# Proxmox connection/auth are supplied via TF_VAR_* env (GitHub Actions).
+# Uncomment for local-only overrides if needed.
+# proxmox_url  = "https://192.168.1.239:8006/api2/json"
+# proxmox_node = "pve"
+# proxmox_token_id     = "terraform@pve!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+# proxmox_username = "root@pam"
+# proxmox_password = "REPLACE_ME"
+
+cloudflared_lxc_vmid       = 160
+cloudflared_lxc_name       = "01-edge-lxc"
+cloudflared_lxc_ip_address = "192.168.1.2/24"
+cloudflared_lxc_gateway    = "192.168.1.1"
+cloudflared_lxc_username   = "toomhorvath"
+# cloudflared_tunnel_token is passed to Ansible (CLOUDFLARED_TUNNEL_TOKEN)

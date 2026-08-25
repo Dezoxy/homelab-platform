@@ -1,0 +1,21 @@
+{% set acted = [] %}
+{% for host in groups['all'] | sort %}
+{% set svcs = hostvars[host].apt_restart_services | default([]) %}
+{% set held = hostvars[host].apt_held_back | default([]) %}
+{% set krun = hostvars[host].apt_kernel_running | default('') %}
+{% set knew = hostvars[host].apt_kernel_newest | default('none') %}
+{% set reboot = hostvars[host].apt_reboot_required | default(false)
+   or (hostvars[host].apt_kernel_state | default('0')) == '3'
+   or (knew not in ['', 'none'] and knew != krun) %}
+{% set reclaim = hostvars[host].apt_autoremovable_count | default(0) | int %}
+{% if svcs | length > 0 or reboot or held | length > 0 or reclaim > 0 %}
+{% set _ = acted.append(host) %}
+{{ host }}:{% if reboot %} REBOOT REQUIRED{% endif %}{% if held | length > 0 %} held back: {{ held | join(', ') }}{% endif %}{% if svcs | length > 0 %} restart: {{ svcs | join(', ') }}{% endif %}{% if reclaim > 0 %} {{ reclaim }} pkg(s) reclaimable{% if hostvars[host].apt_autoremovable_freed | default('') %} ({{ hostvars[host].apt_autoremovable_freed }}){% endif %}{% endif %}
+
+{% endif %}
+{% endfor %}
+{% if acted | length == 0 %}
+Nothing pending: no service restarts and no reboots required.
+{% else %}
+Nothing was restarted or rebooted automatically - decide when.
+{% endif %}

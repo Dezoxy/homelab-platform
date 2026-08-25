@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: adguard_home
+  author: toomhorvath
+  description: "Installs and configures AdGuard Home as a LAN DNS server."
+  license: MIT
+  min_ansible_version: "2.14"

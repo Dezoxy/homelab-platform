@@ -1,0 +1,20 @@
+[Unit]
+Description=notification-digest positions tracker (timer)
+
+[Timer]
+# SERVER TIME (UTC), no Europe/Budapest suffix -- same reasoning as the
+# Patreon timer: this is not read at a fixed local hour, and a DST shift
+# would move all six slots into other jobs' busy bands twice a year. See
+# myapps_digest_positions_on_calendar for the slot's derivation.
+OnCalendar={{ myapps_digest_positions_on_calendar }}
+# Persistent, like every other digest timer: a slot missed across a reboot
+# should still run. Cheap and idempotent -- the app dedups on the items
+# table, and a window with no material news delivers nothing at all.
+Persistent=true
+# Tight enough to keep the whole run inside the :25-:30 slot the calendar
+# above was chosen for.
+RandomizedDelaySec={{ myapps_digest_positions_randomized_delay_sec }}
+Unit=digest-positions.service
+
+[Install]
+WantedBy=timers.target

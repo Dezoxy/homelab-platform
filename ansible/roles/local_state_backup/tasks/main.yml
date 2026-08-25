@@ -1,0 +1,9 @@
+---
+# Both halves in the safe order. A consumer with restore tasks in between must
+# import install.yml and units.yml separately instead -- see the note in
+# units.yml for why the order is not cosmetic.
+- name: Install local state directories and mirror script
+  ansible.builtin.import_tasks: install.yml
+
+- name: Install and enable the local state backup units
+  ansible.builtin.import_tasks: units.yml

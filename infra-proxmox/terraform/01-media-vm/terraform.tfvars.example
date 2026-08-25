@@ -1,0 +1,61 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+template_vmid = 901
+
+ip_address = "192.168.1.70/24"
+ip_gateway = "192.168.1.1"
+
+# Memory ballooning (minimum RAM when reclaimed by host)
+memory_ballooning_mb = 4096
+
+# Storage lives on the Proxmox host and is exposed to this VM via VirtIO-FS:
+# - /srv/appdata (ext4 on a dedicated disk/LV)
+# - /srv/media   (mergerfs on the host)
+enable_virtiofs_shares        = true
+virtiofs_appdata_mapping_name = "homelab-appdata"
+virtiofs_appdata_host_path    = "/srv/appdata"
+virtiofs_media_mapping_name   = "homelab-media"
+virtiofs_media_host_path      = "/srv/media"
+
+# Optional pre-start guard: refuse VM start unless required host mounts are active.
+# Enable this only when the selected datastore is configured for Proxmox snippets.
+media_vm_enable_pre_start_mount_guard = false
+# media_vm_hook_script_datastore_id    = "local"
+# media_vm_hook_script_file_name       = "01-media-vm-pre-start-hook.sh"
+
+# Optional VirtIO-FS tuning
+# virtiofs_cache        = "auto"
+# virtiofs_direct_io    = false
+# virtiofs_expose_acl   = true
+# virtiofs_expose_xattr = true
+
+# Optional disks for the VM itself (keep empty for the "host owns storage" model)
+data_disks_gb = []
+
+# USB controller passthrough is typically disabled when the host owns the DAS
+enable_usb_controller_passthrough = false
+# usb_controller_mapping_name = "usb-controller-01-media-vm"
+usb_controller_pci_id = "8086:7a60"
+usb_controller_pci_path = "0000:00:14.0"
+usb_controller_iommu_group = 3
+usb_controller_subsystem_id = "1849:7a60"
+
+# iGPU passthrough (required) - override values to match your host
+# igpu_mapping_name = "igpu-01-media-vm"
+# igpu_pci_id = "8086:a780"
+# igpu_pci_path = "0000:00:02.0"
+# igpu_iommu_group = 0
+# igpu_subsystem_id = "1849:a780"
+
+# bootstrap_password is required (set via terraform.tfvars or export TF_VAR_bootstrap_password)
+# bootstrap_password = "REPLACE_ME"
+
+# Optional admin public key (defaults to keys/toomhorvath.pub)
+# admin_pubkey = "ssh-ed25519 AAAA..."

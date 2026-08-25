@@ -1,0 +1,10 @@
+[Unit]
+Description=Trim torrent staging mount
+RequiresMountsFor={{ qbittorrent_staging_mount }}
+ConditionPathIsMountPoint={{ qbittorrent_staging_mount }}
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart={{ staging_fstrim_binary }} -v {{ qbittorrent_staging_mount }}

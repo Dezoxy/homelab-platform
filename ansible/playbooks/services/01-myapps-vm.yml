@@ -1,0 +1,220 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Bootstrap 01-myapps-vm
+  hosts: 01-myapps-vm
+  become: true
+  vars:
+    docker_group_users:
+      - "{{ myapps_user }}"
+    # Chromium web UI's HTTP Basic auth password -- a second factor behind
+    # Cloudflare Access. Not generated or set here; store it as the
+    # chromium-ui-password Key Vault secret (folder=myapps,
+    # envvar=CHROMIUM_UI_PASSWORD) before flipping myapps_chromium_enabled.
+    myapps_chromium_ui_password_effective: >-
+      {{
+        (myapps_chromium_ui_password | default('') | trim)
+        or (lookup('env', 'CHROMIUM_UI_PASSWORD') | default('', true) | trim)
+      }}
+    # DIGEST_GHCR_PULL_TOKEN, namespaced rather than a bare GHCR_PULL_TOKEN
+    # (the now-retired dashboard role used that name): if both folders were ever fetched into one job
+    # environment, whichever exported last would silently shadow the other.
+    # Same collision hazard the 01-dashboard-lxc DASHBOARD_PROXMOX_* comment
+    # documents -- see docs/github-secrets.md before renaming.
+    myapps_digest_ghcr_pull_token_effective: >-
+      {{
+        (myapps_digest_ghcr_pull_token | default('') | trim)
+        or (lookup('env', 'DIGEST_GHCR_PULL_TOKEN') | default('', true) | trim)
+      }}
+    myapps_digest_tg_api_id_effective: >-
+      {{
+        (myapps_digest_tg_api_id | default('') | trim)
+        or (lookup('env', 'DIGEST_TG_API_ID') | default('', true) | trim)
+      }}
+    myapps_digest_tg_api_hash_effective: >-
+      {{
+        (myapps_digest_tg_api_hash | default('') | trim)
+        or (lookup('env', 'DIGEST_TG_API_HASH') | default('', true) | trim)
+      }}
+    myapps_digest_tg_session_effective: >-
+      {{
+        (myapps_digest_tg_session | default('') | trim)
+        or (lookup('env', 'DIGEST_TG_SESSION') | default('', true) | trim)
+      }}
+    myapps_digest_smtp_user_effective: >-
+      {{
+        (myapps_digest_smtp_user | default('') | trim)
+        or (lookup('env', 'DIGEST_SMTP_USER') | default('', true) | trim)
+      }}
+    myapps_digest_smtp_password_effective: >-
+      {{
+        (myapps_digest_smtp_password | default('') | trim)
+        or (lookup('env', 'DIGEST_SMTP_PASSWORD') | default('', true) | trim)
+      }}
+    myapps_digest_x_cookies_effective: >-
+      {{
+        (myapps_digest_x_cookies | default('') | trim)
+        or (lookup('env', 'DIGEST_X_COOKIES') | default('', true) | trim)
+      }}
+    myapps_digest_reddit_session_effective: >-
+      {{
+        (myapps_digest_reddit_session | default('') | trim)
+        or (lookup('env', 'DIGEST_REDDIT_SESSION') | default('', true) | trim)
+      }}
+    myapps_digest_polymarket_proxy_key_effective: >-
+      {{
+        (myapps_digest_polymarket_proxy_key | default('') | trim)
+        or (lookup('env', 'DIGEST_POLYMARKET_PROXY_KEY') | default('', true) | trim)
+      }}
+    myapps_digest_site_ingest_key_effective: >-
+      {{
+        (myapps_digest_site_ingest_key | default('') | trim)
+        or (lookup('env', 'DIGEST_SITE_INGEST_KEY') | default('', true) | trim)
+      }}
+    # SECRET: the owner's patreon.com `session_id` cookie -- a live
+    # credential to a PAID account, valid roughly a year from issue. Same
+    # Key Vault path as every other secret here (folder=digest).
+    myapps_digest_patreon_session_cookie_effective: >-
+      {{
+        (myapps_digest_patreon_session_cookie | default('') | trim)
+        or (lookup('env', 'DIGEST_PATREON_SESSION_COOKIE') | default('', true) | trim)
+      }}
+    # SITE_PUBLIC_BASE embeds the news-site capability token, so it rides the
+    # Key Vault path like a secret even though it is "just a URL".
+    myapps_digest_site_public_base_effective: >-
+      {{
+        (myapps_digest_site_public_base | default('') | trim)
+        or (lookup('env', 'DIGEST_SITE_PUBLIC_BASE') | default('', true) | trim)
+      }}
+    myapps_digest_telegram_notify_bot_token_effective: >-
+      {{
+        (myapps_digest_telegram_notify_bot_token | default('') | trim)
+        or (lookup('env', 'DIGEST_TELEGRAM_NOTIFY_BOT_TOKEN') | default('', true) | trim)
+      }}
+    myapps_digest_telegram_notify_chat_id_effective: >-
+      {{
+        (myapps_digest_telegram_notify_chat_id | default('') | trim)
+        or (lookup('env', 'DIGEST_TELEGRAM_NOTIFY_CHAT_ID') | default('', true) | trim)
+      }}
+    myapps_digest_telegram_notify_thread_id_effective: >-
+      {{
+        (myapps_digest_telegram_notify_thread_id | default('') | trim)
+        or (lookup('env', 'DIGEST_TELEGRAM_NOTIFY_THREAD_ID') | default('', true) | trim)
+      }}
+    myapps_digest_telegram_daily_thread_id_effective: >-
+      {{
+        (myapps_digest_telegram_daily_thread_id | default('') | trim)
+        or (lookup('env', 'DIGEST_TELEGRAM_DAILY_THREAD_ID') | default('', true) | trim)
+      }}
+    myapps_digest_telegram_weekly_thread_id_effective: >-
+      {{
+        (myapps_digest_telegram_weekly_thread_id | default('') | trim)
+        or (lookup('env', 'DIGEST_TELEGRAM_WEEKLY_THREAD_ID') | default('', true) | trim)
+      }}
+    # Failure-alert targets for digest-notify.service (mirrors the
+    # restic_backup role's restic-notify env). All optional -- the notify
+    # script no-ops when none are set. See docs/github-secrets.md-style
+    # comment in ansible/roles/myapps/defaults/main.yml for the Key Vault
+    # secret names (folder=digest).
+    myapps_digest_notify_ntfy_url_effective: >-
+      {{
+        (myapps_digest_notify_ntfy_url | default('') | trim)
+        or (lookup('env', 'DIGEST_NOTIFY_NTFY_URL') | default('', true) | trim)
+        or 'https://ntfy.sh'
+      }}
+    myapps_digest_notify_ntfy_topic_effective: >-
+      {{
+        (myapps_digest_notify_ntfy_topic | default('') | trim)
+        or (lookup('env', 'DIGEST_NOTIFY_NTFY_TOPIC') | default('', true) | trim)
+      }}
+    myapps_digest_notify_ntfy_token_effective: >-
+      {{
+        (myapps_digest_notify_ntfy_token | default('') | trim)
+        or (lookup('env', 'DIGEST_NOTIFY_NTFY_TOKEN') | default('', true) | trim)
+      }}
+    myapps_digest_notify_telegram_bot_token_effective: >-
+      {{
+        (myapps_digest_notify_telegram_bot_token | default('') | trim)
+        or (lookup('env', 'DIGEST_NOTIFY_TELEGRAM_BOT_TOKEN') | default('', true) | trim)
+      }}
+    myapps_digest_notify_telegram_chat_id_effective: >-
+      {{
+        (myapps_digest_notify_telegram_chat_id | default('') | trim)
+        or (lookup('env', 'DIGEST_NOTIFY_TELEGRAM_CHAT_ID') | default('', true) | trim)
+      }}
+    # --- garmin-health (folder=garmin) ---
+    # read:packages PAT for the PRIVATE ghcr.io/dezoxy/my-health-datas image.
+    # Namespaced GARMIN_* rather than a bare GHCR_PULL_TOKEN for the same
+    # collision reason the DIGEST_GHCR_PULL_TOKEN comment above documents:
+    # both folders land in one job environment, and whichever exported last
+    # would silently shadow the other.
+    myapps_garmin_health_ghcr_pull_token_effective: >-
+      {{
+        (myapps_garmin_health_ghcr_pull_token | default('') | trim)
+        or (lookup('env', 'GARMIN_GHCR_PULL_TOKEN') | default('', true) | trim)
+      }}
+    # SECRETS: a DEDICATED Telegram bot and the owner's private chat, carrying
+    # both the monthly health report and this service's failure alerts.
+    # Deliberately separate from myapps_digest_notify_telegram_* -- personal
+    # health data must not share a credential or a group with the news digest.
+    myapps_garmin_health_telegram_bot_token_effective: >-
+      {{
+        (myapps_garmin_health_telegram_bot_token | default('') | trim)
+        or (lookup('env', 'GARMIN_TELEGRAM_BOT_TOKEN') | default('', true) | trim)
+      }}
+    myapps_garmin_health_telegram_chat_id_effective: >-
+      {{
+        (myapps_garmin_health_telegram_chat_id | default('') | trim)
+        or (lookup('env', 'GARMIN_TELEGRAM_CHAT_ID') | default('', true) | trim)
+      }}
+    # jobs-refresh tracker sync (folder=jobs-refresh): Cloudflare Access
+    # service token for GET jobs.example.com/api/tracker -- refresh-run.sh
+    # step 2b folds the dashboard tracker's negative verdicts into the
+    # rejected-ids ledger before each fetch. Token minted by cloudflare-
+    # terraform (cloudflare_zero_trust_access_service_token.jobs_refresh);
+    # rotate there, then update the two Key Vault secrets.
+    # jobs-refresh Telegram digest (folder=jobs-refresh): the "Job Agent"
+    # bot and the owner's private chat -- the destination the GitHub Actions
+    # workflow has been posting to. Deliberately separate from the
+    # myapps_digest_notify_telegram_* alert credentials above; see
+    # myapps_jobs_refresh_notify_enabled in the myapps role defaults.
+    myapps_jobs_refresh_telegram_bot_token_effective: >-
+      {{
+        (myapps_jobs_refresh_telegram_bot_token | default('') | trim)
+        or (lookup('env', 'JOBS_REFRESH_TELEGRAM_BOT_TOKEN') | default('', true) | trim)
+      }}
+    myapps_jobs_refresh_telegram_chat_id_effective: >-
+      {{
+        (myapps_jobs_refresh_telegram_chat_id | default('') | trim)
+        or (lookup('env', 'JOBS_REFRESH_TELEGRAM_CHAT_ID') | default('', true) | trim)
+      }}
+    myapps_jobs_refresh_tracker_client_id_effective: >-
+      {{
+        (myapps_jobs_refresh_tracker_client_id | default('') | trim)
+        or (lookup('env', 'JOBS_TRACKER_CLIENT_ID') | default('', true) | trim)
+      }}
+    myapps_jobs_refresh_tracker_client_secret_effective: >-
+      {{
+        (myapps_jobs_refresh_tracker_client_secret | default('') | trim)
+        or (lookup('env', 'JOBS_TRACKER_CLIENT_SECRET') | default('', true) | trim)
+      }}
+  tasks:
+    # Must precede the myapps role: it renders digest-state-backup, whose
+    # mirror step writes into the share. An unmounted path there would
+    # silently write to the VM's own disk instead -- backups that look
+    # healthy and never leave the host, which is the exact failure this
+    # whole change exists to fix.
+    - name: Import virtiofs_mounts role
+      ansible.builtin.import_role:
+        name: virtiofs_mounts
+
+    - name: Import myapps role
+      ansible.builtin.import_role:
+        name: myapps

@@ -1,0 +1,36 @@
+---
+# The BACKUP half only. Restore stays with each consuming role: media stops
+# long-running containers around it, myapps has timer-driven oneshot units, and
+# the two sequences are genuinely different. Only the SQLite-safe copy logic is
+# worth sharing, and that lives entirely in the script template.
+
+- name: Ensure local state directories
+  ansible.builtin.file:
+    path: "{{ item.target }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ homelab_local_state_paths }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.target != item.source | default('')
+
+- name: Ensure backup target directories exist on the share
+  ansible.builtin.file:
+    path: "{{ item.backup_target }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ homelab_local_state_paths }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.backup_target is defined
+
+- name: Install local state backup mirror script
+  ansible.builtin.template:
+    src: homelab-local-state-backup.py.j2
+    dest: "{{ homelab_local_state_backup_script }}"
+    mode: "0755"
+  register: local_state_backup_script_copy

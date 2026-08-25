@@ -1,0 +1,116 @@
+name: CI / Terraform Plan
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terraform-stacks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: matrix
+        shell: bash
+        run: echo "matrix=$(python3 scripts/ci/build_terraform_stack_matrix.py)" >> "${GITHUB_OUTPUT}"
+
+  plan:
+    needs: terraform-stacks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: "true"
+    strategy:
+      matrix: ${{ fromJSON(needs.terraform-stacks.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch Tailscale secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: tailscale
+
+      - name: Fetch Proxmox secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: proxmox
+
+      - name: Fetch Terraform secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: terraform
+
+      - name: Export Terraform runtime environment
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh terraform
+
+      - id: tailscale
+        name: Export Tailscale runtime inputs
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh tailscale-outputs
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Connect to Tailscale (for LAN access)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ steps.tailscale.outputs.oauth_client_id }}
+          oauth-secret: ${{ steps.tailscale.outputs.oauth_secret }}
+          tags: tag:github-ci
+          version: ${{ env.TAILSCALE_VERSION }}
+          hostname: "gh-${{ github.run_id }}-plan"
+          args: --accept-dns=false
+      - name: Wait for Proxmox API reachability
+        shell: bash
+        run: bash scripts/ci/wait_for_proxmox_api.sh
+      - name: Ensure Terraform
+        shell: bash
+        run: bash scripts/ci/ensure_terraform.sh
+      - name: Terraform fmt/validate/plan
+        working-directory: ${{ matrix.dir }}
+        env:
+          TARGET: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          eval "$(
+            python3 "${GITHUB_WORKSPACE}/scripts/ci/resolve_image_pin.py" \
+              --target "${TARGET}" \
+              --format terraform-shell
+          )"
+          terraform fmt -check
+          terraform init -input=false
+          terraform validate
+          terraform plan -out=tfplan
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ matrix.name }}
+          path: ${{ matrix.dir }}/tfplan
+
+      - name: Debug Proxmox connectivity (on failure)
+        if: ${{ failure() }}
+        shell: bash
+        run: bash scripts/ci/debug_proxmox_connectivity.sh

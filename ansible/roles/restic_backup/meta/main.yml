@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: restic_backup
+  author: toomhorvath
+  description: "Configures restic backups with Backblaze B2 and optional SMB/Time Machine."
+  license: MIT
+  min_ansible_version: "2.14"

@@ -1,0 +1,71 @@
+---
+# The repo's own toolchain, so `make lint` / `make ci` / `make deploy` run from
+# 01-code-lxc rather than only from the Mac.
+#
+# Deliberately NOT installed here: packer and tflint. `make install-tools`
+# already downloads both into .local/bin at the versions in
+# scripts/ci/versions.sh, and a second system-wide copy would just create
+# version ambiguity about which one a lint run actually used.
+
+dev_toolchain_enabled: true
+dev_toolchain_user: toomhorvath
+
+dev_toolchain_base_packages:
+  - make
+  - unzip
+  - curl
+  - gnupg
+  - ca-certificates
+  # make lint drives pre-commit, which is not in the venv -- that holds only
+  # ansible, ansible-lint and checkov. apt has 4.5.1 against the Mac's 4.6.2,
+  # which does not matter: pre-commit pins each hook's own version from
+  # .pre-commit-config.yaml, so the runner version is not what lint reproduces.
+  - pre-commit
+  # The image ships only C, C.utf8 and POSIX. Ansible aborts on a missing
+  # locale with "could not initialize the preferred locale: unsupported locale
+  # setting", which stops `make setup` before it installs anything.
+  - locales
+
+# A real UTF-8 locale, generated rather than assumed present.
+dev_toolchain_locale: en_US.UTF-8
+
+# --- Python -------------------------------------------------------------------
+# Ubuntu 26.04 ships Python 3.14, and the Makefile refuses it: local tooling
+# pins require >=3.12,<3.14 because checkov's google-re2 dependency is not
+# reliably wheel-backed on 3.14+. The archive has no older interpreter, so this
+# comes from deadsnakes -- verified to publish for resolute (26.04).
+#
+# The Makefile finds it by name (`command -v python3.13`), so simply having it
+# on PATH is enough; no PYTHON= override is needed at the call site.
+dev_toolchain_python_version: "3.13"
+dev_toolchain_deadsnakes_key_url: "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776"
+dev_toolchain_deadsnakes_keyring: /etc/apt/keyrings/deadsnakes.gpg
+dev_toolchain_deadsnakes_repo: "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu {{ ansible_facts['distribution_release'] }} main"
+
+# --- Terraform ----------------------------------------------------------------
+# Version comes from scripts/ci/versions.sh, read off the CONTROLLER at deploy
+# time. Pinning it again here would make this a second source of truth and let
+# the container drift from CI -- exactly the failure the apt-mirror flip-flop
+# was.
+dev_toolchain_hashicorp_key_url: https://apt.releases.hashicorp.com/gpg
+dev_toolchain_hashicorp_keyring: /etc/apt/keyrings/hashicorp.gpg
+dev_toolchain_hashicorp_repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com {{ ansible_facts['distribution_release'] }} main"
+
+# --- Azure CLI ----------------------------------------------------------------
+# Needed by scripts/dev/azure_kv_run.sh, which every deploy funnels through.
+#
+# NOTE what an `az login` here grants. AZURE_KEYVAULT_FOLDER is a JMESPath
+# filter applied to the result of a full `az keyvault secret list` -- it scopes
+# what the DEPLOY ASKS FOR, not what the session may read. Any session on this
+# box can read every secret the signed-in identity is entitled to. That is
+# accepted deliberately for a box behind Cloudflare Access plus a password; if
+# it ever stops being acceptable, the fix is a service principal with a Key
+# Vault policy scoped to the folders this guest needs, not a tighter env var.
+dev_toolchain_azure_cli_enabled: true
+dev_toolchain_microsoft_key_url: https://packages.microsoft.com/keys/microsoft.asc
+dev_toolchain_microsoft_keyring: /etc/apt/keyrings/microsoft.gpg
+dev_toolchain_microsoft_repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ {{ ansible_facts['distribution_release'] }} main"
+
+# Azure CLI publishes per Ubuntu codename and lags new releases; fall back to
+# the most recent LTS codename it does publish for.
+dev_toolchain_azure_cli_fallback_release: noble

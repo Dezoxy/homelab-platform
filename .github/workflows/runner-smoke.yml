@@ -1,0 +1,18 @@
+name: Debug / Runner Smoke
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Who/where am I
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          echo "Host: $(hostname)"
+          whoami
+          id
+          uname -a
+          df -h /
+          uptime

@@ -1,0 +1,9 @@
+{% if adguard_resolv_search_domain | default('') | length > 0 %}
+search {{ adguard_resolv_search_domain }}
+{% endif %}
+{% for server in adguard_resolv_nameservers | default(adguard_bootstrap_dns) %}
+nameserver {{ server }}
+{% endfor %}
+{% if adguard_resolv_options | default('') | length > 0 %}
+options {{ adguard_resolv_options }}
+{% endif %}

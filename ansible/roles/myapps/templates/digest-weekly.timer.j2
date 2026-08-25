@@ -1,0 +1,19 @@
+[Unit]
+Description=notification-digest weekly brief (timer)
+
+[Timer]
+# Trailing IANA timezone keeps Sunday 21:00 Europe/Budapest correct across
+# DST without manual UTC math -- systemd's OnCalendar= supports it natively.
+# 21:00 sits safely between the UTC-scheduled 6-hourly window runs
+# year-round AND after the 20:30 daily brief has finished -- the Sunday
+# evening cascade is window (20:00) -> daily (20:30) -> weekly (21:00),
+# each rung consuming the one below it.
+OnCalendar={{ myapps_digest_weekly_on_calendar }}
+Persistent=true
+# Same tight jitter cap as the daily brief, for the same reason: a
+# once-a-week deliverable the owner expects to read that evening.
+RandomizedDelaySec={{ myapps_digest_weekly_randomized_delay_sec }}
+Unit=digest-weekly.service
+
+[Install]
+WantedBy=timers.target

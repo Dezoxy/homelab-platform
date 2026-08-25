@@ -1,0 +1,27 @@
+alloy_version: "1.18.1"
+alloy_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+alloy_arch: "{{ alloy_arch_map.get(ansible_facts['architecture'], 'amd64') }}"
+alloy_zip_name: "alloy-linux-{{ alloy_arch }}.zip"
+alloy_download_url: "https://github.com/grafana/alloy/releases/download/v{{ alloy_version }}/{{ alloy_zip_name }}"
+alloy_archive_path: "{{ alloy_install_dir }}/alloy-{{ alloy_version }}-linux-{{ alloy_arch }}.zip"
+alloy_install_dir: /opt/alloy
+alloy_config_dir: /etc/alloy
+alloy_config_path: "{{ alloy_config_dir }}/config.alloy"
+alloy_storage_path: /var/lib/alloy
+alloy_loki_push_url: "http://{{ hostvars['01-observability-lxc']['ansible_host'] }}:3100/loki/api/v1/push"
+legacy_promtail_install_dir: /opt/promtail
+legacy_promtail_config_dir: /etc/promtail
+legacy_promtail_positions_file: /var/lib/promtail/positions.yaml
+
+observability_manage_services: true
+observability_cadvisor_enabled: false
+cadvisor_image: "ghcr.io/google/cadvisor:v0.60.5"
+node_exporter_textfile_directory: /var/lib/prometheus/node-exporter-textfile
+node_exporter_args_file: /etc/default/prometheus-node-exporter
+# Proxmox LXC guests see host XFS runtime stats, which can outpace the
+# distro-packaged node_exporter parser. Filesystem capacity metrics remain on.
+node_exporter_args: >-
+  --collector.textfile.directory={{ node_exporter_textfile_directory }}
+  --no-collector.xfs

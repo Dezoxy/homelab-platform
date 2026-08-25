@@ -1,0 +1,61 @@
+# --- Grafana ---
+# Set password via CI secret; do not commit it here.
+observability_grafana_admin_password: ""
+observability_grafana_alert_telegram_chat_id: "1590715948"
+
+# --- Prometheus scrape targets ---
+observability_node_exporter_targets:
+  - "01-media-vm.home.arpa:9100"
+  - "01-myapps-vm.home.arpa:9100"
+  - "01-torrent-lxc.home.arpa:9100"
+  - "01-observability-lxc.home.arpa:9100"
+  - "01-backup-lxc.home.arpa:9100"
+  - "01-edge-lxc.home.arpa:9100"
+  - "01-dns-lxc.home.arpa:9100"
+  - "01-reverse-proxy-lxc.home.arpa:9100"
+  - "01-tailscale-lxc.home.arpa:9100"
+  - "01-code-lxc.home.arpa:9100"
+observability_cadvisor_targets:
+  - "01-media-vm.home.arpa:18080"
+  - "01-myapps-vm.home.arpa:18080"
+  - "01-torrent-lxc.home.arpa:18080"
+  - "01-observability-lxc.home.arpa:18080"
+observability_backup_node_exporter_target: "01-backup-lxc.home.arpa:9100"
+observability_cloudflared_metrics_target: "01-edge-lxc.home.arpa:2000"
+observability_traefik_metrics_target: "01-reverse-proxy-lxc.home.arpa:9101"
+observability_loki_metrics_target: "01-observability-lxc.home.arpa:3100"
+observability_tempo_metrics_target: "01-observability-lxc.home.arpa:3200"
+
+# --- Grafana dashboards ---
+observability_grafana_dashboard_templates:
+  - homelab-overview.json.j2
+  - docker-fleet.json.j2
+  - ingress-dns.json.j2
+  - apps-overview.json.j2
+  - logs-errors.json.j2
+  - logs-observability.json.j2
+  - logs-traefik.json.j2
+  - logs-hosts.json.j2
+
+# --- AdGuard exporter ---
+observability_adguard_exporter_enabled: true
+observability_adguard_exporter_interval: 30s
+observability_adguard_exporter_username: admin
+observability_adguard_exporter_password: ""
+
+# --- Blackbox exporter ---
+observability_blackbox_exporter_enabled: true
+observability_blackbox_probe_targets:
+  - https://netcheck.example.com
+  - https://tautulli.example.com
+  - https://qb.example.com
+  - https://prowlarr.example.com
+  - https://radarr.example.com
+  - https://sonarr.example.com
+  - https://bazarr.example.com
+  - https://lingarr.example.com
+  - https://askme.example.com
+  - https://grafana.example.com
+  - https://dns.example.com
+  - https://proxmox.example.com
+  - https://reverse-proxy.example.com

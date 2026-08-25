@@ -1,0 +1,10 @@
+---
+galaxy_info:
+  role_name: unifi_os_server
+  author: toomhorvath
+  description: "Installs UniFi OS Server (Podman) and puts controller backups on the VirtIO-FS share."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies:
+  - role: virtiofs_mounts

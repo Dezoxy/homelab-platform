@@ -1,0 +1,63 @@
+name: Platform / PR Ready Notification
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: platform-pr-ready-notify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch CI notification secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: ci
+
+      - name: Build PR notification
+        shell: bash
+        env:
+          PR_ACTION: ${{ github.event.action }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'PR READY TO REVIEW/MERGE: #%s\n' "${PR_NUMBER}"
+            printf 'repo: %s\n' "${REPOSITORY}"
+            printf 'title: %s\n' "${PR_TITLE}"
+            printf 'action: %s\n' "${PR_ACTION}"
+            printf 'author: %s\n' "${PR_AUTHOR}"
+            printf 'branch: %s -> %s\n' "${PR_HEAD}" "${PR_BASE}"
+            printf 'url: %s\n' "${PR_URL}"
+          } > "${RUNNER_TEMP}/pr-ready-message.txt"
+
+      - name: Send Telegram notification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/notify_workflow_run_telegram.py \
+            --message-file "${RUNNER_TEMP}/pr-ready-message.txt"

@@ -1,0 +1,59 @@
+name: CI / ShellCheck
+on:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/shellcheck.yml"
+  # Post-merge safety net: PR checks can be merged past while still pending.
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/shellcheck.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs, but never cancel a main validation: two quick
+  # merges would otherwise leave the first commit silently unvalidated, which
+  # is the exact gap this push trigger exists to close.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run shellcheck on changed scripts
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # On push there is no PR diff to scope against, and the point of a
+          # post-merge gate is to catch what the PR checks did not -- including
+          # a merge that combines two individually-clean branches badly. So
+          # validate the whole tree rather than guessing a base.
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "Push to ${GITHUB_REF_NAME}: validating all repository scripts."
+            find scripts/ -name "*.sh" -print0 | xargs -0 shellcheck --severity=warning
+            exit 0
+          fi
+          if ! git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- .github/workflows/shellcheck.yml; then
+            echo "ShellCheck workflow changed; validating all repository scripts."
+            find scripts/ -name "*.sh" -print0 | xargs -0 shellcheck --severity=warning
+            exit 0
+          fi
+          mapfile -d '' files < <(
+            git diff --name-only --diff-filter=ACMR -z \
+              "${BASE_SHA}" "${HEAD_SHA}" -- 'scripts/**/*.sh'
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed shell scripts to lint."
+            exit 0
+          fi
+          shellcheck --severity=warning "${files[@]}"

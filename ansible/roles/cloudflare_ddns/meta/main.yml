@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: cloudflare_ddns
+  author: toomhorvath
+  description: "Keeps a grey-clouded Cloudflare A record pointed at this site's WAN IP."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies: []

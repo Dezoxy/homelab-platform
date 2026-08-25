@@ -1,0 +1,38 @@
+- name: Snapshot package versions on selected hosts
+  hosts: all
+  gather_facts: false
+  vars:
+    package_snapshot_output_dir: /tmp/package-snapshot
+
+  tasks:
+    - name: Ensure snapshot output directory exists on controller
+      ansible.builtin.file:
+        path: "{{ package_snapshot_output_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Query installed package versions
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - '-f=${Package}\t${Version}\n'
+      register: package_snapshot_cmd
+      changed_when: false
+
+    - name: Write package snapshot JSON on controller
+      ansible.builtin.copy:
+        dest: "{{ package_snapshot_output_dir }}/{{ inventory_hostname }}"
+        mode: "0644"
+        content: >-
+          {{
+            {
+              "stdout_lines": (package_snapshot_cmd.stdout_lines | default([]) | sort)
+            } | to_nice_json
+          }}
+      delegate_to: localhost
+      become: false
+      changed_when: false

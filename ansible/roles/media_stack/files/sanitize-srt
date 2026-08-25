@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+
+"""Rewrite loosely formatted SRT files into a canonical, player-friendly form."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+
+TIMESTAMP_RE = re.compile(
+    r"^\s*(?P<start>\d{1,3}:\d{1,2}:\d{1,2}[,.:]\d{1,3})\s*-->\s*"
+    r"(?P<end>\d{1,3}:\d{1,2}:\d{1,2}[,.:]\d{1,3})(?:\s+.*)?\s*$"
+)
+INDEX_RE = re.compile(r"^\s*\d+\s*$")
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+EMBEDDED_HEX_ESCAPE_RE = re.compile(r"\x00(00[0-9A-Fa-f]{2}|[0-9A-Fa-f]{2})")
+SUSPICIOUS_UNICODE_RE = re.compile(r"[\uE000-\uF8FF\uFFF0-\uFFFF\uFFFD]")
+
+
+@dataclass
+class Cue:
+    start_ms: int
+    end_ms: int
+    lines: list[str]
+
+
+@dataclass
+class SanitizedFile:
+    path: Path
+    original_text: str
+    sanitized_text: str
+    cue_count: int
+    dropped_empty_cues: int
+    adjusted_durations: int
+
+    @property
+    def changed(self) -> bool:
+        return self.original_text != self.sanitized_text
+
+
+def decode_subtitle(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1250", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_timestamp(value: str) -> int:
+    hours, minutes, seconds, milliseconds = re.split(r"[:,.]", value.strip())
+    total_ms = (
+        (int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1000
+        + int(milliseconds.ljust(3, "0")[:3])
+    )
+    return max(total_ms, 0)
+
+
+def format_timestamp(total_ms: int) -> str:
+    total_ms = max(total_ms, 0)
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, milliseconds = divmod(rem, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+
+def decode_embedded_hex_escape(match: re.Match[str]) -> str:
+    raw_value = match.group(1)
+    try:
+        if len(raw_value) == 4:
+            return chr(int(raw_value, 16))
+
+        byte_value = bytes([int(raw_value, 16)])
+        for encoding in ("cp1250", "cp1252", "latin-1"):
+            try:
+                return byte_value.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+    except ValueError:
+        return match.group(0)
+
+    return match.group(0)
+
+
+def clean_text_line(line: str) -> str:
+    cleaned = line.replace("\ufeff", "").replace("\r", "")
+    cleaned = EMBEDDED_HEX_ESCAPE_RE.sub(decode_embedded_hex_escape, cleaned)
+    cleaned = CONTROL_CHARS_RE.sub("", cleaned)
+    return cleaned.rstrip()
+
+
+def assert_no_suspicious_unicode(text: str, path: Path) -> None:
+    match = SUSPICIOUS_UNICODE_RE.search(text)
+    if match:
+        raise ValueError(
+            f"suspicious unicode U+{ord(match.group(0)):04X} detected after sanitizing {path.name}; "
+            "refusing to write potentially corrupted subtitle content"
+        )
+
+
+def parse_cues(text: str, min_duration_ms: int) -> tuple[list[Cue], int, int]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    cues: list[Cue] = []
+    dropped_empty_cues = 0
+    adjusted_durations = 0
+    index = 0
+
+    while index < len(lines):
+        current = lines[index]
+        if not current.strip():
+            index += 1
+            continue
+
+        if INDEX_RE.match(current) and index + 1 < len(lines) and TIMESTAMP_RE.match(lines[index + 1]):
+            index += 1
+            current = lines[index]
+
+        timestamp_match = TIMESTAMP_RE.match(current)
+        if not timestamp_match:
+            index += 1
+            continue
+
+        start_ms = parse_timestamp(timestamp_match.group("start"))
+        end_ms = parse_timestamp(timestamp_match.group("end"))
+        if end_ms <= start_ms:
+            end_ms = start_ms + min_duration_ms
+            adjusted_durations += 1
+
+        index += 1
+        cue_lines: list[str] = []
+
+        while index < len(lines):
+            candidate = lines[index]
+            if not candidate.strip():
+                index += 1
+                while index < len(lines) and not lines[index].strip():
+                    index += 1
+                break
+            if INDEX_RE.match(candidate) and index + 1 < len(lines) and TIMESTAMP_RE.match(lines[index + 1]):
+                break
+            if TIMESTAMP_RE.match(candidate):
+                break
+
+            cleaned = clean_text_line(candidate)
+            if cleaned:
+                cue_lines.append(cleaned)
+            index += 1
+
+        if not cue_lines:
+            dropped_empty_cues += 1
+            continue
+
+        cues.append(Cue(start_ms=start_ms, end_ms=end_ms, lines=cue_lines))
+
+    return cues, dropped_empty_cues, adjusted_durations
+
+
+def render_cues(cues: list[Cue]) -> str:
+    blocks: list[str] = []
+    for number, cue in enumerate(cues, start=1):
+        blocks.append(str(number))
+        blocks.append(f"{format_timestamp(cue.start_ms)} --> {format_timestamp(cue.end_ms)}")
+        blocks.extend(cue.lines)
+        blocks.append("")
+    return "\n".join(blocks).rstrip() + "\n"
+
+
+def sanitize_file(path: Path, min_duration_ms: int) -> SanitizedFile:
+    raw = path.read_bytes()
+    decoded = decode_subtitle(raw)
+    normalized_original = decoded.replace("\r\n", "\n").replace("\r", "\n")
+    cues, dropped_empty_cues, adjusted_durations = parse_cues(decoded, min_duration_ms)
+    if not cues:
+        raise ValueError("No subtitle cues could be parsed")
+
+    sanitized_text = render_cues(cues)
+    assert_no_suspicious_unicode(sanitized_text, path)
+    return SanitizedFile(
+        path=path,
+        original_text=normalized_original,
+        sanitized_text=sanitized_text,
+        cue_count=len(cues),
+        dropped_empty_cues=dropped_empty_cues,
+        adjusted_durations=adjusted_durations,
+    )
+
+
+def write_backup_file(target: Path) -> None:
+    backup_path = target.with_name(f"{target.stem}.subtitlebak")
+    shutil.copy2(target, backup_path)
+
+
+def write_file_atomically(target: Path, content: str) -> None:
+    target_stat = target.stat()
+    fd, temp_path_raw = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+        text=True,
+    )
+    temp_path = Path(temp_path_raw)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as temp_file:
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.chmod(temp_path, target_stat.st_mode)
+        if hasattr(os, "chown"):
+            os.chown(temp_path, target_stat.st_uid, target_stat.st_gid)
+
+        os.replace(temp_path, target)
+
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def matches_language_code(path: Path, language_code: str | None) -> bool:
+    if not language_code:
+        return True
+    suffix = f".{language_code.lower()}.srt"
+    return path.name.lower().endswith(suffix)
+
+
+def expand_paths(raw_paths: list[str], language_code: str | None) -> list[Path]:
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"{path} does not exist")
+        if path.is_dir():
+            paths.extend(
+                sorted(
+                    candidate
+                    for candidate in path.rglob("*.srt")
+                    if candidate.is_file() and matches_language_code(candidate, language_code)
+                )
+            )
+        else:
+            if matches_language_code(path, language_code):
+                paths.append(path)
+    return paths
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Rewrite SRT subtitles into a canonical, player-friendly format."
+    )
+    parser.add_argument("paths", nargs="+", help="Subtitle file or directory to sanitize")
+    parser.add_argument(
+        "--language-code",
+        help="Only process files ending in .<language-code>.srt, for example --language-code hu",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Report files that would change without writing them",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Write a .bak copy before overwriting a subtitle file",
+    )
+    parser.add_argument(
+        "--min-duration-ms",
+        type=int,
+        default=1000,
+        help="Minimum cue duration used when an end timestamp is missing or invalid",
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        targets = expand_paths(args.paths, args.language_code)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+
+    if not targets:
+        if args.language_code:
+            parser.error(f"No .{args.language_code}.srt files found")
+        parser.error("No .srt files found")
+
+    changed_files = 0
+    failed_files = 0
+
+    for target in targets:
+        try:
+            result = sanitize_file(target, args.min_duration_ms)
+            if result.changed:
+                changed_files += 1
+                if not args.check:
+                    if args.backup:
+                        write_backup_file(target)
+                    write_file_atomically(target, result.sanitized_text)
+
+            status = "would-fix" if args.check and result.changed else "fixed" if result.changed else "ok"
+            print(
+                f"{status}: {target} "
+                f"(cues={result.cue_count}, dropped_empty={result.dropped_empty_cues}, "
+                f"adjusted_durations={result.adjusted_durations})"
+            )
+        except PermissionError as exc:
+            failed_files += 1
+            print(
+                f"error: {target}: permission denied while writing subtitle files "
+                f"({exc}). Try running with sudo or fix the directory ownership.",
+                file=sys.stderr,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            failed_files += 1
+            print(f"error: {target}: {exc}", file=sys.stderr)
+            continue
+
+    if failed_files:
+        return 1
+    if args.check and changed_files:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

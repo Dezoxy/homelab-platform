@@ -1,0 +1,89 @@
+---
+- name: Validate Azure Arc onboarding variables
+  ansible.builtin.assert:
+    that:
+      - azure_arc_subscription_id | length > 0
+      - azure_arc_tenant_id | length > 0
+      - azure_arc_resource_group | length > 0
+      - azure_arc_location | length > 0
+      - azure_arc_service_principal_id | length > 0
+      - azure_arc_service_principal_secret | length > 0
+    quiet: true
+    fail_msg: >-
+      Missing Azure Arc onboarding variables. Export AZ_SUBSCRIPTION_ID,
+      AZ_TENANT_ID, AZ_RG, AZ_LOCATION, ARC_SP_ID, and ARC_SP_SECRET before
+      running this playbook.
+
+- name: Block unsupported Ubuntu versions
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == "Ubuntu"
+      - ansible_facts.distribution_version in azure_arc_supported_ubuntu_versions
+    fail_msg: >-
+      Check Azure Arc OS support before onboarding {{ inventory_hostname }}
+      running {{ ansible_facts.distribution | default('unknown') }}
+      {{ ansible_facts.distribution_version | default('unknown') }}. Supported
+      Ubuntu versions in this role: {{ azure_arc_supported_ubuntu_versions | join(', ') }}.
+
+- name: Download Azure Connected Machine agent installer
+  ansible.builtin.get_url:
+    url: "{{ azure_arc_install_script_url }}"
+    dest: "{{ azure_arc_install_script_path }}"
+    mode: "0755"
+  register: azure_arc_installer_download
+  retries: 5
+  delay: 10
+  until: azure_arc_installer_download is succeeded
+
+- name: Install Azure Connected Machine agent
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - "{{ azure_arc_install_script_path }}"
+  args:
+    creates: "{{ azure_arc_agent_binary_path }}"
+
+- name: Check current Azure Arc agent status
+  ansible.builtin.command:
+    argv:
+      - azcmagent
+      - show
+  register: azure_arc_status
+  changed_when: false
+  failed_when: false
+
+- name: Connect VM to Azure Arc
+  ansible.builtin.command:
+    argv:
+      - azcmagent
+      - connect
+      - --service-principal-id
+      - "{{ azure_arc_service_principal_id }}"
+      - --service-principal-secret
+      - "{{ azure_arc_service_principal_secret }}"
+      - --tenant-id
+      - "{{ azure_arc_tenant_id }}"
+      - --subscription-id
+      - "{{ azure_arc_subscription_id }}"
+      - --resource-group
+      - "{{ azure_arc_resource_group }}"
+      - --location
+      - "{{ azure_arc_location }}"
+      - --resource-name
+      - "{{ azure_arc_resource_name }}"
+      - --cloud
+      - "{{ azure_arc_cloud }}"
+      - --tags
+      - "{{ azure_arc_tags }}"
+  when: "'Connected' not in azure_arc_status.stdout"
+  changed_when: true
+  no_log: true
+
+- name: Verify Azure Arc agent status after onboarding
+  ansible.builtin.command:
+    argv:
+      - azcmagent
+      - show
+  register: azure_arc_verify_status
+  changed_when: false
+  failed_when: "'Connected' not in azure_arc_verify_status.stdout"

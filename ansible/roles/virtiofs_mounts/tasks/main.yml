@@ -1,0 +1,56 @@
+- name: Ensure VirtIO-FS mount root directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ virtiofs_mounts }}"
+
+- name: Assert, mount, and verify VirtIO-FS shares
+  when: not (virtiofs_skip_mount_check | default(false))
+  block:
+    - name: Assert VirtIO-FS mounts are configured
+      ansible.builtin.assert:
+        that:
+          - virtiofs_mounts is defined
+          - (virtiofs_mounts | length) > 0
+        fail_msg: "virtiofs_mounts is not configured; this host expects storage via VirtIO-FS from the Proxmox host."
+
+    - name: Mount VirtIO-FS shares from Proxmox host
+      ansible.posix.mount:
+        path: "{{ item.path }}"
+        src: "{{ item.tag }}"
+        fstype: virtiofs
+        opts: "{{ item.opts | default('defaults,' ~ fstab_timeout_opts) }}"
+        state: mounted
+      loop: "{{ virtiofs_mounts }}"
+
+    - name: Check storage mount targets
+      ansible.builtin.command:
+        argv: [findmnt, -n, -o, TARGET, -T, "{{ item.path }}"]
+      register: virtiofs_mount_targets
+      loop: "{{ virtiofs_mounts }}"
+      changed_when: false
+
+    - name: Fail when VirtIO-FS mount target is missing
+      ansible.builtin.fail:
+        msg: >-
+          Path {{ item.item.path }} resolves to "{{ item.stdout | trim }}" (expected "{{ item.item.path }}"),
+          which means the VirtIO-FS mount is missing.
+          Fix: ensure Proxmox Directory Mappings are attached and tags match virtiofs_mounts.
+      when: not (item.skipped | default(false)) and (item.stdout | trim) != item.item.path
+      loop: "{{ virtiofs_mount_targets.results }}"
+
+    - name: Check storage filesystem types
+      ansible.builtin.command:
+        argv: [findmnt, -n, -o, FSTYPE, -T, "{{ item.path }}"]
+      register: virtiofs_mount_fstypes
+      loop: "{{ virtiofs_mounts }}"
+      changed_when: false
+
+    - name: Fail when mount is not VirtIO-FS
+      ansible.builtin.fail:
+        msg: >-
+          Path {{ item.item.path }} is mounted as "{{ item.stdout | trim }}" (expected "virtiofs").
+          Fix: verify this VM is using VirtIO-FS (Directory Mappings).
+      when: not (item.skipped | default(false)) and (item.stdout | trim) != "virtiofs"
+      loop: "{{ virtiofs_mount_fstypes.results }}"

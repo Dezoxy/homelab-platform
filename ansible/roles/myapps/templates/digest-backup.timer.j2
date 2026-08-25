@@ -1,0 +1,15 @@
+# Daily state.db snapshot at 04:15 UTC -- deliberately offset from the
+# digest window runs (00/06/12/18 UTC grid + up to 10min randomized delay)
+# and the 20:30 Budapest daily brief, so the snapshot never races a run's
+# own writes (WAL makes that safe anyway; this just keeps the snapshot a
+# consistent quiet-hour cut).
+[Unit]
+Description=notification-digest state.db snapshot (timer)
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+Unit=digest-backup.service
+
+[Install]
+WantedBy=timers.target

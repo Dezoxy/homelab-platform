@@ -1,0 +1,30 @@
+---
+- name: Install gpg (required for keyring conversion)
+  ansible.builtin.apt:
+    name: gpg
+    state: present
+    update_cache: false
+
+- name: Download NodeSource GPG key (ASCII)
+  ansible.builtin.get_url:
+    url: "{{ node_gpg_url }}"
+    dest: "{{ node_keyring_asc }}"
+    mode: "0644"
+
+- name: Convert NodeSource GPG key to keyring
+  ansible.builtin.command:
+    cmd: "gpg --dearmor -o {{ node_keyring_path }} {{ node_keyring_asc }}"
+  args:
+    creates: "{{ node_keyring_path }}"
+
+- name: Add NodeSource apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by={{ node_keyring_path }}] {{ node_repo_url }} nodistro main"
+    filename: nodesource
+    state: present
+
+- name: Install Node.js
+  ansible.builtin.apt:
+    name: nodejs
+    state: present
+    update_cache: true

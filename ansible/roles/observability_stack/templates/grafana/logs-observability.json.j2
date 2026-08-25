@@ -1,0 +1,103 @@
+{
+  "annotations": { "list": [{ "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" }] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Observability Docker Warn/Error / 5m by Service (Noise-Filtered)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum by (compose_service) (count_over_time(({host=\"01-observability-lxc\",compose_service=~\"grafana|loki|prometheus|tempo|cadvisor|adguard-exporter\"} |~ \"(?i)\\\\b(warn|warning|error|eror|fatal|panic|critical)\\\\b\" != \"query=\" != \"context canceled\" != \"err=EOF\" != \"failed mapping AST\" != \"error calling scheduler\" != \"no jobs found\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Loki Query-Cancel Noise / 5m",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum(count_over_time(({host=\"01-observability-lxc\",compose_service=\"loki\"} |~ \"(?i)(failed mapping AST|context canceled|err=EOF|error notifying scheduler|error processing requests from scheduler)\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Grafana /api/ds/query 400 / 5m",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 7 },
+      "targets": [{ "expr": "sum(count_over_time(({host=\"01-observability-lxc\",compose_service=\"grafana\"} |= \"path=/api/ds/query\" |= \"status=400\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Loki Non-Cancel Warn/Error / 5m",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 7 },
+      "targets": [{ "expr": "sum(count_over_time(({host=\"01-observability-lxc\",compose_service=\"loki\"} |~ \"level=(warn|error)\" != \"query=\" != \"context canceled\" != \"err=EOF\" != \"failed mapping AST\")[5m]))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Observability Host Systemd Error-like / 5m by Unit",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 7 },
+      "targets": [{ "expr": "topk(20, sum by (unit) (count_over_time(({job=\"systemd-journal\",host=\"01-observability-lxc\",unit!=\"\"} |~ \"(?i)(error|fail|panic|fatal)\")[5m])))", "queryType": "range", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 6,
+      "type": "logs",
+      "title": "Observability Docker Warnings+Errors (Noise-Filtered)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 14 },
+      "targets": [{ "expr": "{host=\"01-observability-lxc\",compose_service=~\"grafana|loki|prometheus|tempo|cadvisor|adguard-exporter\"} |~ \"(?i)\\\\b(warn|warning|error|eror|fatal|panic|critical)\\\\b\" != \"query=\" != \"context canceled\" != \"err=EOF\" != \"failed mapping AST\" != \"error calling scheduler\" != \"no jobs found\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "Loki Query-Cancel Noise (For Tuning)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 14 },
+      "targets": [{ "expr": "{host=\"01-observability-lxc\",compose_service=\"loki\"} |~ \"(?i)(failed mapping AST|context canceled|err=EOF|error notifying scheduler|error processing requests from scheduler)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    },
+    {
+      "id": 8,
+      "type": "logs",
+      "title": "Grafana Datasource Query 400s",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 24 },
+      "targets": [{ "expr": "{host=\"01-observability-lxc\",compose_service=\"grafana\"} |= \"path=/api/ds/query\" |= \"status=400\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    },
+    {
+      "id": 9,
+      "type": "logs",
+      "title": "Observability Host Systemd Error-like Logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 24 },
+      "targets": [{ "expr": "{job=\"systemd-journal\",host=\"01-observability-lxc\"} |~ \"(?i)(error|fail|panic|fatal)\"", "queryType": "range", "refId": "A" }],
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["homelab", "logs", "observability", "provisioned"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "title": "Logs - Observability Stack",
+  "uid": "logs-observability",
+  "version": 1,
+  "weekStart": ""
+}

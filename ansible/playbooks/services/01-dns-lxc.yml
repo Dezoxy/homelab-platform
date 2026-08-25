@@ -1,0 +1,19 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+# DNS play runs before system updates: first boot can have resolv.conf pointing at itself.
+# Configuring AdGuard first fixes name resolution so updates can reach the internet.
+- name: Configure AdGuard Home in 01-dns-lxc
+  hosts: 01-dns-lxc
+  become: true
+  tasks:
+    - name: Deploy adguard_home role
+      ansible.builtin.import_role:
+        name: adguard_home
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml

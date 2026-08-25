@@ -1,0 +1,132 @@
+name: Platform / Deploy
+run-name: Platform / Deploy (${{ inputs.deployment_mode }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: "Deploy all hosts"
+        type: boolean
+        default: false
+      target_01_edge_lxc:
+        description: "01-edge-lxc"
+        type: boolean
+        default: false
+      target_01_dns_lxc:
+        description: "01-dns-lxc"
+        type: boolean
+        default: false
+      target_01_reverse_proxy_lxc:
+        description: "01-reverse-proxy-lxc"
+        type: boolean
+        default: false
+      target_01_torrent_lxc:
+        description: "01-torrent-lxc"
+        type: boolean
+        default: false
+      target_01_observability_lxc:
+        description: "01-observability-lxc"
+        type: boolean
+        default: false
+      target_01_backup_lxc:
+        description: "01-backup-lxc"
+        type: boolean
+        default: false
+      target_01_tailscale_lxc:
+        description: "01-tailscale-lxc"
+        type: boolean
+        default: false
+      target_01_media_vm:
+        description: "01-media-vm"
+        type: boolean
+        default: false
+      target_01_myapps_vm:
+        description: "01-myapps-vm"
+        type: boolean
+        default: false
+      # Inert until 01-unifi-vm is moved back into ALL_TARGETS in
+      # scripts/ci/targets.sh: the step below selects hosts by iterating that
+      # list, so ticking this alone fails with "Select at least one destination".
+      target_01_unifi_vm:
+        description: "01-unifi-vm (not provisioned yet)"
+        type: boolean
+        default: false
+      deployment_mode:
+        description: "Deployment mode (select explicitly)"
+        type: choice
+        default: Select deployment mode
+        options:
+          - Select deployment mode
+          - Full deploy
+          - Infrastructure only
+          - Configuration only
+      force_replace:
+        description: "Recreate infrastructure if needed (destructive)"
+        type: boolean
+        default: false
+
+jobs:
+  prepare-targets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.collect.outputs.targets }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: collect
+        shell: bash
+        env:
+          DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
+          DEPLOY_ALL: ${{ inputs.deploy_all }}
+          TARGET_01_EDGE_LXC: ${{ inputs.target_01_edge_lxc }}
+          TARGET_01_DNS_LXC: ${{ inputs.target_01_dns_lxc }}
+          TARGET_01_REVERSE_PROXY_LXC: ${{ inputs.target_01_reverse_proxy_lxc }}
+          TARGET_01_TORRENT_LXC: ${{ inputs.target_01_torrent_lxc }}
+          TARGET_01_OBSERVABILITY_LXC: ${{ inputs.target_01_observability_lxc }}
+          TARGET_01_BACKUP_LXC: ${{ inputs.target_01_backup_lxc }}
+          TARGET_01_TAILSCALE_LXC: ${{ inputs.target_01_tailscale_lxc }}
+          TARGET_01_MEDIA_VM: ${{ inputs.target_01_media_vm }}
+          TARGET_01_MYAPPS_VM: ${{ inputs.target_01_myapps_vm }}
+          TARGET_01_UNIFI_VM: ${{ inputs.target_01_unifi_vm }}
+        run: |
+          set -euo pipefail
+          if [[ "${DEPLOYMENT_MODE}" == "Select deployment mode" ]]; then
+            echo "Select an explicit deployment mode before starting this workflow." >&2
+            exit 1
+          fi
+
+          # shellcheck source=scripts/ci/targets.sh
+          source scripts/ci/targets.sh
+
+          targets=()
+          if [[ "${DEPLOY_ALL}" == "true" ]]; then
+            targets=("${ALL_TARGETS[@]}")
+          else
+            for t in "${ALL_TARGETS[@]}"; do
+              # Convention: 01-edge-lxc -> TARGET_01_EDGE_LXC
+              var="TARGET_$(printf '%s' "${t}" | tr '[:lower:]-' '[:upper:]_')"
+              [[ "${!var:-}" == "true" ]] && targets+=("${t}")
+            done
+          fi
+
+          if (( ${#targets[@]} == 0 )); then
+            echo "Select at least one destination, or enable Deploy all hosts." >&2
+            exit 1
+          fi
+
+          json_items=()
+          for t in "${targets[@]}"; do json_items+=("\"${t}\""); done
+          printf 'targets=[%s]\n' "$(IFS=,; echo "${json_items[*]}")" >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    needs: prepare-targets
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-reusable.yml
+    with:
+      targets: ${{ needs.prepare-targets.outputs.targets }}
+      deployment_mode: ${{ inputs.deployment_mode }}
+      force_replace: ${{ inputs.force_replace }}

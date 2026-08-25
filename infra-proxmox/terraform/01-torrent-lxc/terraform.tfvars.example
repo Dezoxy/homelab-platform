@@ -1,0 +1,40 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+qbittorrent_lxc_vmid       = 171
+qbittorrent_lxc_name       = "01-torrent-lxc"
+qbittorrent_lxc_ip_address = "192.168.1.71/24"
+qbittorrent_lxc_gateway    = "192.168.1.1"
+qbittorrent_lxc_username   = "toomhorvath"
+
+# Staging SSD mount for incomplete downloads (mounted into the LXC at /srv/torrent-staging,
+# so /srv/torrent-staging/incomplete is on the SSD).
+# Bind mount: set qbittorrent_staging_mount_volume to a host path (requires root@pam auth) and set size = null.
+# Example host path: /srv/staging-ssd/torrent-staging
+qbittorrent_staging_mount_volume = "/srv/staging-ssd/torrent-staging"
+qbittorrent_staging_mount_size   = null
+qbittorrent_staging_mount_path   = "/srv/torrent-staging"
+
+# Volume mount example (storage-backed virtual disk):
+# qbittorrent_staging_mount_volume = "staging-ssd"
+# qbittorrent_staging_mount_size   = "200G"
+# qbittorrent_staging_mount_path   = "/srv/torrent-staging"
+
+# Bind mounts from the Proxmox host (no NFS inside the container).
+qbittorrent_appdata_mount_volume   = "/srv/appdata/qbittorrent"
+qbittorrent_appdata_mount_path     = "/srv/appdata/qbittorrent"
+qbittorrent_downloads_mount_volume = "/srv/media/downloads"
+qbittorrent_downloads_mount_path   = "/srv/media/downloads"
+
+# Optional: cap torrent traffic at the Proxmox NIC level (MB/s).
+# qbittorrent_lxc_rate_limit_mb_s = 10
+
+# Bind mounts are simplest with a privileged LXC. You can experiment with unprivileged,
+# but make sure UID/GID mapping lines up with the host filesystem ownership.
+# qbittorrent_lxc_unprivileged = false

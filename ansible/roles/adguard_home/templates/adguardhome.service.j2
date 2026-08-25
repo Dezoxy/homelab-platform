@@ -1,0 +1,12 @@
+[Unit]
+Description=AdGuard Home
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{ adguard_bin_path }} -s run --config {{ adguardhome_config_dir }}/AdGuardHome.yaml --work-dir {{ adguardhome_work_dir }}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

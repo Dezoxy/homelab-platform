@@ -1,0 +1,8 @@
+# Long-lived SSH root of trust for Proxmox-attested guest deployment.
+# This key is non-secret. Update only after out-of-band fingerprint verification:
+#   scripts/setup/enroll-ssh-host-key.sh --verified '<SHA256:fingerprint>' pve
+#
+# Guest host keys are generated into a temporary known_hosts file by asking
+# this pinned Proxmox host for each VM/LXC key at runtime.
+# pve 192.168.1.239 SHA256:cBugmS1PK8DpX1sipMP6y7Agx6QDvDbpTWZ+NtR6FVM
+192.168.1.239 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOVSYbHtEgP3bqVNapzqU/w0CGcNKMFUI5BVVmNhMqYH

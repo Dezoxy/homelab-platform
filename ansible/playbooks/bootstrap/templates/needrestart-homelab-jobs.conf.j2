@@ -1,0 +1,23 @@
+# Managed by Ansible (playbooks/bootstrap/00-system-updates.yml).
+# Local edits are overwritten on the next deploy.
+#
+# Stops needrestart from restarting unattended job units out of their schedule
+# when apt's DPkg::Post-Invoke hook fires. See needrestart_never_restart_units
+# in ansible/group_vars/all.yml for the incident this came from and why daemons
+# are deliberately left alone.
+#
+# MERGED, not assigned. needrestart slurps every conf.d file and eval()s it
+# (see the loop at the end of /etc/needrestart/needrestart.conf), so a bare
+# `$nrconf{override_rc} = {...}` would REPLACE the hash and silently drop the
+# entries the package ships for dbus and the display managers -- the exact
+# services whose auto-restart takes a desktop or the system bus down with it.
+# The %{...} spread below keeps them and adds ours on top.
+#
+# A syntax error here is fatal: needrestart dies with "Error parsing", which
+# takes the apt hook -- and therefore every upgrade on this host -- with it.
+$nrconf{override_rc} = {
+    %{ $nrconf{override_rc} // {} },
+{% for unit_re in needrestart_never_restart_units %}
+    qr({{ unit_re }}) => 0,
+{% endfor %}
+};

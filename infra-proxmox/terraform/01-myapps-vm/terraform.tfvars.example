@@ -1,0 +1,28 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id     = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+# Clone source — Ubuntu 26.04 base template (resolved from catalog at deploy).
+template_vmid = 901
+
+vmid       = 151
+name       = "01-myapps-vm"
+ip_address = "192.168.1.72/24"
+ip_gateway = "192.168.1.1"
+
+# Sized for netcheck plus heavier local apps such as T3MP3ST full arsenal.
+cores                = 4
+memory_mb            = 8192
+memory_ballooning_mb = 4096
+disk_gb              = 120
+
+# bootstrap_password is required (set via terraform.tfvars or export TF_VAR_bootstrap_password)
+# bootstrap_password = "REPLACE_ME"
+
+# Optional admin public key (defaults to keys/toomhorvath.pub)
+# admin_pubkey = "ssh-ed25519 AAAA..."

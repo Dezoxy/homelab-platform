@@ -1,0 +1,14 @@
+[Unit]
+Description=notification-digest overnight (no Telegram ping) (timer)
+
+[Timer]
+# One slot carved out of the same 6-hourly UTC grid digest.timer runs on --
+# the firing INSTANT is unchanged from when all four slots shared one timer;
+# only what this run publishes differs.
+OnCalendar={{ myapps_digest_overnight_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_digest_randomized_delay_sec }}
+Unit=digest-overnight.service
+
+[Install]
+WantedBy=timers.target

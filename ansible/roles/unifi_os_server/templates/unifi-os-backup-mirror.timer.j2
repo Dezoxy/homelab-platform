@@ -1,0 +1,10 @@
+# Managed by Ansible -- roles/unifi_os_server/templates/
+[Unit]
+Description=Periodic mirror of UniFi OS Server auto-backups
+
+[Timer]
+OnCalendar={{ unifi_os_backup_mirror_oncalendar }}
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,265 @@
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install node exporter and dependencies
+  ansible.builtin.apt:
+    name:
+      - prometheus-node-exporter
+      - unzip
+    state: present
+
+- name: Ensure node exporter textfile directory exists
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_directory }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install node exporter args file
+  ansible.builtin.copy:
+    dest: "{{ node_exporter_args_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible.
+      ARGS="{{ node_exporter_args }}"
+  notify: Restart node exporter
+
+- name: Ensure node exporter service is enabled and running
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    enabled: true
+    state: started
+  when: observability_manage_services | bool
+
+- name: Create Alloy directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ alloy_install_dir }}"
+      mode: "0755"
+    - path: "{{ alloy_config_dir }}"
+      mode: "0755"
+    - path: "{{ alloy_storage_path }}"
+      mode: "0755"
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+  when: observability_manage_services | bool
+
+- name: Stop legacy Promtail service
+  ansible.builtin.systemd:
+    name: promtail
+    enabled: false
+    state: stopped
+    daemon_reload: true
+  when: observability_manage_services | bool and 'promtail.service' in (ansible_facts.services | default({}))
+
+- name: Remove legacy Promtail unit file
+  ansible.builtin.file:
+    path: /etc/systemd/system/promtail.service
+    state: absent
+
+- name: Remove legacy Promtail binary
+  ansible.builtin.file:
+    path: /usr/local/bin/promtail
+    state: absent
+
+- name: Remove legacy Promtail install directory
+  ansible.builtin.file:
+    path: "{{ legacy_promtail_install_dir }}"
+    state: absent
+
+- name: Remove legacy Promtail config directory
+  ansible.builtin.file:
+    path: "{{ legacy_promtail_config_dir }}"
+    state: absent
+
+# check_mode: false because this is read-only AND check mode needs the answer.
+# command modules skip by default under --check, which left the guard below
+# evaluating against a skipped register: the block ran anyway, get_url reported
+# "changed" without writing a file, and unarchive then failed on an archive that
+# was never created. That aborted every `make deploy-check` on a host whose
+# Alloy version differed from the pin.
+- name: Check installed Alloy version
+  ansible.builtin.command:
+    cmd: alloy --version
+  register: alloy_installed_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Check mode still reports the pending upgrade -- skipping the work silently
+# would make a dry run look clean on a host that is about to change.
+- name: Report the pending Alloy install without performing it
+  ansible.builtin.debug:
+    msg: >-
+      Alloy {{ alloy_version }} would be installed
+      (currently: {{ (alloy_installed_version.stdout | default('') | trim | truncate(60))
+                     or 'not installed' }}).
+      Skipped: check mode cannot download the archive it would unpack.
+  when:
+    - ansible_check_mode
+    - alloy_installed_version.rc != 0 or alloy_version not in alloy_installed_version.stdout
+
+- name: Download, unpack, and install Alloy {{ alloy_version }}
+  when:
+    - not ansible_check_mode
+    - alloy_installed_version.rc != 0 or alloy_version not in alloy_installed_version.stdout
+  block:
+    - name: Download Alloy archive
+      ansible.builtin.get_url:
+        url: "{{ alloy_download_url }}"
+        dest: "{{ alloy_archive_path }}"
+        mode: "0644"
+      register: alloy_download_result
+      retries: 5
+      delay: 10
+      until: alloy_download_result is succeeded
+
+    - name: Unpack Alloy archive
+      ansible.builtin.unarchive:
+        src: "{{ alloy_archive_path }}"
+        dest: "{{ alloy_install_dir }}"
+        remote_src: true
+
+    - name: Install Alloy binary from staging directory
+      ansible.builtin.command:
+        argv:
+          - mv
+          - -f
+          - "{{ alloy_install_dir }}/alloy-linux-{{ alloy_arch }}"
+          - /usr/local/bin/alloy
+      notify: Restart alloy
+
+    - name: Ensure Alloy binary is executable
+      ansible.builtin.file:
+        path: /usr/local/bin/alloy
+        mode: "0755"
+        state: file
+
+    - name: Remove downloaded Alloy archive
+      ansible.builtin.file:
+        path: "{{ alloy_archive_path }}"
+        state: absent
+
+    - name: Remove unpacked Alloy binary from staging directory
+      ansible.builtin.file:
+        path: "{{ alloy_install_dir }}/alloy-linux-{{ alloy_arch }}"
+        state: absent
+
+- name: Install Alloy config
+  ansible.builtin.template:
+    src: alloy-config.alloy.j2
+    dest: "{{ alloy_config_path }}"
+    mode: "0644"
+  notify: Restart alloy
+
+- name: Install Alloy systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/alloy.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Grafana Alloy log collector
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory={{ alloy_storage_path }}
+      ExecStart=/usr/local/bin/alloy run --storage.path={{ alloy_storage_path }} {{ alloy_config_path }}
+      ExecReload=/usr/bin/env kill -HUP $MAINPID
+      Restart=on-failure
+      RestartSec=5s
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart alloy
+
+- name: Enable and start Alloy
+  ansible.builtin.systemd:
+    name: alloy
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: observability_manage_services | bool
+
+- name: Install cAdvisor systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/cadvisor.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=cAdvisor (container metrics)
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Restart=always
+      RestartSec=5
+      ExecStartPre=-/usr/bin/docker rm -f cadvisor
+      ExecStart=/usr/bin/docker run --name=cadvisor --detach=false \
+        --security-opt apparmor=unconfined \
+        --volume=/:/rootfs:ro \
+        --volume=/var/run:/var/run:rw \
+        --volume=/sys:/sys:ro \
+        --volume=/var/lib/docker/:/var/lib/docker:ro \
+        --publish=18080:8080 \
+        {{ cadvisor_image }} \
+        --store_container_labels=true
+      ExecStop=/usr/bin/docker stop cadvisor
+
+      [Install]
+      WantedBy=multi-user.target
+  register: cadvisor_unit_copy
+  when: observability_cadvisor_enabled | bool
+
+- name: Enable and start cAdvisor
+  ansible.builtin.systemd:
+    name: cadvisor
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - observability_manage_services | bool
+    - observability_cadvisor_enabled | bool
+
+- name: Inspect running cAdvisor image
+  ansible.builtin.shell: >-
+    docker inspect cadvisor --format {% raw %}'{{.Config.Image}}'{% endraw %} 2>/dev/null || true
+  register: cadvisor_running_image
+  changed_when: false
+  failed_when: false
+  when: observability_cadvisor_enabled | bool
+
+- name: Restart cAdvisor when unit changed or image mismatched
+  ansible.builtin.systemd:
+    name: cadvisor
+    state: restarted
+  when: >-
+    (observability_manage_services | bool)
+    and (observability_cadvisor_enabled | bool)
+    and ((cadvisor_unit_copy.changed | default(false))
+         or ((cadvisor_running_image.stdout | trim) != cadvisor_image))
+
+- name: Wait for cAdvisor metrics endpoint
+  ansible.builtin.uri:
+    url: http://127.0.0.1:18080/metrics
+    method: GET
+    status_code: 200
+    return_content: false
+  register: cadvisor_metrics_ready
+  changed_when: false
+  retries: 24
+  delay: 5
+  until: cadvisor_metrics_ready.status == 200
+  when:
+    - observability_manage_services | bool
+    - observability_cadvisor_enabled | bool

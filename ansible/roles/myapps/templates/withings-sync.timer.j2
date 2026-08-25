@@ -1,0 +1,11 @@
+[Unit]
+Description=withings-sync (timer)
+
+[Timer]
+OnCalendar={{ myapps_withings_sync_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ myapps_withings_sync_randomized_delay_sec }}
+Unit=withings-sync.service
+
+[Install]
+WantedBy=timers.target

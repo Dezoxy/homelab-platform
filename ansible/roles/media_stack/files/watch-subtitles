@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+delay_seconds="${SANITIZE_DELAY_SECONDS:-30}"
+sanitize_bin="${SANITIZE_SRT_BIN:-/usr/local/bin/sanitize-srt}"
+inotifywait_bin="${INOTIFYWAIT_BIN:-/usr/bin/inotifywait}"
+sanitize_backup="${SANITIZE_BACKUP:-true}"
+sanitize_language_code="${SANITIZE_LANGUAGE_CODE:-}"
+self_event_ignore_seconds="${SANITIZE_SELF_EVENT_IGNORE_SECONDS:-10}"
+
+if ! [[ "$delay_seconds" =~ ^[0-9]+$ ]] || [[ "$delay_seconds" -lt 1 ]]; then
+  echo "SANITIZE_DELAY_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+
+if ! [[ "$self_event_ignore_seconds" =~ ^[0-9]+$ ]]; then
+  echo "SANITIZE_SELF_EVENT_IGNORE_SECONDS must be a non-negative integer" >&2
+  exit 1
+fi
+
+if ! command -v "$inotifywait_bin" >/dev/null 2>&1; then
+  echo "inotifywait is required but not installed" >&2
+  exit 1
+fi
+
+if [[ ! -x "$sanitize_bin" ]]; then
+  echo "$sanitize_bin is required but not installed" >&2
+  exit 1
+fi
+
+case "$sanitize_backup" in
+  true|false) ;;
+  *)
+    echo "SANITIZE_BACKUP must be true or false" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "$sanitize_language_code" ]] && ! [[ "$sanitize_language_code" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "SANITIZE_LANGUAGE_CODE contains unsupported characters" >&2
+  exit 1
+fi
+
+roots=()
+for candidate in "$@"; do
+  if [[ -d "$candidate" ]]; then
+    roots+=("$candidate")
+  fi
+done
+
+if [[ ${#roots[@]} -eq 0 ]]; then
+  echo "No existing subtitle watch roots were provided" >&2
+  exit 1
+fi
+
+echo "Watching subtitle roots: ${roots[*]} (debounce=${delay_seconds}s)"
+
+declare -A pending_files=()
+declare -A recently_sanitized_files=()
+
+matches_language_code() {
+  local file_lower suffix
+  if [[ -z "$sanitize_language_code" ]]; then
+    return 0
+  fi
+
+  file_lower="${1,,}"
+  suffix=".${sanitize_language_code,,}.srt"
+  [[ "$file_lower" == *"$suffix" ]]
+}
+
+queue_file() {
+  local file="$1"
+  local now
+
+  now="$(date +%s)"
+
+  [[ "$file" == *.srt ]] || return 0
+  [[ -f "$file" ]] || return 0
+  [[ "$file" != *.bak ]] || return 0
+  [[ "$file" != *.subtitlebak ]] || return 0
+  matches_language_code "$file" || return 0
+
+  if [[ -n "${recently_sanitized_files[$file]:-}" ]] && (( now < recently_sanitized_files["$file"] )); then
+    echo "Ignoring self-triggered subtitle event: $file"
+    return 0
+  fi
+
+  pending_files["$file"]="$(( now + delay_seconds ))"
+  echo "Queued subtitle sanitize after ${delay_seconds}s quiet period: $file"
+}
+
+sanitize_due_files() {
+  local current_time
+  current_time="$(date +%s)"
+
+  for file in "${!pending_files[@]}"; do
+    if (( current_time < pending_files["$file"] )); then
+      continue
+    fi
+
+    unset 'pending_files[$file]'
+
+    if [[ ! -f "$file" ]]; then
+      echo "Skipped vanished subtitle: $file"
+      continue
+    fi
+
+    echo "Sanitizing subtitle after ${delay_seconds}s quiet period: $file"
+    if [[ "$sanitize_backup" == "true" ]]; then
+      "$sanitize_bin" --backup "$file"
+    else
+      "$sanitize_bin" "$file"
+    fi
+
+    if [[ "$?" -eq 0 ]] && (( self_event_ignore_seconds > 0 )); then
+      recently_sanitized_files["$file"]="$(( current_time + self_event_ignore_seconds ))"
+    fi
+  done
+}
+
+prune_recently_sanitized_files() {
+  local current_time file
+  current_time="$(date +%s)"
+
+  for file in "${!recently_sanitized_files[@]}"; do
+    if (( current_time >= recently_sanitized_files["$file"] )); then
+      unset 'recently_sanitized_files[$file]'
+    fi
+  done
+}
+
+event_pipe="$(mktemp -u)"
+mkfifo "$event_pipe"
+
+"$inotifywait_bin" \
+  --monitor \
+  --recursive \
+  --event close_write,moved_to \
+  --format '%w%f' \
+  --includei '\.srt$' \
+  "${roots[@]}" >"$event_pipe" &
+monitor_pid=$!
+
+exec 3<"$event_pipe"
+
+trap 'kill "${monitor_pid:-0}" 2>/dev/null || true; exec 3<&-; rm -f "$event_pipe"' EXIT
+
+while true; do
+  if IFS= read -r -t 1 changed_file <&3; then
+    queue_file "$changed_file"
+    sanitize_due_files
+    continue
+  fi
+
+  sanitize_due_files
+  prune_recently_sanitized_files
+
+  if ! kill -0 "${monitor_pid}" 2>/dev/null; then
+    echo "inotify monitor exited unexpectedly" >&2
+    exit 1
+  fi
+done

@@ -1,0 +1,1296 @@
+---
+# --- General ---
+myapps_user: toomhorvath
+
+# --- Compose ---
+myapps_compose_dir: /opt/myapps
+
+# --- netcheck (https://github.com/Dezoxy/netcheck) ---
+# Single static Go binary with the React UI embedded; serves UI + API on :8787.
+# Pin an exact version. To update: bump the tag, then redeploy — the compose
+# file changes, the systemd unit restarts, and `docker compose up -d` pulls the
+# new tag and recreates the container.
+myapps_netcheck_enabled: true
+myapps_netcheck_image: "ghcr.io/dezoxy/netcheck:2.9.0"
+myapps_netcheck_port: 8787
+
+# --- Chromium (persistent-profile browser for one-time interactive logins) ---
+# Since 2026-08-07 the only session that still matters here is LinkedIn: the
+# jobs-dashboard browse step was cut to the LinkedIn alerts feed alone when
+# the three portal saved-jobs lists were retired (they had produced 0, 7 and
+# 0 new saves in nine days). Any Profession.hu / No Fluff Jobs cookies still
+# sitting in the profile below are now dead weight -- sign out of those two
+# in the Chromium UI to shrink what an agent driving this browser can reach.
+# Phase 2a: the browser + its Traefik route only. A LATER change attaches a
+# Playwright MCP server to the CDP port below and builds the automation that
+# drives it -- not part of this change.
+# lscr.io/linuxserver/chromium serves a browser-accessible remote-desktop UI
+# (Selkies-based -- no separate VNC client needed) on container port :3000
+# (HTTP) / :3001 (HTTPS), per https://docs.linuxserver.io/images/docker-chromium/
+# (fetched 2026-07-30). Unlike prowlarr/radarr/etc in media_stack, this image
+# ships no app-version tags -- only <commit>-ls<build> build tags -- so it's
+# pinned to the newest one (verified via the Docker Hub API, 2026-07-30)
+# instead of a semver release.
+myapps_chromium_enabled: false
+myapps_chromium_image: "lscr.io/linuxserver/chromium:e2e1ec9c-ls47"
+# Host port for the container's :3000 (HTTP) UI port -- :3001/HTTPS is unused
+# here since Cloudflare Tunnel + Access already terminate public TLS, mirroring
+# how netcheck/T3MP3ST are reached over plain HTTP internally. Verified free
+# on 01-myapps-vm: not netcheck's 8787, not T3MP3ST's 3333, and not the
+# cadvisor scrape port 18080 that observability_agent publishes on every host
+# including this one.
+myapps_chromium_port: 3990
+# Persistent Chromium profile (cookies, logins) -- LOCAL disk under
+# /srv/appdata, deliberately OUTSIDE anything restic_backup ships offsite:
+# it holds a live LinkedIn session cookie (plus whatever Profession.hu / No
+# Fluff Jobs cookies predate the 2026-08-07 retirement and have not been
+# signed out yet), and those must never leave this host.
+myapps_chromium_profile_dir: /srv/appdata/chromium
+myapps_chromium_timezone: Europe/Budapest
+# The image's baseimage-selkies entrypoint chowns /config to PUID:PGID at
+# startup; the role's directory task below pins the host side to match.
+myapps_chromium_puid: 1000
+myapps_chromium_pgid: 1000
+# HTTP Basic auth in front of the UI -- a second factor behind Cloudflare
+# Access, per CUSTOM_USER/PASSWORD (documented at the docs URL above).
+# Username isn't a secret; defaults to the same account as the rest of
+# myapps. The password is a secret -- see myapps_chromium_ui_password below.
+myapps_chromium_ui_user: "{{ myapps_user }}"
+# Secret: leave blank here and set via the chromium-ui-password Key Vault
+# secret, resolved through myapps_chromium_ui_password_effective (falls back
+# to lookup('env', 'CHROMIUM_UI_PASSWORD') -- see ansible/playbooks/services/
+# 01-myapps-vm.yml), mirroring how the digest secrets below are wired.
+myapps_chromium_ui_password: ""
+# Desktop-sized virtual display/viewport, single-sourced here and reused by
+# three places that must never drift apart: the --window-size flag folded
+# into CHROME_CLI below, the SELKIES_MANUAL_WIDTH/HEIGHT env vars in
+# chromium.env.j2, and playwright-mcp's --viewport-size
+# (myapps_playwright_mcp_viewport_size, further below).
+#
+# WHY THIS EXISTS: this image's Selkies-based virtual display comes up
+# phone-sized (measured live: window.innerWidth=500, window.innerHeight=540,
+# screen 392x664) when nothing has ever attached a VNC/Selkies client to set
+# it -- exactly the case for an unattended CDP-only automation client like
+# playwright-mcp. That phone-sized viewport isn't merely cosmetic: it made
+# nofluffjobs.com's SPA fail to render at all (empty document.body.innerText,
+# 27 console errors, only a bare navbar) even though the session was
+# genuinely logged in (nfj_session/nfj_token/nfj_user cookies present, no
+# login redirect) -- the automation misread that as "logged out". Do not
+# remove these flags as unnecessary without re-testing against a real,
+# JS-heavy site: a too-small viewport silently corrupts data collection
+# instead of failing loudly.
+myapps_chromium_display_width: 1920
+myapps_chromium_display_height: 1080
+# CHROME_CLI passes extra Chromium CLI flags through the image (documented at
+# the URL above). --remote-debugging-port=9222 enables CDP for a LATER
+# Playwright MCP attach (see the Phase 2a note above) -- Chrome binds this to
+# 127.0.0.1 by default, and the compose service deliberately never publishes
+# 9222 in `ports:`, so it stays reachable only from inside this container's
+# own network namespace, never from the host or the network. --window-size
+# sets Chrome's own browser window to a desktop size (see the phone-sized
+# viewport note above) -- this alone is NOT sufficient on this image, since
+# the virtual display Chrome runs inside can still be phone-sized regardless
+# of the window's requested size; see SELKIES_MANUAL_WIDTH/HEIGHT in
+# chromium.env.j2 for the layer that actually fixes that.
+myapps_chromium_chrome_cli: >-
+  --remote-debugging-port=9222
+  --window-size={{ myapps_chromium_display_width }},{{ myapps_chromium_display_height }}
+
+# --- Playwright MCP (attaches to the running chromium container over CDP,
+# so jobs-refresh's Claude CLI can drive that already-logged-in browser) ---
+# Phase 2b: this service + wiring only. The browse step itself (what
+# refresh-run.sh does with the browser tools) is written in the
+# jobs-dashboard repo against the JOBS_REFRESH_MCP_CONFIG /
+# JOBS_REFRESH_BROWSER_ENABLED contract below -- not part of this change.
+# Two processes cannot share one Chrome profile directory (Chrome locks it),
+# so this MUST attach to chromium's already-running browser over CDP --
+# never launch its own browser against myapps_chromium_profile_dir.
+myapps_playwright_mcp_enabled: false
+# mcr.microsoft.com/playwright/mcp, the official image. Pinned to a release
+# tag (never `latest`) -- v0.0.78 verified present via the MCR registry API
+# (`curl -s https://mcr.microsoft.com/v2/playwright/mcp/tags/list`, fetched
+# 2026-07-30 -- it was the newest of the listed tags at that time), with its
+# manifest digest confirmed via `curl -sI -H "Accept:
+# application/vnd.docker.distribution.manifest.v2+json"
+# https://mcr.microsoft.com/v2/playwright/mcp/manifests/v0.0.78` ->
+# sha256:3d871c22ea2d4cca0966e2cfb1860e1cb03eb7353725a3d6cffd133296fb04eb.
+myapps_playwright_mcp_image: "mcr.microsoft.com/playwright/mcp:v0.0.79"
+# Port playwright-mcp's HTTP/SSE transport listens on. This container joins
+# chromium's network namespace (network_mode: "service:chromium" in the
+# compose template -- required because the CDP port it attaches to is
+# loopback-only inside that namespace), so it cannot publish its own
+# `ports:` -- whatever it binds appears on the chromium container's address
+# instead. 8931 is free there: chromium itself only uses :3000 (web UI,
+# published as myapps_chromium_port), :3001 (HTTPS, unused), and :9222 (CDP,
+# loopback-only, see myapps_chromium_chrome_cli). 8931 is also playwright-mcp
+# upstream's own documented example port for this flag, per its README's
+# Docker usage example (fetched 2026-07-30).
+myapps_playwright_mcp_port: 8931
+# CDP endpoint playwright-mcp attaches to. "localhost" resolves inside
+# chromium's own network namespace (shared via network_mode above), where
+# chromium's CHROME_CLI (myapps_chromium_chrome_cli) already binds 9222.
+myapps_playwright_mcp_cdp_endpoint: "http://localhost:9222"
+# playwright-mcp's DNS-rebinding protection (its --allowed-hosts flag):
+# by default it only accepts requests whose Host header matches the host it
+# was bound to. Because this container is reached from jobs-refresh under
+# the `chromium` service name (network_mode: "service:chromium" makes it
+# answer on chromium's address, not its own -- see myapps_playwright_mcp_port
+# above), that default rejects jobs-refresh with HTTP 403 even though
+# `--host 0.0.0.0` made it listen everywhere: listening and accepting are
+# separate checks.
+#
+# EMPIRICAL FINDING (live on 01-myapps-vm, tested by sending the same
+# request to http://chromium:8931/mcp from jobs-refresh with three different
+# Host headers): the check matches the RAW Host header verbatim, port
+# included whenever the client sends one -- NOT the bare hostname the
+# README's wording ("comma-separated list of hosts") suggests.
+#   Host: localhost       -> HTTP 400 (accepted; reached the MCP handler)
+#   Host: chromium        -> HTTP 400 (accepted)
+#   Host: chromium:8931   -> HTTP 403 (REJECTED)
+# chromium:8931 is exactly what an ordinary HTTP client -- including the
+# Claude CLI -- sends by default for http://chromium:8931/..., so the
+# port-qualified form is the one that actually matters; bare hostnames
+# alone are NOT sufficient despite how the README reads. Do not
+# "simplify" this back to bare hostnames without re-testing against a real
+# client -- that regresses to a 403.
+# {{ myapps_playwright_mcp_port }} is interpolated from the port var above
+# (never hardcoded a second time) so the two can't drift apart. Both
+# port-qualified and bare forms are listed for both hostnames: the
+# port-qualified ones are what's proven necessary; the bare ones are kept
+# too since they're already proven to work and cost nothing, covering any
+# client that happens to omit the port. Deliberately not "*" (which
+# disables the check entirely) -- the specific-form list works.
+myapps_playwright_mcp_allowed_hosts: >-
+  chromium:{{ myapps_playwright_mcp_port }},localhost:{{ myapps_playwright_mcp_port }},chromium,localhost
+# playwright-mcp's --blocked-origins: origins the driven browser is refused.
+# SEMICOLON-separated, unlike --allowed-hosts directly above it, which is
+# comma-separated -- the two sit side by side in the same compose `command:`
+# block, so do not copy one's separator onto the other.
+#
+# Purpose: enforce the 2026-08-07 retirement of the three portal saved-jobs
+# lists. The browse step's instructions (jobs-dashboard docs/refresh-task.md)
+# already tell it to visit LinkedIn only; this makes a regression fail loudly
+# at the browser instead of silently re-scraping a retired source.
+#
+# WHY A BLOCKLIST AND NOT AN ALLOWLIST. --allowed-origins looks like the
+# tighter choice and was rejected on a hard constraint: per playwright-mcp's
+# own config.d.ts, wildcards are supported for the PORT only ("http://
+# localhost:*"), never the hostname -- every host must be listed in full.
+# LinkedIn serves assets from several licdn.com subdomains, so an allowlist
+# means enumerating them exactly and having the page silently fail to render
+# the moment one is missed. That is precisely the failure that produced a
+# false "logged out" reading for No Fluff Jobs and discarded 387 good rows
+# (see jobs-dashboard README.md's auth tri-state section). A blocklist names
+# only what is already retired and cannot break what still works.
+#
+# Note upstream's own caveat: these flags "do not serve as a security
+# boundary and do not affect redirects". Treat this as regression-proofing
+# for a decision already made, NOT as a containment measure for an agent
+# parsing hostile pages -- that job belongs to the container boundary.
+#
+# UNVERIFIED OVER CDP: playwright-mcp's docs do not state whether the origin
+# flags apply when attached via --cdp-endpoint (this service's only mode)
+# rather than to a browser it launched itself -- the same open question
+# already recorded for --viewport-size below. Costs nothing if ignored;
+# confirm on the next run by checking the browse step still returns LinkedIn
+# rows normally. Set to "" to disable entirely.
+myapps_playwright_mcp_blocked_origins: >-
+  https://www.profession.hu;https://profession.hu;https://nofluffjobs.com;https://www.nofluffjobs.com
+# playwright-mcp's --viewport-size ("specify browser viewport size in
+# pixels, for example \"1280x720\""), format WIDTHxHEIGHT -- derived from
+# the same myapps_chromium_display_width/height as chromium's own
+# --window-size and SELKIES_MANUAL_WIDTH/HEIGHT (see the comment above
+# myapps_chromium_chrome_cli for WHY: a phone-sized viewport made a real
+# site fail to render and produced a false "logged out" reading), so all
+# three can never drift out of sync.
+#
+# UNVERIFIED CAVEAT: playwright-mcp's README does not state whether
+# --viewport-size has any effect when connecting to an existing browser via
+# --cdp-endpoint (this service's whole mode of operation -- see
+# myapps_playwright_mcp_cdp_endpoint above) rather than launching its own
+# browser; it reads like a launch-time option and may simply be ignored for
+# CDP connections. Set anyway -- it costs nothing if ignored, since the
+# actual fix for the CDP-attached case is the chromium-side display/window
+# sizing above -- but its effect (if any) over CDP has NOT been confirmed
+# by testing. Re-measure the real viewport after deploying this and adjust
+# here if it turns out to do nothing.
+myapps_playwright_mcp_viewport_size: "{{ myapps_chromium_display_width }}x{{ myapps_chromium_display_height }}"
+
+# --- notification-digest (Telegram/X digest summarizer + emailer) ---
+# One-shot container run on a schedule via `docker compose run --rm digest`;
+# it is never part of `docker compose up -d` (see profiles: ["oneshot"] in the
+# compose template). A systemd timer triggers digest.service, which runs it.
+# Flip to true after the Key Vault secrets exist (digest-tg-api-id,
+# digest-tg-api-hash, digest-tg-session, digest-x-cookies, digest-smtp-user,
+# digest-smtp-password) — keeping it false keeps other myapps deploys working
+# while those secrets are absent.
+myapps_digest_enabled: false
+# First release tag lands after the app repo's packaging PR merges and v0.1.0
+# is tagged; Renovate bumps thereafter.
+myapps_digest_image: "ghcr.io/dezoxy/notification-digest:0.21.2"
+# read:packages PAT for pulling the PRIVATE ghcr.io/dezoxy/notification-digest
+# package (unlike netcheck, whose repo is public and needs no auth). Blank
+# here; resolved from the digest-ghcr-pull-token Key Vault secret via the
+# playbook's _effective pattern.
+myapps_digest_ghcr_pull_token: ""
+myapps_digest_state_dir: /srv/appdata/digest
+myapps_digest_archive_dir: "{{ myapps_digest_state_dir }}/archive"
+myapps_digest_claude_home_dir: "{{ myapps_digest_state_dir }}/claude-home"
+# Daily state.db snapshots (digest-backup.timer) land here; aged out after
+# 7 days by tmpfiles.d (digest-tmpfiles.conf.j2). Root-owned -- snapshots
+# are an operator artifact, not container state.
+myapps_digest_backup_dir: "{{ myapps_digest_state_dir }}/backups"
+
+# Marker proving state.db was already seeded (or deliberately started empty)
+# on this host. Its ABSENCE is what triggers the restore below -- the same
+# gate media_stack uses via homelab_local_state_marker_name, and for the same
+# reason: the seed must run exactly once, on a host that has no state yet,
+# and never again.
+myapps_digest_state_marker: "{{ myapps_digest_state_dir }}/.state-seeded"
+
+# Restore state.db from the newest valid offsite snapshot when this host has
+# none. This is the read half of myapps_digest_offsite_backup_enabled: that
+# one gets snapshots onto the VirtIO-FS share nightly, this one brings them
+# back on a rebuilt VM. A backup nobody has ever restored is a hypothesis,
+# not a backup.
+myapps_digest_state_restore_enabled: true
+myapps_digest_state_restore_script: /usr/local/bin/digest-state-restore
+
+# How many dated snapshots digest-state-backup keeps on the share. 14 rather
+# than the 7 the LOCAL copies get from tmpfiles: the restore above walks these
+# newest-first and validates each, dropping to the previous when one is
+# unreadable, so the chain is the fallback and depth is worth having. At ~17 MB
+# each and growing, that caps the share at roughly 250 MB.
+myapps_digest_offsite_backup_keep: 14
+
+# The window cycle runs every 6 hours on the 0/6 UTC grid (00 06 12 18),
+# randomized to avoid a thundering herd on restart. Phase matters, not just
+# the interval: the 18:00 UTC slot is what the daily brief's 20:30 scheduling
+# depends on (see below), and the grid keeps the 1h offset from jobs-refresh's
+# 1/6 intact. A shifted grid would break both.
+#
+# Those four slots are split across THREE timers by what each one publishes.
+# The firing instants are exactly the union of the old single 0/6 timer --
+# nothing runs at a different time than before, and every slot still
+# collects, summarizes, persists and archives identically. Only reader-facing
+# delivery differs, via the app's `hide:<channel>` argv (notification-digest
+# PR #88):
+#
+#   06,12 UTC  digest.timer            -- delivered everywhere (08:00/14:00 Budapest)
+#   00    UTC  digest-overnight.timer  -- hide:telegram       (02:00 Budapest)
+#   18    UTC  digest-evening.timer    -- hide:telegram,site  (20:00 Budapest)
+#
+# Why the two hidden slots differ, since it looks asymmetric: nobody reads a
+# 02:00 or 20:00 ping, so neither slot notifies. But the SITE entries are not
+# equally redundant. The 20:00 window is republished to the site by the 20:30
+# daily brief thirty minutes later, so its own entry adds nothing. The 02:00
+# window has no such successor -- hiding it from the site too would leave
+# overnight news invisible to site readers until that same 20:30 brief, ~18
+# hours later. So the overnight slot keeps its site entry and only drops the
+# ping.
+#
+# The daily and weekly briefs are unaffected by any of this: they consume
+# window digests by KIND, out of SQLite, never by delivery state.
+myapps_digest_on_calendar: "*-*-* 06,12:00:00"
+myapps_digest_overnight_on_calendar: "*-*-* 00:00:00"
+myapps_digest_evening_on_calendar: "*-*-* 18:00:00"
+myapps_digest_randomized_delay_sec: 600
+
+# --- systemd TimeoutStartSec per run mode ---
+# INVARIANT (asserted at deploy time in tasks/main.yml -- do not treat these
+# as free-floating numbers): each unit's TimeoutStartSec must exceed the SUM
+# of the app's own internal budgets for that run mode, which this role also
+# sets. Break it and systemd kills a run in which every internal step behaved
+# exactly as designed and none of them timed out.
+#
+# That is not hypothetical: digest-daily.service failed with Result=timeout
+# every night from at least 2026-08-14 to 2026-08-17. It delivered the brief
+# successfully each time, then got SIGINTed seconds later during container
+# teardown, firing a spurious OnFailure alert. Cause: TimeoutStartSec was
+# hardcoded 600 here while the app was handed 600 (summarize) + 600 (verify)
+# + up to 1200 (translate, which retried a safeguards refusal on a fallback
+# model at the full timeout) -- the ceiling equalled ONE phase's allowance.
+#
+# The per-mode budgets, from the vars below (window has no verify pass, and
+# only the daily runs one). TRANSLATE COUNTS TWICE: digest/translate.py
+# retries a safeguards refusal on translate_model_fallback with the SAME
+# timeout_seconds (translate.py lines 196 and 207), so its worst case is
+# 2x myapps_digest_translate_timeout_seconds, not 1x. The single-leg figures
+# this block used to carry understated every mode by 300s -- which is the
+# very mistake the incident above is about, repeated in the arithmetic
+# meant to prevent it:
+#   window = claude 600 + translate 2x300             = 1200
+#   daily  = claude 600 + verify 300 + translate 2x300 = 1500
+#   weekly = claude 600 + translate 2x300             = 1200
+#
+# Against the ceilings below that left the WINDOW and the DAILY each with
+# exactly ZERO margin -- a run in which every internal step stays inside its
+# own allowance still gets SIGKILLed. Not hypothetical: window runs were
+# measured at 479-675s (allocation -> run_summary) over 2026-08-15..20, and
+# 2026-08-20T00:09 hit the 600s summarize cap for real. It has not bitten
+# only because a translate refusal has not yet landed on a slow summarize.
+#
+# The window ceiling is raised to 1800 here (1200 worst case + 600 margin).
+# It is the mode with no cascade constraint -- nothing waits on it, and the
+# next window is 6h away -- so headroom is free. THE DAILY IS STILL AT ZERO
+# MARGIN and is deliberately NOT changed here: 1500 is the schedule's own
+# ceiling (see the Sunday cascade note below), so fixing it means moving the
+# weekly first. Tracked, not fixed.
+#
+# Ceilings are sized from OBSERVED runtime plus margin, not from the
+# theoretical sum -- a timeout exists to bound the pathological case, and
+# being killed mid-delivery is a recoverable, designed state here (per-channel
+# flags + deliver_pending's retry pass finish a partial delivery next run).
+# The daily has been landing at ~595s; 1500 is ~2.5x that.
+#
+# The daily's ceiling is bounded by the SUNDAY cascade, not by taste. That
+# used to read "1500, and move the weekly first if you ever need more" --
+# which is exactly what this change does, because 1500 was not margin, it
+# was the daily's worst case exactly (600 + 300 verify + 2x300 translate),
+# leaving nothing for a run where every step behaves.
+#
+# Sunday evening, summer UTC, after this change:
+#   18:00 window       (+600s jitter, 1800 ceiling) -> done by 18:40
+#   18:30 daily        (+300s jitter, 2100 ceiling) -> done by 19:10
+#   19:45 weekly       (+300s jitter, 1500 ceiling) -> done by 20:15
+# Daily worst finish 19:10 vs weekly earliest start 19:45 = 35 minutes of
+# real margin, where there were zero.
+#
+# TWO known overlaps remain, both accepted, both documented so the next
+# reader does not "discover" them as regressions:
+#   1. jobs-refresh runs 1/6 UTC (19:00) with a 600s jitter and a 3600s
+#      ceiling, so it occupies 19:00-20:10 -- it ALREADY overlapped the
+#      weekly at 19:00 before this change, and now may also overlap the
+#      tail of a pathological daily by up to ~10 min.
+#
+#      Deliberately not designed around, and it is worth being precise
+#      about WHY, because the digest cascade and jobs-refresh are otherwise
+#      unrelated jobs. They share exactly ONE thing: the owner's single
+#      Claude subscription. Both authenticate through a logged-in CLI
+#      session (CLAUDE_CONFIG_DIR) rather than an API key, in separate
+#      directories -- separate credential STORAGE, one account behind it,
+#      so one rate limit. Nothing else is shared: different containers,
+#      different code, different state, different failure paths, and
+#      NEITHER READS THE OTHER'S DATA.
+#
+#      That makes the coupling soft. Contention throttles and slows a run;
+#      a ceiling equal to the worst case KILLS one. Trading a real
+#      SIGKILL for a possible slowdown is the wrong way round, so the
+#      digest cascade is sized on its own real dependencies (window ->
+#      daily -> weekly, which genuinely consume each other's output) and
+#      jobs-refresh is left to contend.
+#   2. A pathological window (>1200s, never yet observed -- measured range
+#      479-675s) can now run to 18:40, past the daily's 18:30 start, so
+#      that night's brief would synthesize 3 window digests instead of 4.
+#      The same brief lost the same digest under the old 1200 ceiling --
+#      the window was simply SIGKILLed instead of finishing -- so this
+#      trades a half-delivered digest plus a spurious OnFailure alert for
+#      a complete one. Strictly better, not new.
+myapps_digest_timeout_start_sec: 1800
+myapps_digest_daily_timeout_start_sec: 2100
+myapps_digest_weekly_timeout_start_sec: 1500
+
+# --- notification-digest daily brief (notification-digest PR #30) ---
+# A second scheduled job, independent of the 6-hourly window digest above:
+# `python -m digest daily` runs once a day and synthesizes the day's window
+# digests into one evening brief. Gated on its own flag rather than folded
+# into myapps_digest_enabled so it can ship disabled while myapps_digest_image
+# still predates the `daily` argv mode, and so its teardown (see tasks/main.yml)
+# is independent of the window job's.
+myapps_digest_daily_enabled: false
+# Trailing IANA timezone (systemd OnCalendar= supports it natively) keeps
+# the local time correct across DST with no manual UTC math. 20:30, not
+# 20:00: the 6-hourly window timer above runs on SERVER time (UTC), so in
+# summer (CEST, UTC+2) its 18:00 UTC run IS 20:00 Budapest -- the daily
+# brief used to fire at the same instant, separated only by randomized
+# jitter, which made "does tonight's brief include the 17:00-20:00 window?"
+# a race. At 20:30 the evening window run (<=600s jitter + a few minutes of
+# work) is reliably finished, so the daily deterministically includes the
+# day's final window digest.
+myapps_digest_daily_on_calendar: "*-*-* 20:30:00 Europe/Budapest"
+# Capped well below myapps_digest_randomized_delay_sec (600s): a missed
+# window digest drifting ten minutes is a non-event, but a daily brief is a
+# once-a-day deliverable the owner expects to read that evening -- keep its
+# jitter tighter.
+myapps_digest_daily_randomized_delay_sec: 300
+
+# --- notification-digest weekly brief (notification-digest PR #57) ---
+# A third scheduled job, one editorial rung above the daily brief:
+# `python -m digest weekly` runs Sunday evening and synthesizes the week's
+# daily briefs into one weekly report (image 0.11.0+). Gated on its own
+# flag, same reasoning as the daily brief's own gate above. The Sunday
+# cascade is window (20:00) -> daily (20:30) -> weekly (21:45) Budapest,
+# each rung consuming the one below.
+#
+# 21:45, not the original 21:00: the daily's ceiling was raised to 2100s
+# (see the TimeoutStartSec block above -- its old 1500 equalled its own
+# worst case exactly, so a well-behaved run could still be SIGKILLed), and
+# 21:00 left no room for that. A daily starting as late as 20:35 Budapest
+# and running its full 35 minutes finishes at 21:10; 21:45 keeps 35 minutes
+# of real margin. Both times are Budapest-anchored, so the gap between them
+# is DST-stable and needs no seasonal re-check.
+#
+# Note this does NOT clear jobs-refresh (1/6 UTC = 19:00 UTC summer, 600s
+# jitter, 3600s ceiling -> occupies 19:00-20:10 UTC = 21:00-22:10 Budapest).
+# The weekly overlapped it at 21:00 before this change and still overlaps it
+# at 21:45. Untouched on purpose: that is a pre-existing condition with its
+# own trade-off, not something this timeout fix should quietly redesign.
+myapps_digest_weekly_enabled: false
+myapps_digest_weekly_on_calendar: "Sun *-*-* 21:45:00 Europe/Budapest"
+myapps_digest_weekly_randomized_delay_sec: 300
+
+# --- notification-digest Patreon collector (notification-digest PR TBD) ---
+# A FOURTH scheduled job, and the first that is not part of the window ->
+# daily -> weekly cascade at all: `python -m digest patreon` polls one paid
+# Patreon campaign hourly and posts each new post to its own Telegram topic.
+# Gated on its own flag, same reasoning as the daily/weekly gates above --
+# it must ship disabled while myapps_digest_image still predates the
+# `patreon` argv mode.
+myapps_digest_patreon_enabled: false
+
+# SERVER TIME (UTC), deliberately -- unlike the daily/weekly briefs, which
+# carry a Europe/Budapest suffix because a reader expects them at a
+# particular local hour. Nobody reads this on a schedule; it fires whenever
+# a post appears, so the only thing the clock has to do is stay clear of the
+# other jobs, and a DST shift would move it INTO them twice a year.
+#
+# :50 is chosen against the other timers' MEASURED BUSY BANDS, not their
+# start times and not their TimeoutStartSec ceilings (which are 2-3x the
+# real durations and would misprice this). From 21 days of journal history
+# on 2026-08-21, every band in UTC:
+#
+#   window/evening/overnight  :00 + <=600s jitter + ~10m run  ->  :00-:20
+#   daily                     18:30 + <=300s + ~11m           ->  18:30-18:46
+#   weekly (Sun)              19:45 + <=300s + ~9m            ->  19:45-19:59
+#   backup                    04:15, instant
+#
+# An hourly job at :00, :15 or :30 lands inside the window band -- which
+# fires four times a day -- every single day. :50 (+<=120s jitter, and a run
+# measured in seconds when there is nothing new) clears every one of those,
+# and clears the daily brief too.
+#
+# It does NOT clear the Sunday weekly: 19:50 falls inside 19:45-19:59. Left
+# that way deliberately. Moving to :25 would dodge it but leaves only ~5
+# minutes of margin after the window band and ~1 before the daily, so a
+# single slow run would collide with a job that runs 4x daily instead of one
+# that runs weekly. The overlap is also measured, not assumed: the sole
+# shared resource is state.db, both jobs hold write transactions for
+# milliseconds (the long Claude calls hold none), and a 400-pair concurrent
+# write test against the real state layer produced zero errors with a
+# worst-case wait of 62ms against connect()'s busy_timeout=5000.
+myapps_digest_patreon_on_calendar: "*-*-* *:50:00"
+# Tighter than the window's 600s: this job runs 24x a day, and wide jitter
+# would smear it back across the bands the :50 slot exists to avoid.
+myapps_digest_patreon_randomized_delay_sec: 120
+# Generous relative to the work (one HTTP request plus one Claude call per
+# new post, usually zero) but sized for the worst realistic run: a first
+# run, or a catch-up after an outage, summarizing five posts back to back.
+myapps_digest_patreon_timeout_start_sec: 1800
+
+# The Patreon campaign whose posts are collected. Not a secret -- it is the
+# numeric id behind a public creator page (resolvable from
+# /api/campaigns?filter[vanity]=<name>). Empty disables the collector inside
+# the app as well, which is the safe direction if this file is ever rendered
+# before the value is set.
+myapps_digest_patreon_campaign_id: ""
+
+# --- notification-digest positions tracker (notification-digest PR TBD) ---
+# A FIFTH scheduled job, and the second outside the window -> daily -> weekly
+# cascade: `python -m digest positions` tracks the projects the owner holds a
+# position in, in their OWN Telegram topic, on their own 4-hourly clock.
+#
+# It does not merely re-summarize what the window run collected -- it
+# collects its own Telegram channels, which is what makes its cadence real.
+# The X half rides along on the window run's collection deliberately: every
+# extra scheduled contact with the unofficial, cookie-authenticated X client
+# raises the ban risk that is this service's largest operational hazard.
+#
+# Gated on its own flag, same reasoning as the daily/weekly/patreon gates:
+# it must ship disabled while myapps_digest_image still predates the
+# `positions` argv mode. Turning it on also REMOVES those channels from the
+# window briefing (the app excludes them from its own sweep), so the flag is
+# a two-sided switch, not an addition.
+myapps_digest_positions_enabled: false
+
+# SERVER TIME (UTC), deliberately, for the reason
+# myapps_digest_patreon_on_calendar documents at length: nobody reads this at
+# a fixed local hour, and a DST shift would move six slots into other jobs'
+# bands twice a year.
+#
+# Slot chosen against the SAME measured busy bands that comment records
+# (21 days of journal history, 2026-08-21), in UTC:
+#
+#   window/evening/overnight  00,06,12,18 :00-:20
+#   daily                     18:30-18:46
+#   weekly (Sun)              19:45-19:59
+#   patreon                   every hour :50-:52
+#   backup                    04:15
+#   jobs-refresh              19:00-20:10
+#
+# Hours 01,05,09,13,17,21 collide with none of them -- window, daily, weekly,
+# backup and jobs-refresh all sit in hours this set never uses -- and :25
+# clears the :00-:20 window band by five minutes at the front and the hourly
+# :50 patreon slot by twenty at the back. In Budapest terms that is roughly
+# 03/07/11/15/19/23 in summer, so the owner wakes to one, gets one mid-
+# morning, and gets one each side of the evening.
+myapps_digest_positions_on_calendar: "*-*-* 01,05,09,13,17,21:25:00"
+# Tighter than the window's 600s, matching the patreon job's reasoning: six
+# fires a day, and wide jitter would smear them back into the bands the :25
+# slot exists to avoid. 180s keeps the whole run inside :25-:30.
+myapps_digest_positions_randomized_delay_sec: 180
+# One Telethon collect over a handful of channels plus at most one Claude
+# call. Most runs are far shorter -- a window with no material news returns
+# the NO-SIGNAL sentinel and delivers nothing at all -- but sized here for a
+# catch-up run after an outage, with a full prompt.
+myapps_digest_positions_timeout_start_sec: 1800
+
+# X screen names whose posts belong to the tracker, alongside
+# myapps_digest_positions_tg_channels below. Bare handles, comma-separated,
+# a leading @ optional. NOT a secret: these are public handles, unlike the
+# X SESSION COOKIES (DIGEST_X_COOKIES), which are.
+#
+# DEPLOY CHECKLIST: an account listed here only produces items if POST
+# NOTIFICATIONS (the bell) are enabled for it in the owner's X app. The
+# collector fetches an account's own timeline only when a notification names
+# it. A handle without the bell is not an error and cannot be detected from
+# inside the service -- it simply never matches, and reads as a quiet
+# account.
+myapps_digest_positions_x_accounts: ""
+
+# Free-text terms that pull an item into the tracker from ANY source, so the
+# project's news is claimed out of a general crypto channel, a news feed or a
+# subreddit instead of staying in the window briefing. Case-insensitive
+# substring match; the app rejects entries shorter than 4 characters.
+#
+# KEEP THESE DISTINCTIVE. The error cost is asymmetric: a false positive
+# removes the story from the briefing, and if the tracker then judges that
+# window immaterial the item is absorbed as a quiet-window record -- so an
+# over-broad term makes unrelated stories vanish from every channel,
+# silently. Cashtags and proper names only; never a bare ASI or FET
+# ("basic" contains "asi", "feta" contains "fet").
+#
+# Commas separate entries, so a term cannot contain one.
+myapps_digest_positions_keywords: ""
+
+# --- notification-digest runtime env ---
+# TG_API_ID/TG_API_HASH/TG_SESSION/SMTP_USER/SMTP_PASSWORD are secrets: leave
+# blank here and set them via Azure Key Vault (see ansible/playbooks/services/
+# 01-myapps-vm.yml for the lookup('env', ...) pattern that resolves them).
+myapps_digest_tg_api_id: ""
+myapps_digest_tg_api_hash: ""
+myapps_digest_tg_session: ""
+myapps_digest_tg_chat_allowlist: ""
+myapps_digest_smtp_host: smtp.mail.me.com
+myapps_digest_smtp_port: 587
+myapps_digest_smtp_user: ""
+myapps_digest_smtp_password: ""
+myapps_digest_from: digest@example.net
+# Display name shown alongside the address in the mail client's sender
+# field (notification-digest DIGEST_FROM_NAME, default "Digest" if unset).
+# Owner-requested value, not the module default -- see PR history. The
+# original request, "Digest @ Toom", was changed to this on 2026-08-02: an
+# "@" inside a From display name is a well-known anti-spoofing trigger in
+# modern mail clients (Gmail is the documented case; Apple Mail's inbox
+# list silently showed the bare address instead of the name, with Contacts
+# and the wire-level header both ruled out as the cause first) -- clients
+# suppress the display name and fall back to the raw address specifically
+# because "@" in a name can be used to impersonate a trusted address.
+myapps_digest_from_name: "Toom's Digest"
+# Comma-separated: every address here lands in the To header, and
+# smtplib derives the envelope recipients from it, so all of them get the
+# digest. They are NOT blind-copied -- each recipient sees the others.
+# Only non-empty is validated (notification-digest config.py), so a typo
+# surfaces as a per-run bounce rather than a startup error.
+myapps_digest_to: "tom@example.net, second-recipient@example.com"
+# Reasoning effort for the summarizer's `claude -p` call: one of
+# low|medium|high|xhigh|max. `high` was chosen from a measured A/B on real
+# items -- it clusters stories noticeably better than the CLI default,
+# while `max` produced near-identical output for 65% more wall clock. The
+# cost of raising it is not money (subscription auth) but the owner's
+# shared plan usage limits, spent by an unattended job running 8x/day.
+myapps_digest_claude_effort: high
+myapps_digest_anthropic_model: claude-opus-5
+# 600, not the app default 300: the doubled briefing length budget (app PR #17)
+# roughly doubles the Opus call's output time, and 300s was already seeing
+# ~2.5-minute calls at the old length.
+myapps_digest_claude_timeout_seconds: 600
+myapps_digest_state_db_path: /data/state.db
+myapps_digest_archive_container_dir: /data/archive
+myapps_digest_claude_config_dir: /data/claude-home
+myapps_digest_x_enabled: false
+# X_COOKIES_PATH is a container-side path, not the secret itself; the cookie
+# jar contents come from the digest-x-cookies Key Vault secret (see the
+# playbook) and, when enabling X, must be written to
+# {{ myapps_digest_state_dir }}/x-cookies.json so this path resolves under the
+# /data bind mount.
+myapps_digest_x_cookies_path: /data/x-cookies.json
+# Reddit cookie-session collector (notification-digest PR #35, image 0.7.0+).
+# OAuth is permanently dead — Reddit's Data Team refused the API application
+# (2026-08-06) — so the collector authenticates as the owner's own account
+# via the long-lived reddit_session browser cookie against old.reddit.com,
+# the same ToS-risk posture as X above (auth errors back off, never
+# retry-loop). The cookie is a secret: digest-reddit-session in Key Vault
+# (folder=digest, envvar=DIGEST_REDDIT_SESSION), mapped to
+# myapps_digest_reddit_session_effective by the playbook — same pattern as
+# SMTP_PASSWORD. Logging out of that Reddit browser session invalidates the
+# cookie; refresh the secret and redeploy if the digest reports session
+# verify failures. Subreddits are comma-separated bare names, no "r/"
+# prefix (notification-digest config.py validates the charset). Harmless on
+# images that predate the collector, same as NEWS_FEEDS below.
+myapps_digest_reddit_enabled: false
+myapps_digest_reddit_session: ""
+myapps_digest_reddit_subreddits: ""
+# Comma-separated RSS/Atom feed URLs for the AI/robotics news collector
+# (rendered as NEWS_FEEDS). Not a secret — set per-host in host_vars, no Key
+# Vault indirection. Empty disables the collector entirely; there is no
+# separate NEWS_ENABLED flag by design (notification-digest config.py).
+# Harmless on images that predate the collector: unknown env vars are
+# simply never read.
+myapps_digest_news_feeds: ""
+# Telegram public-channel usernames (comma-separated, no @ / t.me/ prefix)
+## Telegram public-channel usernames (no @ / t.me/ prefix) claimed by the
+# positions tracker instead of the window briefing. Empty = no Telegram half.
+# Every channel named here must ALSO be in myapps_digest_tg_chat_allowlist --
+# the allowlist is what gets collected at all; this only decides which run
+# claims the result.
+myapps_digest_positions_tg_channels: ""
+# Hacker News front-page collector (notification-digest v0.18.0+, PR #84):
+# Algolia public API, no auth, no secret. Off by default at the role level;
+# the real VM flips it in host_vars.
+myapps_digest_hackernews_enabled: false
+myapps_digest_hackernews_top_n: 15
+# Polymarket prediction-market collector (notification-digest PR #24).
+# Disabled by default; the real VM flips it in host_vars. The API base is
+# deployment-specific: gamma-api.polymarket.com is ISP-blocked in Hungary,
+# so the host points it at the polymarket-proxy Worker (toom-edge repo,
+# workers/polymarket-proxy). Empty here means "use the app's built-in
+# default" (config.py falls back to the direct gamma-api URL on blank).
+# The proxy key is a secret: digest-polymarket-proxy-key in Key Vault
+# (folder=digest, envvar=DIGEST_POLYMARKET_PROXY_KEY), mapped to
+# myapps_digest_polymarket_proxy_key_effective by the playbook — same
+# pattern as SMTP_PASSWORD. Harmless on images that predate the collector,
+# same as NEWS_FEEDS above.
+myapps_digest_polymarket_enabled: false
+myapps_digest_polymarket_api_base: ""
+myapps_digest_polymarket_proxy_key: ""
+# Multi-channel delivery (notification-digest PR #25). email stays the role
+# default so a host that never configures the new channels keeps its old
+# single-channel behavior; the real VM flips email off and the site/telegram
+# values on in host_vars. Secrets (ingest key, public base with its embedded
+# capability token, bot token, chat/thread ids) come from Key Vault
+# (folder=digest, envvar=DIGEST_SITE_INGEST_KEY / DIGEST_SITE_PUBLIC_BASE /
+# DIGEST_TELEGRAM_NOTIFY_BOT_TOKEN / DIGEST_TELEGRAM_NOTIFY_CHAT_ID /
+# DIGEST_TELEGRAM_NOTIFY_THREAD_ID) via the playbook's _effective mappings,
+# same pattern as SMTP_PASSWORD. The app refuses to start with every
+# channel disabled (config.py guard), so email_enabled: false only ever
+# ships together with a configured site/telegram channel.
+myapps_digest_email_enabled: true
+myapps_digest_site_publish_url: ""
+myapps_digest_site_ingest_key: ""
+myapps_digest_site_public_base: ""
+myapps_digest_telegram_notify_bot_token: ""
+myapps_digest_telegram_notify_chat_id: ""
+myapps_digest_telegram_notify_thread_id: ""
+# Daily brief Telegram topic (notification-digest PR #30): the app picks this
+# thread id for kind="daily" digests, falling back to the window topic above
+# (with a logged INFO) when blank. Secret: leave blank here and set via the
+# digest-telegram-daily-thread-id Key Vault secret (folder=digest,
+# envvar=DIGEST_TELEGRAM_DAILY_THREAD_ID — already present in the vault),
+# resolved through myapps_digest_telegram_daily_thread_id_effective, same
+# _effective pattern as the notify thread id above.
+myapps_digest_telegram_daily_thread_id: ""
+# Same contract for the weekly brief's own forum topic ("Weekly Brief").
+# Not a secret (a topic id is group-internal routing, not a credential), so
+# unlike the daily id it is set as a plain host var -- see
+# host_vars/01-myapps-vm/vars.yml; the env fallback
+# (DIGEST_TELEGRAM_WEEKLY_THREAD_ID) stays available via the same
+# _effective pattern regardless.
+myapps_digest_telegram_weekly_thread_id: ""
+# Forum topic for Patreon posts. Empty = fall back to the window digest's
+# topic (the app logs an INFO line when it does), same contract as the
+# daily/weekly thread ids above.
+myapps_digest_telegram_patreon_thread_id: ""
+# Forum topic for the positions tracker. Same shape as the three thread ids
+# above: "" means unset, and the app then falls back to the window digest's
+# topic with an INFO log rather than failing -- which matters more here than
+# for any other kind, because these items are REMOVED from the window
+# briefing, so a hard failure would strand them until the 14-day prune.
+# 0 is a real value (post to the group root), not "unset".
+myapps_digest_telegram_positions_thread_id: ""
+# SECRET: the owner's `session_id` cookie for patreon.com. A live credential
+# to a PAID account, valid roughly a year from issue -- leave blank here and
+# set it via Azure Key Vault, like every other secret in this file.
+# Refreshed by logging into Patreon in the chromium container and reading
+# the cookie back out; see docs.
+myapps_digest_patreon_session_cookie: ""
+# Hungarian translation for the news site (notification-digest PR #27).
+# One extra claude -p call per run at a cheaper tier; soft-fails to
+# English-only. No secrets involved. The real VM enables it in host_vars.
+myapps_digest_translate_hu_enabled: false
+myapps_digest_translate_model: "sonnet"
+# Its own budget, NOT a reuse of myapps_digest_claude_timeout_seconds
+# (notification-digest 0.15.0 added TRANSLATE_TIMEOUT_SECONDS for this).
+# translate_digest can call the model TWICE -- primary, then a fallback model
+# if the primary refuses on safeguards -- each at the full timeout it is
+# handed. While it inherited the 600s summarizer budget, that was up to 1200s
+# for translation alone, which is what pushed the daily run past its unit
+# TimeoutStartSec. 300 caps both legs; translation is a fixed-size rewrite of
+# one already-written body and never carries the 200-item payload that
+# 600s was sized for.
+myapps_digest_translate_timeout_seconds: 300
+
+# Verified daily briefing (notification-digest PR #64, PLAN.md §11.4). A
+# SECOND claude -p call on the daily brief only -- the window digests stay
+# toolless -- this one WITH WebSearch/WebFetch, cross-checking each story
+# against the open web and appending per-story corroboration status. It is
+# the only place in this pipeline that ever reads live web content, so it
+# carries a real prompt-injection surface (see PLAN.md §8); containment is
+# a hardened prompt plus a link allowlist widened ONLY with URLs the run
+# provably fetched. Soft-fails: any failure ships the unverified draft with
+# a code-prepended banner, never a missing or delayed brief.
+#
+# Defaults OFF in the role. The real VM opts in via host_vars, same pattern
+# as translate_hu above.
+myapps_digest_verify_daily_enabled: false
+# 300, not the 600 this shipped with: real web I/O deserves headroom, but not
+# at the cost of the whole unit budget. This pass is the ONE phase of the
+# daily that is explicitly optional -- the app soft-fails it and delivers an
+# unverified brief with a banner, on the stated principle that "an unverified
+# brief on time still beats no brief". So it is the right place to buy the
+# headroom digest-daily.service needs (see the TimeoutStartSec invariant
+# above): failing fast here costs a banner, whereas the alternative was the
+# unit being killed mid-teardown every single night.
+myapps_digest_verify_daily_timeout_seconds: 300
+# Prompt-level guidance, not a hard cap -- the CLI does not enforce a
+# tool-call budget, so this bounds cost by instruction only.
+myapps_digest_verify_daily_max_web_ops: 20
+
+# Arc background primers (notification-digest PR #70, PLAN.md §11.6). On
+# the DAILY run only, generates a short durable "what is this story about"
+# primer for arcs that have recurred at least twice in the trailing week
+# and have none yet — rendered as a collapsed Background disclosure on the
+# arc page. Toolless, fed only the arc's own label (never brief text, so it
+# can't become a replay channel), soft-fails to storing nothing.
+#
+# Defaults OFF, and deliberately left off at first: this shares the daily
+# run with the verified briefing above, and stacking both onto one
+# execution is how a usage ceiling gets hit. Enable in host_vars once
+# verification has proven itself for a night or two; consider
+# max_per_run: 1 to start.
+myapps_digest_context_enabled: false
+myapps_digest_context_max_per_run: 3
+
+# --- myapps failure alerting (shared: notification-digest + jobs-refresh) ---
+# Mirrors the restic_backup role's OnFailure= + notify-script pattern (see
+# ansible/roles/restic_backup/templates/restic-appdata-backup-notify.service.j2
+# and restic-notify.sh.j2): a failed journalctl-only run is otherwise only
+# visible to someone who goes looking. One generic script + one shared env
+# file back both digest-notify.service (digest.service's OnFailure= target)
+# and jobs-refresh-notify.service (jobs-refresh.service's OnFailure= target),
+# posting to ntfy and/or Telegram -- gating the script on digest_enabled
+# alone would silently break jobs-refresh alerting whenever digest was off.
+# A job retries automatically on its next timer fire, so the notification
+# wording says "investigate", not "act immediately".
+myapps_notify_script: /usr/local/sbin/myapps-notify
+# Shared wrapper every notification-digest systemd unit invokes instead of
+# calling `docker compose run` itself -- see digest-run.sh.j2 for why the
+# lock exists (concurrent Telethon clients on one StringSession after a
+# Persistent=true boot storm).
+myapps_digest_run_script: /usr/local/sbin/digest-run
+# On tmpfs deliberately: a reboot clears it, so a crash can never strand a
+# stale lock, and the kernel releases it if a holder is killed.
+myapps_digest_lock_file: /run/digest.lock
+# How long a digest run waits for the lock before giving up and failing.
+# Sized against the WORST CASE it exists for -- every timer firing at once
+# after an outage -- using the measured run durations recorded in
+# myapps_digest_patreon_on_calendar: three window runs (~10m each), the
+# daily (~11m), the weekly (~9m), patreon (~1m) and positions (~2m) is
+# roughly 53 minutes of serial work. 3600s clears that with margin while
+# still being bounded, so a genuinely wedged holder surfaces as a failed
+# unit instead of a job that hangs until its own timeout.
+#
+# Every unit's TimeoutStartSec adds this value, since the wait happens
+# INSIDE ExecStart and systemd counts it against the start timeout.
+myapps_digest_lock_wait_sec: 3600
+myapps_digest_notify_env_file: "{{ myapps_compose_dir }}/digest-notify.env"
+# Secrets: leave blank here and set via the digest-notify-* Key Vault secrets
+# (folder=digest), resolved through the lookup('env', ...) _effective pattern
+# in ansible/playbooks/services/01-myapps-vm.yml -- same mechanism the other
+# digest secrets (TG_*/SMTP_*/X_COOKIES) already use on this host. The
+# digest_ prefix on this file/these vars is historical (kept to avoid
+# re-provisioning already-configured Key Vault secrets and CI env vars) --
+# in practice these targets are shared by every myapps job's failure alerts.
+myapps_digest_notify_ntfy_url: https://ntfy.sh
+myapps_digest_notify_ntfy_topic: ""
+myapps_digest_notify_ntfy_token: ""
+myapps_digest_notify_telegram_bot_token: ""
+myapps_digest_notify_telegram_chat_id: ""
+
+# --- jobs-refresh (jobs-dashboard data refresh) ---
+# One-shot container run on a schedule via `docker compose run --rm
+# jobs-refresh`; it is never part of `docker compose up -d` (see
+# profiles: ["oneshot"] in the compose template), mirroring
+# notification-digest. A systemd timer triggers jobs-refresh.service, which
+# runs it. Unlike digest (pulled from a private GHCR package), there is no
+# published image to pull, so the image is built locally from node:22 + git
+# + a pinned Claude CLI -- mirroring T3MP3ST's build-locally pattern.
+# Flip to true once the jobs-dashboard repo checkout, the employee-cv sparse
+# checkout, and Claude auth (one-time interactive `claude` login into
+# myapps_jobs_refresh_claude_home_dir, mirroring digest's claude-home) are in
+# place -- keeping it false keeps other myapps deploys a no-op for this job
+# while those are absent.
+myapps_jobs_refresh_enabled: false
+myapps_jobs_refresh_claude_cli_version: "{{ claude_cli_version | default('2.1.199') }}"
+myapps_jobs_refresh_image: "jobs-refresh:{{ myapps_jobs_refresh_claude_cli_version }}"
+myapps_jobs_refresh_build_dir: "{{ myapps_compose_dir }}/jobs-refresh/build"
+myapps_jobs_refresh_force_build: false
+
+# The container runs as this uid:gid, NOT root -- node:22-bookworm-slim
+# already ships a `node` user at 1000:1000, which the Dockerfile switches
+# to. Two independent reasons this isn't optional: (1) Claude CLI refuses
+# `--permission-mode bypassPermissions` under root/sudo by design, and
+# refresh-run.sh needs that mode (headless, no TTY -- any permission prompt
+# is an instant failure); (2) this container holds a WRITE-capable git
+# deploy key, so running as root is worth avoiding on its own merits. The
+# bind-mounted host paths below (repo/employee-cv/claude-home dirs, and the
+# SSH deploy keys) are chowned to this same uid:gid so the container can
+# actually read/write them.
+myapps_jobs_refresh_container_uid: 1000
+myapps_jobs_refresh_container_gid: 1000
+
+# Host paths bind-mounted into the container. The repo checkout and the
+# employee-cv sparse checkout are reproducible working trees (the container
+# can re-clone them; see jobs-refresh.Dockerfile.j2), so they live under
+# myapps_compose_dir like T3MP3ST's upstream checkout, not under
+# /srv/appdata. claude-home is genuine persistent auth state, so it follows
+# digest's claude-home precedent and lives under /srv/appdata.
+myapps_jobs_refresh_repo_dir: "{{ myapps_compose_dir }}/jobs-refresh/jobs-dashboard"
+# The job only *reads* two files out of employee-cv, but the mount stays
+# read-write (not :ro) in myapps-compose.yml.j2: the container does its own
+# sparse checkout into this same host path (see jobs-refresh.Dockerfile.j2),
+# and a read-only bind mount would make that checkout/pull fail. Read-only
+# access is enforced one layer up instead, via the read-only employee-cv
+# deploy key below.
+myapps_jobs_refresh_employee_cv_dir: "{{ myapps_compose_dir }}/jobs-refresh/employee-cv"
+myapps_jobs_refresh_claude_home_dir: /srv/appdata/jobs-refresh/claude-home
+
+# The bootstrap is rendered onto the host (not baked into the image) and
+# bind-mounted read-only into the container -- see
+# jobs-refresh-bootstrap.sh.j2 and jobs-refresh.Dockerfile.j2's CMD. This
+# keeps bootstrap-mechanics tweaks (repo URLs, sparse paths) an Ansible
+# redeploy instead of an image rebuild.
+myapps_jobs_refresh_bootstrap_script: "{{ myapps_compose_dir }}/jobs-refresh/bootstrap.sh"
+
+# Repos the bootstrap checks out. jobs-dashboard is the app repo itself
+# (full checkout, read-write); employee-cv holds the full CV corpus (master
+# profile, achievements, work relationships, experience bank, and more) --
+# on a container that also holds live LinkedIn session cookies, exposing
+# more of that than needed is a real cost, so only what the refresh/merge
+# prompt (docs/refresh-task.md in jobs-dashboard) actually reads goes here.
+myapps_jobs_refresh_repo_url: git@github.com:Dezoxy/jobs-dashboard.git
+myapps_jobs_refresh_employee_cv_repo_url: git@github.com:Dezoxy/employee-cv.git
+#
+# VERIFIED CONE-MODE QUIRK (against git 2.39.5, the exact version in the
+# built jobs-refresh image -- reproduced live in that image via `docker
+# compose run --rm --entrypoint bash jobs-refresh` against a throwaway repo,
+# then cross-checked against the real checkout at
+# /opt/myapps/jobs-refresh/employee-cv on 01-myapps-vm): naming an
+# individual FILE here does NOT sparse-checkout just that file. In `--cone`
+# mode, `sparse-checkout set` silently rewrites a file pattern into a
+# directory-shaped one (`.git/info/sparse-checkout` literally gets
+# `/profile/target-roles.md/` with a trailing slash) and, combined with
+# cone mode's automatic parent-directory scaffolding, that sweeps in EVERY
+# file directly inside that file's parent directory (not subdirectories).
+# Confirmed live: with only profile/target-roles.md listed, the real
+# checkout on 01-myapps-vm already has the ENTIRE flat contents of
+# profile/ on disk -- achievements.md, documents-scan.md,
+# experience-bank.md, linkedin-draft.md, master-profile.md, preferences.md,
+# project-inventory.md, skills-evidence.md, work-relationships.md -- none
+# of which is a subdirectory, so cone mode's directory-scaffold rule
+# includes all of them. This is a pre-existing gap, not something this
+# change introduces; not narrowed here per instruction ("do not change
+# anything else about the checkout") but worth a follow-up.
+#
+# profile/preferences.md is listed explicitly below even though the quirk
+# above already puts it on disk today (confirmed at the real path, still
+# showing its pre-fix 617-byte placeholder size at verification time) --
+# explicit because that's what docs/refresh-task.md actually names it for
+# (deterministic location/language-exclusion policy) and because leaving it
+# implicit means a future edit to the target-roles.md entry could silently
+# drop it with no signal here.
+#
+# research/roles/ is a DIRECTORY pattern, not the specific dated audit
+# filename (research/roles/alert-audit-2026-07-28.md) the merge prompt's
+# rationale table currently cites. Two independent reasons, both confirmed
+# by the same live reproduction: (1) the quirk above means a single
+# filename pattern was never going to scope to just that file anyway --
+# every other flat file already inside research/roles/ (there are no
+# subdirectories there) would come along regardless, so the directory form
+# is the honest description of what actually happens, not a broader
+# request; (2) confirmed live that a file added to research/roles/ on
+# origin/main AFTER this config is written appears in the checkout on the
+# next plain `git pull --ff-only` -- no Ansible redeploy needed -- so the
+# next dated audit file is not silently missed the way an exact-filename
+# pattern would miss it. Confirmed the directory form does NOT pull in
+# research/'s other subdirectories (e.g. research/companies/) -- only
+# research/roles/ itself, plus the already-listed research/market/.
+myapps_jobs_refresh_employee_cv_sparse_paths:
+  - profile/target-roles.md
+  - profile/preferences.md
+  - research/market/salary-benchmarks.md
+  - research/roles/
+
+# --- jobs-refresh git credentials (SSH deploy keys, least privilege) ---
+# Two private GitHub repos, two separate per-repo deploy keys -- neither
+# generated nor managed by Ansible; place the private key files at these
+# host paths out-of-band before flipping myapps_jobs_refresh_enabled to
+# true (this role only wires the paths + read-only mounts, following how
+# digest's X cookies file is bind-mounted in rather than templated):
+#   - Dezoxy/jobs-dashboard: write access (the job pushes jobs.json +
+#     last-run.json back to this repo)
+#   - Dezoxy/employee-cv: read-only access (the job only reads two files
+#     from a sparse checkout)
+# Both are bind-mounted read-only into the container regardless of the repo
+# checkout's own read-write/read-only mount above -- the container's git
+# client decides per-clone which key to use (e.g. via GIT_SSH_COMMAND -i),
+# so a write-capable key never needs to be handed to the employee-cv clone.
+#
+# The role chowns both key files to myapps_jobs_refresh_container_uid/_gid
+# (not root, despite the operator likely dropping them in as root). This
+# isn't a style choice: OpenSSH's client-side private-key loader refuses a
+# key whose owning uid doesn't match the calling process's uid, UNLESS the
+# calling process is uid 0 -- and the container calls it as uid 1000, not
+# root. Group-readable-by-root-owned would also fail a second, independent
+# check (identity files must have zero group/other permission bits), so
+# mode stays a strict 0600 and only the owning uid changes.
+myapps_jobs_refresh_ssh_key_dir: /srv/appdata/jobs-refresh/keys
+myapps_jobs_refresh_ssh_key_dashboard_path: "{{ myapps_jobs_refresh_ssh_key_dir }}/jobs-dashboard-deploy-key"
+myapps_jobs_refresh_ssh_key_employee_cv_path: "{{ myapps_jobs_refresh_ssh_key_dir }}/employee-cv-deploy-key"
+myapps_jobs_refresh_ssh_key_dashboard_container_path: /data/ssh/jobs-dashboard-deploy-key
+myapps_jobs_refresh_ssh_key_employee_cv_container_path: /data/ssh/employee-cv-deploy-key
+
+# --- jobs-refresh runtime env ---
+myapps_jobs_refresh_anthropic_model: claude-opus-5
+myapps_jobs_refresh_claude_config_dir: /data/claude-home
+# Explicit --effort for the two separate `claude --print` calls
+# refresh-run.sh makes (Sonnet browse step, Opus merge step) -- CLI default
+# otherwise applies, which the owner wants pinned instead. Valid values,
+# per the installed CLI's own --help: low, medium, high, xhigh, max.
+# Deliberately NOT the same mechanism as myapps_digest_claude_effort /
+# CLAUDE_EFFORT below: that's an env var notification-digest's own
+# application code reads and passes to `claude -p` itself, whereas
+# refresh-run.sh invokes the `claude` binary directly and needs an actual
+# `--effort` command-line flag -- reusing CLAUDE_EFFORT would collide in
+# name while meaning something different, so these get their own names.
+#
+# The two differ because effort buys little on the browse step: it's
+# mechanical DOM extraction against documented selectors, and already the
+# long pole at 12-16 minutes regardless of effort. The merge step is where
+# the actual judgement lives -- fit filtering against target-roles.md,
+# salary estimation with employer adjustments, the Hungarian summary -- and
+# only takes ~4-9 minutes, so higher effort there is cheap in wall-clock
+# terms. Both draw on the same Claude subscription quota as the digest job
+# and the owner's own interactive use, though, so raising these is not free.
+myapps_jobs_refresh_browse_effort: high
+myapps_jobs_refresh_merge_effort: xhigh
+# Publish gate: the MacBook publisher is still the live publisher of
+# jobs-dashboard's data, and its publish.sh refuses to push when behind
+# (exit 6). If the VM ran refresh-run.sh AND pushed at the same time, the
+# two publishers would deadlock against each other. Keep this false until
+# the MacBook publisher is deliberately retired -- the VM should do the
+# full run (fetch/check/refresh) but must not push while both are live.
+myapps_jobs_refresh_publish_enabled: false
+
+# Git identity for the commits scripts/publish.sh makes (in the jobs-dashboard
+# repo, via the write-capable deploy key above) -- a fresh container has none
+# of the ambient ~/.gitconfig a human's machine picks up (that's exactly how
+# this surfaced: the MacBook publisher inherited the owner's global git
+# config, so this gap was invisible there). Passed as GIT_AUTHOR_*/
+# GIT_COMMITTER_* env vars in jobs-refresh.env.j2 rather than a git config
+# file written to $HOME or baked into the image: git honors these natively
+# for every commit with no config file needed, which fits this role's
+# existing pattern of injecting ALL jobs-refresh runtime config through the
+# env_file rather than mutating $HOME -- and needs no extra directory/
+# permissions handling for the non-root uid 1000 (node) user beyond what
+# already exists. Not a secret (an email address, and these commits land in
+# Dezoxy/jobs-dashboard via the deploy key above -- this identity never needs
+# to match a real GitHub account), so plain vars, no Key Vault.
+# Deliberately not a personal address -- these commits are authored by
+# unattended automation, and the history should say so. jobs-refresh@ mirrors
+# notification-digest's own from-address convention (myapps_digest_from:
+# digest@example.com below) -- an address at a domain this operator
+# already owns, obviously non-human, not squatting on anyone else's identity.
+myapps_jobs_refresh_git_committer_name: "jobs-refresh bot"
+myapps_jobs_refresh_git_committer_email: "jobs-refresh@example.com"
+
+# --- jobs-refresh tracker sync (added 2026-08-08) ---
+# refresh-run.sh step 2b: before each fetch, pull the dashboard's tracker
+# from this endpoint (KV-backed, behind Cloudflare Access) and fold its
+# ignored/rejected ids into the rejected-ids ledger, so the candidate set
+# already excludes what the owner hid on any device. Empty URL = the step
+# is skipped entirely (the script's own gate) -- that keeps existing
+# deploys unaffected, so the enable lives in host_vars, not here.
+# JOBS_TRACKER_SYNC_URL / _CLIENT_ID / _CLIENT_SECRET (jobs-refresh.env.j2)
+# are the exact names that repo's script depends on. Auth is a Cloudflare
+# Access service token (Key Vault folder=jobs-refresh, minted by
+# cloudflare-terraform); the URL itself is not a secret, so a plain var.
+myapps_jobs_refresh_tracker_sync_url: ""
+
+# --- jobs-refresh Telegram digest (added 2026-08-21) ---
+# refresh-run.sh step 7b: send the "list refreshed" digest straight from this
+# container instead of from the GitHub Actions workflow in the jobs-dashboard
+# repo. Same message either way -- both call that repo's
+# scripts/notify-diff.mjs -- only the transport differs.
+#
+# Why it moved here: the repo is private, so its Actions minutes are metered,
+# and between 2026-08-19 and 2026-08-20 five digests were lost outright. The
+# jobs were refused before a runner ever started them ("recent account
+# payments have failed or your spending limit needs to be increased"); the
+# refresh itself published normally each time, so nothing downstream noticed
+# the notification was missing. This container already holds every input the
+# message needs.
+#
+# EXACTLY ONE SENDER MAY BE LIVE. Both means every refresh notifies twice.
+# Flipping this true is therefore paired with dropping the `push:` trigger
+# from .github/workflows/notify-telegram.yml in the jobs-dashboard repo.
+#
+# JOBS_REFRESH_NOTIFY_ENABLED / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# (jobs-refresh.env.j2) are the exact names that repo's script depends on --
+# do not rename without updating it there too.
+myapps_jobs_refresh_notify_enabled: false
+
+# Deliberately NOT the myapps_digest_notify_telegram_* credentials the
+# OnFailure= alerts use. Those are the "bobi" bot posting into the Homelab
+# Agent supergroup; the job digest is a different bot ("Job Agent") in the
+# owner's private chat, and it has been going there since the workflow first
+# shipped. Pointing the digest at the alert bot would move months of ongoing
+# conversation into a group chat full of unrelated infrastructure noise, and
+# would couple two notification paths that fail for entirely different
+# reasons. Key Vault folder=jobs-refresh, same folder as the tracker service
+# token (envvar=JOBS_REFRESH_TELEGRAM_BOT_TOKEN / _CHAT_ID); resolved through
+# the _effective mappings in playbooks/services/01-myapps-vm.yml.
+myapps_jobs_refresh_telegram_bot_token: ""
+myapps_jobs_refresh_telegram_chat_id: ""
+
+# --- jobs-refresh browser support (Phase 2b) ---
+# Wires jobs-refresh's Claude CLI to the playwright-mcp server above so
+# refresh-run.sh's browse step (implemented in the jobs-dashboard repo, not
+# here) can drive chromium's already-logged-in session. JOBS_REFRESH_MCP_CONFIG
+# and JOBS_REFRESH_BROWSER_ENABLED (jobs-refresh.env.j2) are the exact names
+# that repo's script depends on -- do not rename without updating it there
+# too. Keeping this false keeps existing jobs-refresh deploys unaffected
+# until the browse step actually ships.
+myapps_jobs_refresh_browser_enabled: false
+# Host path for the rendered MCP config JSON (see
+# jobs-refresh-mcp-config.json.j2); lives alongside the bootstrap script
+# under myapps_compose_dir, not /srv/appdata, since it's fully reproducible
+# from these vars -- nothing here is a secret or persistent state.
+myapps_jobs_refresh_mcp_config_path: "{{ myapps_compose_dir }}/jobs-refresh/mcp-config.json"
+# Container-side path, bind-mounted read-only -- this is the value
+# JOBS_REFRESH_MCP_CONFIG carries into the container.
+myapps_jobs_refresh_mcp_config_container_path: /data/mcp-config.json
+
+# Timer: run every 6 hours, randomized to avoid a thundering herd on restart.
+# Deliberately offset by an hour so it never lands on a digest slot. digest
+# runs 0/6 (00 06 12 18); a 0/6 schedule here would collide on
+# every single run, and with a 600s jitter either side both Opus jobs would
+# be in flight at once -- competing for the same subscription rate limit and
+# the VM's CPU, with jobs-refresh holding it for up to an hour. Keep the
+# offset if you change the interval.
+myapps_jobs_refresh_on_calendar: "*-*-* 1/6:00:00"
+myapps_jobs_refresh_randomized_delay_sec: 600
+# The job clones/pulls two repos and runs a `claude -p` pass -- digest's
+# 600s TimeoutStartSec is nowhere near enough headroom for that. Must stay
+# >= 3600.
+myapps_jobs_refresh_timeout_start_sec: 3600
+
+# --- garmin-health (https://github.com/Dezoxy/my-health-datas) ---
+# Personal Garmin health pipeline. One image, two independent one-shot jobs:
+# `sync` (fetch -> ingest -> verify) daily, and `report` (stats -> claude -p
+# -> Telegram) monthly. Same shape as digest: pinned GHCR tag, never built on
+# the VM, `profiles: ["oneshot"]` so `up -d` ignores it, systemd timers own
+# the scheduling.
+#
+# Flip to true after the Key Vault secrets exist (folder=garmin:
+# garmin-ghcr-pull-token, garmin-telegram-bot-token, garmin-telegram-chat-id)
+# AND both one-time interactive logins have been done on the VM (Garmin OAuth
+# and the Claude CLI -- see the app repo's docs/deployment.md). Keeping it
+# false keeps every other myapps deploy working.
+myapps_garmin_health_enabled: false
+# Pin an exact version -- Renovate opens the bump PR when a new tag lands in
+# GHCR. There is no `latest` tag to fall back on, by design.
+myapps_garmin_health_image: "ghcr.io/dezoxy/my-health-datas:0.8.0"
+# read:packages PAT for pulling the PRIVATE ghcr.io/dezoxy/my-health-datas
+# image. Empty here; resolved from the garmin-ghcr-pull-token Key Vault secret
+# via myapps_garmin_health_ghcr_pull_token_effective in 01-myapps-vm.yml.
+myapps_garmin_health_ghcr_pull_token: ""
+
+# Single bind mount -> /data in the container.
+#
+# Backed up by the homelab_local_state_paths mirror declared in
+# host_vars/01-myapps-vm -- NOT by restic reading /srv/appdata directly. That
+# was the claim here until 2026-08-25 and it was false: on 01-media-vm and
+# 01-unifi-vm /srv/appdata IS the VirtIO-FS share, but on THIS host it is a
+# local ext4 directory and the share is mounted at /srv/backup-share. Restic
+# had never seen any of this. 70 MB of raw dumps and both token dirs were
+# unbacked for as long as the comment said otherwise.
+#
+# What is worth keeping, and why:
+#   raw/            immutable source of truth (health.db is rebuilt from it)
+#   garmin-tokens/  cannot be re-created unattended
+#   claude-home/    cannot be re-created unattended
+#   raw/            immutable Garmin dumps
+#   health.db       rebuilt by every ingest
+#   reports/        monthly markdown reports
+#   garmin-tokens/  garth OAuth tokens   (one-time interactive login)
+#   claude-home/    Claude CLI auth      (one-time interactive login)
+myapps_garmin_health_state_dir: /srv/appdata/garmin-health
+myapps_garmin_health_reports_dir: "{{ myapps_garmin_health_state_dir }}/reports"
+myapps_garmin_health_garmin_tokens_dir: "{{ myapps_garmin_health_state_dir }}/garmin-tokens"
+myapps_garmin_health_claude_home_dir: "{{ myapps_garmin_health_state_dir }}/claude-home"
+
+# --- Claude report generation ---
+# Auth is the owner's subscription login in claude-home above, not an API key
+# -- same as digest, so no Anthropic secret exists in Key Vault.
+myapps_garmin_health_anthropic_model: opus
+myapps_garmin_health_claude_effort: high
+# One call per month against a ~600-word report: nowhere near this ceiling.
+# Must stay below myapps_garmin_health_report_timeout_start_sec (asserted in
+# tasks/main.yml) so the app's own timeout fires first and produces a real
+# error message instead of systemd killing the unit mid-call.
+myapps_garmin_health_claude_timeout_seconds: 1200
+
+# How stale the newest DB row may be before `verify` fails the sync. Loose on
+# purpose: Garmin gaps are normal (watch off the wrist, travel), so this
+# catches "the feed stopped", not "he skipped a night".
+myapps_garmin_health_verify_max_stale_days: 10
+
+# --- Telegram (SECRETS, folder=garmin) ---
+# A DEDICATED bot and private chat, deliberately not the digest alert bot:
+# health data must not share a credential or a group with the news digest.
+# Carries both the monthly report and this service's failure alerts (whose
+# journal tails can include the owner's Garmin account name and data dates).
+myapps_garmin_health_telegram_bot_token: ""
+myapps_garmin_health_telegram_chat_id: ""
+myapps_garmin_health_notify_env_file: "{{ myapps_compose_dir }}/garmin-health-notify.env"
+
+# --- Schedules ---
+# Daily sync, NOT monthly. The Garmin web API is unofficial: when its response
+# shape changes the j_* parsers return zero rows instead of crashing, and only
+# the pipeline's `verify` stage turns that into a non-zero exit. Daily runs
+# surface a break within a day instead of up to a month, and each fetch pulls
+# one day rather than thirty-five. The 03:30-03:45 band (900s jitter) is used
+# by no other myapps job: digest windows run 00/06/12/18, positions on odd
+# hours at :25, jobs-refresh 01,07,13,19, and the hourly patreon :50 slot sits
+# five minutes past the far end. Contention matters less here than for the
+# report anyway -- sync makes no Claude call at all.
+myapps_garmin_health_sync_on_calendar: "*-*-* 03:30:00"
+myapps_garmin_health_sync_randomized_delay_sec: 900
+# Fetch is rate-limited to ~0.6s/request and a normal day is a handful of
+# requests. The headroom is for the occasional catch-up after the VM was off,
+# where Persistent=true replays one run covering several days.
+myapps_garmin_health_sync_timeout_start_sec: 1800
+
+# 2nd of the month, so the month being reported on is fully complete. Runs
+# after that morning's sync rather than chaining off it with OnSuccess=: an
+# independent timer means a failed sync cannot silently cancel the report, and
+# the report always covers the previous FULL month regardless of when the last
+# sync landed.
+#
+# 04:10, NOT 06:00. This is the repo's second Opus job outside the digest role
+# (the first being jobs-refresh, offset to 1/6 for the same reason): 06:00 is a
+# digest window slot, and with 600s jitter on both sides the two `claude -p`
+# calls would land in the same ten-minute band once a month, competing for the
+# one Max-subscription rate limit. Hour 04 is used by no other myapps job --
+# digest windows run 00/06/12/18, positions 01,05,09,13,17,21:25, jobs-refresh
+# 01,07,13,19 -- and the 04:10-04:20 band clears the hourly patreon :50 slot by
+# thirty minutes and this service's own sync (03:30-03:45) by twenty-five.
+#
+# NOT serialized behind digest-run's flock (#769), deliberately: that lock
+# exists because four digest modes share ONE Telethon session, which garmin-
+# health never opens. jobs-refresh, the other non-digest Claude job, stays out
+# of it too. Separation here is by schedule, not by lock.
+myapps_garmin_health_report_on_calendar: "*-*-02 04:10:00"
+myapps_garmin_health_report_randomized_delay_sec: 600
+# Must exceed myapps_garmin_health_claude_timeout_seconds (1200) with room for
+# the stats query and the two Telegram uploads -- asserted in tasks/main.yml.
+myapps_garmin_health_report_timeout_start_sec: 2400
+
+# --- withings-sync (https://github.com/jaroslawhartman/withings-sync) ---
+# Feeds the garmin-health pipeline above: the owner weighs in on a Withings
+# scale, Garmin has no native Withings integration, and this tool bridges the
+# gap by pulling the readings from the Withings API and uploading them as a
+# FIT file to Garmin Connect. From there garmin-sync's body_composition fetch
+# picks them up like any other Garmin data, so the app repo needs no Withings
+# code at all. Same deployment shape as garmin-health: pinned public GHCR
+# tag, `profiles: ["oneshot"]`, a systemd timer owns the scheduling.
+#
+# Needs NO Key Vault secret. Both sides authenticate from token files that a
+# one-time interactive login writes into the state dir (see host_vars):
+# Withings via its OAuth flow (URL printed, code pasted back), Garmin via
+# python-garminconnect's tokenstore-first login, which only asks for the
+# password (and MFA) the first time. It is gated separately from
+# garmin-health so the pipeline keeps running if this bridge is ever
+# retired, and because garmin-health can be enabled without it.
+myapps_withings_sync_enabled: false
+# Pin an exact version -- Renovate tracks this via the top-level *_image
+# regex manager. Upstream tags carry a `v` prefix.
+# v6.0.2 is the newest upstream release (2026-04-22). Renovate tracks this pin
+# via the generic *_image manager.
+#
+# KNOWN, NOT FIXABLE HERE: the image ships garminconnect 0.3.2 — the release
+# that introduced the 5-strategy cascading login, without any of the nine later
+# fixes to it (429 preservation, Cloudflare detection, MFA state, token-store
+# hardening). It is NOT a stale pin: the image runs Python 3.11.15 and
+# garminconnect 0.3.3+ requires >=3.12, so 0.3.2 is the newest version
+# installable there. A derived image doing `pip install --upgrade` cannot work;
+# verified by building one and watching pip reject every candidate.
+#
+# Consequences, both narrow: the ONE-TIME login and the ~yearly re-auth run the
+# unfixed cascade and may hit Garmin's SSO rate limit (wait, do not retry in a
+# loop) — nightly runs are tokenstore-first and never touch it. And 0.3.2
+# predates the 0.3.5 fix for world-readable token files, which is why the state
+# directory below is 0700 rather than 0750.
+myapps_withings_sync_image: "ghcr.io/jaroslawhartman/withings-sync:v6.0.2"
+# Holds exactly two files, both written by the one-time login:
+#   .withings_user.json   Withings OAuth refresh token
+#   garmin_tokens.json    Garmin session tokens
+# Mirrored to the share by homelab_local_state_paths (host_vars) so restic
+# sweeps it -- being under /srv/appdata is NOT what backs it up, because
+# /srv/appdata on this host is local ext4, not the share. Neither file is
+# re-creatable unattended. Separate from /srv/appdata/garmin-health on purpose: a
+# different tool with its own token format, and a Garmin token dir that
+# garmin-health's fetch must never read or rewrite.
+# REQUIRED when enabled — and not for login. In withings-sync's upload gate
+# the Garmin username is the switch that SELECTS Garmin as a destination:
+# without it the tool fetches from Withings and then uploads nowhere, logging
+# only "No Garmin data selected - skipping sync" and exiting 0 — a silent
+# no-op the OnFailure alert can never catch. Login itself is tokenstore-first
+# and never uses it once tokens exist; no password is ever set.
+myapps_withings_sync_garmin_username: ""
+myapps_withings_sync_state_dir: /srv/appdata/withings-sync
+myapps_withings_sync_timezone: Europe/Budapest
+
+# 03:00, deliberately BEFORE garmin-sync's 03:30-03:45 band: a weigh-in has
+# to be in Garmin Connect before garmin-sync fetches body_composition, or it
+# shows up a day late. 600s jitter ends at 03:10, twenty minutes clear of
+# garmin-sync's earliest start. Independent timer rather than OnSuccess=
+# chaining, for the same reason garmin-report is not chained off garmin-sync:
+# a Withings outage must not cancel the Garmin fetch. Hour 03 is used by no
+# other myapps job (digest windows 00/06/12/18, positions on odd hours at
+# :25, jobs-refresh 01/07/13/19, patreon hourly at :50 -- 02:50-02:52 ends
+# eight minutes before this starts).
+myapps_withings_sync_on_calendar: "*-*-* 03:00:00"
+myapps_withings_sync_randomized_delay_sec: 600
+# Two API calls and one FIT upload; "no measurements" is a normal exit, not a
+# failure. 600s is generous for a catch-up after the VM was off.
+# Sized for a nightly delta (a handful of weigh-ins). A --fromdate backfill can
+# exceed this, which is fine: the runbook in host_vars runs that by hand, not
+# through the unit, so this ceiling never applies to it.
+myapps_withings_sync_timeout_start_sec: 600
+
+# --- Service control ---
+myapps_restart_on_change: true
+myapps_manage_services: true
+# T3MP3ST builds are large; cleanup runs only after a changed deploy succeeds.
+myapps_prune_images_after_deploy: true

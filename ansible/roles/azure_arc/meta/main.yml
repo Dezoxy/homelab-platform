@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: azure_arc
+  author: toomhorvath
+  description: "Registers supported Linux VMs with Azure Arc-enabled servers."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies: []

@@ -1,0 +1,19 @@
+[Unit]
+Description=Restic backup: appdata
+Wants=network-online.target
+After=network-online.target
+OnFailure={{ restic_appdata_service_name }}-notify.service
+ConditionPathIsMountPoint={{ restic_appdata_source_dir }}
+ConditionPathExists={{ restic_appdata_env_file }}
+ConditionPathExists={{ restic_appdata_backup_script }}
+
+[Service]
+Type=oneshot
+ExecStart={{ restic_appdata_backup_script }}
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

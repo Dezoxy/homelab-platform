@@ -1,0 +1,72 @@
+---
+- name: Resolve requested base image pin
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    proxmox_image_repo_root: "{{ playbook_dir }}/../../.."
+    proxmox_image_target_effective: >-
+      {{
+        proxmox_image_target
+        | default(lookup('env', 'TARGET'), true)
+        | trim
+      }}
+    proxmox_image_id_effective: >-
+      {{
+        proxmox_image_id
+        | default(lookup('env', 'IMAGE_ID'), true)
+        | trim
+      }}
+
+  tasks:
+    - name: Require exactly one image selector
+      ansible.builtin.assert:
+        that:
+          - >-
+            (proxmox_image_target_effective | length > 0)
+            != (proxmox_image_id_effective | length > 0)
+        fail_msg: >-
+          Set exactly one of proxmox_image_target/TARGET or
+          proxmox_image_id/IMAGE_ID from infra-images/catalog.json.
+
+    - name: Select resolver input
+      ansible.builtin.set_fact:
+        proxmox_image_selector_argument: >-
+          {{
+            '--image'
+            if proxmox_image_id_effective | length > 0
+            else '--target'
+          }}
+        proxmox_image_selector_value: >-
+          {{
+            proxmox_image_id_effective
+            if proxmox_image_id_effective | length > 0
+            else proxmox_image_target_effective
+          }}
+
+    - name: Resolve pinned image from catalog
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ proxmox_image_repo_root }}/scripts/ci/resolve_image_pin.py"
+          - --catalog
+          - "{{ proxmox_image_repo_root }}/infra-images/catalog.json"
+          - "{{ proxmox_image_selector_argument }}"
+          - "{{ proxmox_image_selector_value }}"
+      register: proxmox_image_resolution_raw
+      changed_when: false
+
+    - name: Store resolved image pin
+      ansible.builtin.set_fact:
+        proxmox_image_resolution: "{{ proxmox_image_resolution_raw.stdout | from_json }}"
+
+- name: Ensure target base image exists
+  hosts: proxmox_nodes
+  become: true
+  gather_facts: false
+  vars:
+    proxmox_image_repo_root: "{{ playbook_dir }}/../../.."
+    proxmox_image_resolution: "{{ hostvars['localhost'].proxmox_image_resolution }}"
+
+  roles:
+    - role: proxmox_image

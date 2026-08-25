@@ -1,0 +1,32 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  locale: en_US
+  keyboard:
+    layout: us
+
+  identity:
+    hostname: ${template_name}
+    username: ${ssh_username}
+    password: "$6$20yZTLWMRJK.EvQp$7w/iE4buJ52AjOt4Bi37ljDvm8nBnlW.4FBX2oUlU2a25rDIS0qVH5eZ39WNGYZxBhfzIPAJYZ21Pqj/VfS8E0"
+    # ^ SHA-512 hash for password "packer".
+
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - ${ssh_public_key}
+
+  packages:
+    - qemu-guest-agent
+
+  package_update: false
+  package_upgrade: false
+
+  late-commands:
+    - curtin in-target -- systemctl enable qemu-guest-agent
+    - curtin in-target -- systemctl enable ssh
+    - curtin in-target -- usermod -aG sudo ${ssh_username} || true
+    - curtin in-target -- sh -c "echo '${ssh_username} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-${ssh_username}"
+    - curtin in-target -- chmod 0440 /etc/sudoers.d/99-${ssh_username}

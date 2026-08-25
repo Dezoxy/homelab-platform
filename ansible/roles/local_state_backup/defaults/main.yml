@@ -1,0 +1,38 @@
+---
+# Mirror a host's LOCAL application state onto the VirtIO-FS share, where
+# 01-backup-lxc's restic run sweeps it to B2.
+#
+# Extracted from media_stack (2026-08-25) so 01-myapps-vm can use it too. The
+# reason it is shared rather than copied: the script does SQLite-safe copying
+# -- sqlite3.backup() into a temp file on LOCAL ext4 before crossing the share
+# -- and two divergent copies of that logic is how one of them quietly stops
+# being safe.
+#
+# Why local state exists at all, on both hosts: VirtIO-FS is fine for regular
+# files, but SQLite write/locking semantics break on it. Live databases stay on
+# the VM's own ext4 disk; only snapshots cross the share.
+
+# Where this host keeps live state. Used for RequiresMountsFor= only.
+homelab_local_state_root: /var/lib/homelab
+
+# The VirtIO-FS share this host mirrors INTO. Not the same path everywhere:
+# 01-media-vm and 01-unifi-vm mount the share at /srv/appdata, but
+# 01-myapps-vm mounts it at /srv/backup-share because /srv/appdata there is a
+# local ext4 directory holding live state. Defaulting to appdata_mount keeps
+# media rendering byte-identically to before the extraction.
+local_state_share_mount: "{{ appdata_mount | default('/srv/appdata') }}"
+
+homelab_local_state_backup_root: "{{ local_state_share_mount }}"
+homelab_local_state_backup_script: /usr/local/sbin/homelab-local-state-backup
+
+# Absence of this marker in a target directory is what triggers a restore, so
+# the seed runs exactly once on a host with no state and never again. Consumed
+# by each role's own restore tasks, not by this role.
+homelab_local_state_marker_name: ".codex-local-state-ready"
+
+homelab_local_state_paths: []
+homelab_local_state_backup_on_calendar: "*-*-* 01:05:00"
+homelab_local_state_backup_randomized_delay_sec: "5m"
+
+# Set false on a host that declares paths but should not run the timer.
+local_state_backup_timer_enabled: true

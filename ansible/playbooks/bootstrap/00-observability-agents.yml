@@ -1,0 +1,14 @@
+- name: Install observability agents on all hosts
+  hosts: all
+  become: true
+  roles:
+    - role: observability_agent
+
+- name: Enable cAdvisor on Docker hosts
+  hosts: media_vm:torrent_lxc:myapps_vm:observability_lxc
+  become: true
+  vars:
+    observability_cadvisor_enabled: true
+  roles:
+    - role: docker
+    - role: observability_agent

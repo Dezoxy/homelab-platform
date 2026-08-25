@@ -1,0 +1,453 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "pre-commit": {
+    "enabled": true
+  },
+  "prConcurrentLimit": 1,
+  "customManagers": [
+    {
+      "description": "Docker image pins stored as top-level *_image vars in Ansible host_vars or role defaults",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/",
+        "/^ansible\\/roles\\/[^/]+\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*[A-Za-z0-9_]+_image:[\\t ]*[\"']?(?<depName>[^\\s\"'#:{}]+(?:/[^\\s\"'#:{}]+)*):(?<currentValue>[^@\\s\"'#{}]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "description": "LinuxServer image pins stored in nested Ansible maps via lscr.io mirror",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/",
+        "/^ansible\\/roles\\/[^/]+\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]{2,}[A-Za-z0-9_-]+:[\\t ]*[\"']?lscr\\.io\\/(?<packageName>[A-Za-z0-9._-]+(?:\\/[A-Za-z0-9._-]+)+):(?<currentValue>[^@\\s\"'#]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
+      ],
+      "depNameTemplate": "lscr.io/{{{packageName}}}",
+      "packageNameTemplate": "{{{packageName}}}",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "description": "Docker image pins stored in nested Ansible maps like homelab_images",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/",
+        "/^ansible\\/roles\\/[^/]+\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]{2,}[A-Za-z0-9_-]+:[\\t ]*[\"']?(?<depName>[A-Za-z0-9_-]+(?:\\/[A-Za-z0-9._-]+)+):(?<currentValue>[^@\\s\"'#]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "description": "GHCR image pins stored in nested Ansible maps like homelab_images",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/",
+        "/^ansible\\/roles\\/[^/]+\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]{2,}[A-Za-z0-9_-]+:[\\t ]*[\"']?(?<depName>ghcr\\.io\\/[A-Za-z0-9._-]+(?:\\/[A-Za-z0-9._-]+)+):(?<currentValue>[^@\\s\"'#]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "description": "Pinned upstream Plex Media Server version used by the LinuxServer image",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/",
+        "/^ansible\\/roles\\/[^/]+\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*plex_server_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "plexinc/pms-docker",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "description": "Claude Code CLI version pins in Ansible host vars",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*claude_cli_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "@anthropic-ai/claude-code",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
+    },
+    {
+      "description": "Traefik GitHub release pins in Ansible host vars",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/host_vars\\/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*traefik_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "traefik/traefik",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "Grafana Alloy version pin in observability agents role defaults",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/roles\\/observability_agent\\/defaults\\/main\\.yml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*alloy_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "grafana/alloy",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "code-server version pin in the code_server role defaults",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/roles\\/code_server\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*code_server_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "coder/code-server",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "@anthropic-ai/claude-code version pin in the agent_cli role defaults",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/roles\\/agent_cli\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*agent_claude_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "@anthropic-ai/claude-code",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "@openai/codex version pin in the agent_cli role defaults",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ansible\\/roles\\/agent_cli\\/defaults\\/main\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*agent_codex_version:[\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "@openai/codex",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "Terraform CLI version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*TERRAFORM_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "hashicorp/terraform",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "Packer CLI version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*PACKER_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "hashicorp/packer",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "Ansible version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*ANSIBLE_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "ansible",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    },
+    {
+      "description": "ansible-lint version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*ANSIBLE_LINT_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "ansible-lint",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    },
+    {
+      "description": "Tailscale CLI version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*TAILSCALE_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "tailscale/tailscale",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "actionlint version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*ACTIONLINT_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "rhysd/actionlint",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "community.docker collection version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*COMMUNITY_DOCKER_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "community.docker",
+      "datasourceTemplate": "galaxy-collection",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "tflint version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*TFLINT_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "terraform-linters/tflint",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "checkov version pin in scripts/ci/versions.sh",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts\\/ci\\/versions\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\r\n|\r|\n)[\\t ]*CHECKOV_VERSION[=:][\\t ]*[\"']?(?<currentValue>[^\\s\"'#]+)[\"']?"
+      ],
+      "depNameTemplate": "checkov",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    },
+    {
+      "description": "gitleaks version pin in secret-scan workflow",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/gitleaks\\.yml$/"
+      ],
+      "matchStrings": [
+        "version=\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "gitleaks/gitleaks",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "Trivy version pin in trivy workflow",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/trivy\\.yml$/"
+      ],
+      "matchStrings": [
+        "version=\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Disable Renovate for Tailscale",
+      "matchPackageNames": [
+        "tailscale/tailscale"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Use stable short-tag versioning for LinuxServer images",
+      "matchPackageNames": [
+        "linuxserver/bazarr",
+        "linuxserver/plex",
+        "linuxserver/prowlarr",
+        "linuxserver/radarr",
+        "linuxserver/sonarr",
+        "linuxserver/tautulli"
+      ],
+      "matchDepNames": [
+        "lscr.io/linuxserver/bazarr",
+        "lscr.io/linuxserver/plex",
+        "lscr.io/linuxserver/prowlarr",
+        "lscr.io/linuxserver/radarr",
+        "lscr.io/linuxserver/sonarr",
+        "lscr.io/linuxserver/tautulli"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "description": "Use <version>-ls<build> tags for the LinuxServer UniFi Network Application",
+      "matchPackageNames": [
+        "linuxserver/unifi-network-application"
+      ],
+      "matchDepNames": [
+        "lscr.io/linuxserver/unifi-network-application"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-ls(?<build>\\d+)$"
+    },
+    {
+      "description": "Pin MongoDB to the 8.0 LTS line -- UniFi's DB. MongoDB ships one yearly major (8.0, 9.0) plus quarterly Rapid Releases (8.1/8.2/8.3) that fold into the next major, and the documented upgrade path between them is sequential -- you cannot jump 8.0 -> 8.3. 8.0 also carries 5-year support where a rapid release does not, and UniFi documents support for 8.0, not for rapid releases. <9.0.0 was too loose: it let Renovate propose 8.3.7. Patch updates within 8.0.x are still picked up.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchDepNames": [
+        "mongo"
+      ],
+      "allowedVersions": "<8.1.0"
+    },
+    {
+      "description": "Use version-release tags for LinuxServer qBittorrent",
+      "matchPackageNames": [
+        "linuxserver/qbittorrent"
+      ],
+      "matchDepNames": [
+        "linuxserver/qbittorrent"
+      ],
+      "versioning": "regex:^version-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:(?:-r|_v\\d+\\.)(?<build>\\d+)(?:\\.(?<revision>\\d+))?)?$"
+    },
+    {
+      "description": "Resolve Seerr tags from Docker Hub while keeping the deployed GHCR image reference",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchDepNames": [
+        "ghcr.io/seerr-team/seerr"
+      ],
+      "overridePackageName": "seerr/seerr"
+    },
+    {
+      "description": "Group managed dependency updates for 01-edge-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-edge-lxc/vars.yml"
+      ],
+      "groupName": "01-edge-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-dns-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-dns-lxc.yml"
+      ],
+      "groupName": "01-dns-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-reverse-proxy-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-reverse-proxy-lxc.yml"
+      ],
+      "groupName": "01-reverse-proxy-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-torrent-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-torrent-lxc.yml"
+      ],
+      "groupName": "01-torrent-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-myapps-vm",
+      "matchFileNames": [
+        "ansible/host_vars/01-myapps-vm/vars.yml"
+      ],
+      "groupName": "01-myapps-vm managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-observability-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-observability-lxc/vars.yml"
+      ],
+      "groupName": "01-observability-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-backup-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-backup-lxc/vars.yml"
+      ],
+      "groupName": "01-backup-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-tailscale-lxc",
+      "matchFileNames": [
+        "ansible/host_vars/01-tailscale-lxc/vars.yml"
+      ],
+      "groupName": "01-tailscale-lxc managed dependencies"
+    },
+    {
+      "description": "Group managed dependency updates for 01-media-vm",
+      "matchFileNames": [
+        "ansible/host_vars/01-media-vm/vars.yml"
+      ],
+      "groupName": "01-media-vm managed dependencies"
+    },
+    {
+      "description": "Group 01-code-lxc's toolchain. code-server and the two agent CLIs are one guest's dependencies and are deployed by one play; separate PRs would mean three deploys of the same container.",
+      "matchFileNames": [
+        "ansible/roles/code_server/defaults/main.yml",
+        "ansible/roles/agent_cli/defaults/main.yml"
+      ],
+      "groupName": "01-code-lxc managed dependencies"
+    },
+    {
+      "description": "Group GitHub workflow action and tool version updates",
+      "matchFileNames": [
+        ".github/workflows/**"
+      ],
+      "groupName": "github workflow dependencies"
+    }
+  ],
+  "timezone": "Europe/Budapest",
+  "schedule": [
+    "after 6am before 7am"
+  ]
+}

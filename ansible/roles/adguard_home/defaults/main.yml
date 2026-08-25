@@ -1,0 +1,48 @@
+---
+base_packages:
+  - ca-certificates
+  - curl
+  - apache2-utils
+  - tar
+
+adguard_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armv7
+
+adguardhome_install_dir: /opt/adguardhome
+adguardhome_config_dir: /opt/adguardhome/conf
+adguardhome_work_dir: /opt/adguardhome/work
+
+adguard_manage_config: true
+adguard_schema_version: 32
+adguard_bind_host: 0.0.0.0
+adguard_web_port: 3000
+adguard_dns_port: 53
+adguard_filters_update_interval: 24
+# 168h/7d: the previous 2160h/90d default let querylog.json grow to 3.7G and
+# filled a 5.9G root disk (01-dns-lxc, 2026-08-06 incident).
+adguard_querylog_interval: "168h"
+adguard_querylog_size_memory: 1000
+adguard_statistics_interval: "24h"
+adguard_ratelimit: 200
+adguard_ratelimit_subnet_len_ipv4: 32
+adguard_ratelimit_subnet_len_ipv6: 128
+
+adguard_upstream_dns: []
+adguard_bootstrap_dns: []
+adguard_fallback_dns: []
+adguard_use_private_ptr_resolvers: true
+adguard_local_ptr_upstreams: []
+
+adguard_filters: []
+adguard_whitelist_filters: []
+adguard_user_rules: []
+
+adguard_extra_rewrites: []
+
+adguard_resolv_search_domain: home.arpa
+adguard_resolv_nameservers:
+  - 9.9.9.9
+  - 8.8.8.8
+adguard_resolv_options: "timeout:2 attempts:2 rotate"

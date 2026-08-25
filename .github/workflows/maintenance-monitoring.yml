@@ -1,0 +1,147 @@
+name: Platform / Maintenance / Monitoring
+run-name: Maintenance / Monitoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_all:
+        description: "Run on all hosts"
+        type: boolean
+        default: false
+      target_01_edge_lxc:
+        description: "01-edge-lxc"
+        type: boolean
+        default: false
+      target_01_dns_lxc:
+        description: "01-dns-lxc"
+        type: boolean
+        default: false
+      target_01_reverse_proxy_lxc:
+        description: "01-reverse-proxy-lxc"
+        type: boolean
+        default: false
+      target_01_torrent_lxc:
+        description: "01-torrent-lxc"
+        type: boolean
+        default: false
+      target_01_observability_lxc:
+        description: "01-observability-lxc"
+        type: boolean
+        default: false
+      target_01_backup_lxc:
+        description: "01-backup-lxc"
+        type: boolean
+        default: false
+      target_01_tailscale_lxc:
+        description: "01-tailscale-lxc"
+        type: boolean
+        default: false
+      target_01_media_vm:
+        description: "01-media-vm"
+        type: boolean
+        default: false
+      target_01_myapps_vm:
+        description: "01-myapps-vm"
+        type: boolean
+        default: false
+      target_01_unifi_vm:
+        description: "01-unifi-vm"
+        type: boolean
+        default: false
+
+concurrency:
+  group: platform-maintenance-monitoring
+  cancel-in-progress: false
+
+jobs:
+  monitoring:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ANSIBLE_CONFIG: ansible/ansible.cfg
+      ANSIBLE_DEPRECATION_WARNINGS: "False"
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load CI versions
+        shell: bash
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' scripts/ci/versions.sh | tr -d '"' >> "$GITHUB_ENV"
+
+      - name: Fetch Tailscale secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: tailscale
+
+      - name: Fetch SSH secrets from Azure Key Vault
+        uses: ./.github/actions/azure-secrets
+        with:
+          keyvault-name: ${{ vars.AZURE_KEYVAULT_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          folder: ssh
+
+      - id: tailscale
+        name: Export Tailscale runtime inputs
+        shell: bash
+        run: bash scripts/ci/export_runtime_env.sh tailscale-outputs
+
+      - name: Connect to Tailscale (for LAN access)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ steps.tailscale.outputs.oauth_client_id }}
+          oauth-secret: ${{ steps.tailscale.outputs.oauth_secret }}
+          tags: tag:github-ci
+          version: ${{ env.TAILSCALE_VERSION }}
+          hostname: "gh-${{ github.run_id }}-monitoring"
+          args: --accept-dns=false
+
+      - name: Ensure Ansible
+        shell: bash
+        run: bash scripts/ci/ensure_ansible.sh
+
+      - name: Prepare SSH keys
+        shell: bash
+        run: bash scripts/ci/prepare_ssh_keys.sh
+
+      - name: Resolve monitoring targets
+        shell: bash
+        env:
+          TARGET_ALL: ${{ inputs.target_all || 'false' }}
+          TARGET_01_EDGE_LXC: ${{ inputs.target_01_edge_lxc || 'false' }}
+          TARGET_01_DNS_LXC: ${{ inputs.target_01_dns_lxc || 'false' }}
+          TARGET_01_REVERSE_PROXY_LXC: ${{ inputs.target_01_reverse_proxy_lxc || 'false' }}
+          TARGET_01_TORRENT_LXC: ${{ inputs.target_01_torrent_lxc || 'false' }}
+          TARGET_01_OBSERVABILITY_LXC: ${{ inputs.target_01_observability_lxc || 'false' }}
+          TARGET_01_BACKUP_LXC: ${{ inputs.target_01_backup_lxc || 'false' }}
+          TARGET_01_TAILSCALE_LXC: ${{ inputs.target_01_tailscale_lxc || 'false' }}
+          TARGET_01_MEDIA_VM: ${{ inputs.target_01_media_vm || 'false' }}
+          TARGET_01_MYAPPS_VM: ${{ inputs.target_01_myapps_vm || 'false' }}
+          TARGET_01_UNIFI_VM: ${{ inputs.target_01_unifi_vm || 'false' }}
+        run: bash scripts/ci/resolve_maintenance_targets.sh
+
+      - name: Prepare attested SSH trust for selected guests
+        shell: bash
+        run: bash scripts/ci/prepare_attested_ssh_trust.sh
+
+      - name: Wait for selected hosts to become reachable
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-wait-for-connection.yml \
+            --limit "${MAINTENANCE_LIMIT}" \
+            -e "maintenance_wait_timeout=600 maintenance_wait_sleep=5"
+
+      - name: Enable monitoring on selected hosts
+        shell: bash
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/playbooks/bootstrap/00-observability-agents.yml \
+            --limit "${MAINTENANCE_LIMIT}"

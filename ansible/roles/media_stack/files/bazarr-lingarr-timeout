@@ -1,0 +1,35 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+translator_file=/app/bazarr/bin/bazarr/subtitles/tools/translate/services/lingarr_translator.py
+timeout_seconds="${BAZARR_LINGARR_TRANSLATION_TIMEOUT_SECONDS:-5400}"
+
+python3 - "${translator_file}" "${timeout_seconds}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+translator_path = Path(sys.argv[1])
+timeout = sys.argv[2]
+
+if not timeout.isdecimal() or not 60 <= int(timeout) <= 86400:
+    raise SystemExit(
+        "BAZARR_LINGARR_TRANSLATION_TIMEOUT_SECONDS must be between 60 and 86400"
+    )
+
+if not translator_path.is_file():
+    raise SystemExit(f"Bazarr Lingarr translator not found: {translator_path}")
+
+source = translator_path.read_text(encoding="utf-8")
+pattern = re.compile(r"(?m)^(\s*)timeout=\d+(\s*)$")
+matches = pattern.findall(source)
+if len(matches) != 1:
+    raise SystemExit(
+        f"Expected exactly one Lingarr timeout assignment in {translator_path}, "
+        f"found {len(matches)}"
+    )
+
+updated = pattern.sub(rf"\g<1>timeout={timeout}\g<2>", source, count=1)
+translator_path.write_text(updated, encoding="utf-8")
+print(f"Set Bazarr Lingarr translation timeout to {timeout} seconds")
+PY

@@ -1,0 +1,33 @@
+server:
+  http_listen_port: {{ observability_tempo_port }}
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:{{ observability_otlp_grpc_port }}
+        http:
+          endpoint: 0.0.0.0:{{ observability_otlp_http_port }}
+
+metrics_generator:
+  storage:
+    path: /var/tempo/generator/wal
+
+backend_scheduler:
+  provider:
+    compaction:
+      compaction:
+        block_retention: {{ observability_tempo_block_retention }}
+
+backend_worker:
+  compaction:
+    block_retention: {{ observability_tempo_block_retention }}
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal

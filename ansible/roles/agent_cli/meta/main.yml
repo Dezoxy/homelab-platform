@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: agent_cli
+  author: toomhorvath
+  description: "Installs the claude and codex CLIs with auth state on the appdata mount."
+  license: MIT
+  min_ansible_version: "2.15"
+
+dependencies: []

@@ -1,0 +1,23 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+observability_lxc_vmid       = 174
+observability_lxc_name       = "01-observability-lxc"
+observability_lxc_ip_address = "192.168.1.74/24"
+observability_lxc_gateway    = "192.168.1.1"
+observability_lxc_disk_gb    = 16
+observability_lxc_username   = "toomhorvath"
+
+# Bind mount from the Proxmox host (no NFS inside the container).
+observability_appdata_mount_volume = "/srv/appdata/observability"
+observability_appdata_mount_path   = "/srv/appdata/observability"
+
+# Bind mounts are simplest with a privileged LXC. You can experiment with unprivileged,
+# but make sure UID/GID mapping lines up with the host filesystem ownership.
+# observability_lxc_unprivileged = false

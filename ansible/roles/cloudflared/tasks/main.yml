@@ -1,0 +1,103 @@
+---
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] in ["Debian", "Ubuntu"]
+    fail_msg: "cloudflared role expects Debian or Ubuntu."
+
+- name: Require cloudflared tunnel token
+  ansible.builtin.assert:
+    that: cloudflared_tunnel_token | length > 0
+    fail_msg: "Set cloudflared_tunnel_token in host_vars."
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: Download Cloudflare repo key
+  ansible.builtin.get_url:
+    url: https://pkg.cloudflare.com/cloudflare-main.gpg
+    dest: "{{ cloudflared_keyring }}"
+    mode: "0644"
+
+- name: Add Cloudflare apt repo
+  ansible.builtin.apt_repository:
+    repo: "{{ cloudflared_repo }}"
+    filename: cloudflare
+    state: present
+
+- name: Detect ping_group_range from gid_map
+  ansible.builtin.command: awk 'NR==1{print $1 " " ($1+$3-1)}' /proc/self/gid_map
+  register: ping_group_range_auto
+  changed_when: false
+  failed_when: false
+  # Reading /proc changes nothing, and the sysctl below needs the value in check
+  # mode too -- command modules skip under --check, which left it resolving to an
+  # empty string and failing with "value cannot be blank".
+  check_mode: false
+
+- name: Decide ping_group_range
+  ansible.builtin.set_fact:
+    cloudflared_ping_group_range_effective: >-
+      {{
+        (cloudflared_ping_group_range | default('') | trim)
+        if (cloudflared_ping_group_range | default('') | trim) != ''
+        else (ping_group_range_auto.stdout | default('', true) | trim) or '0 65535'
+      }}
+
+- name: Tune UDP buffers for QUIC
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop:
+    - name: net.core.rmem_max
+      value: "{{ cloudflared_udp_buffer_max }}"
+    - name: net.core.wmem_max
+      value: "{{ cloudflared_udp_buffer_max }}"
+  when: cloudflared_configure_sysctl | bool
+
+- name: Allow ICMP proxy for all groups (WARP)
+  ansible.posix.sysctl:
+    name: net.ipv4.ping_group_range
+    value: "{{ cloudflared_ping_group_range_effective }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  when: cloudflared_configure_sysctl | bool
+
+- name: Install cloudflared
+  ansible.builtin.apt:
+    name: cloudflared
+    state: present
+    update_cache: true
+
+- name: Write cloudflared environment file
+  ansible.builtin.template:
+    src: cloudflared.env.j2
+    dest: /etc/default/cloudflared
+    mode: "0600"
+  no_log: true
+
+- name: Install cloudflared systemd unit
+  ansible.builtin.template:
+    src: cloudflared.service.j2
+    dest: /etc/systemd/system/cloudflared.service
+    mode: "0644"
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start cloudflared
+  ansible.builtin.systemd:
+    name: cloudflared
+    enabled: true
+    state: started

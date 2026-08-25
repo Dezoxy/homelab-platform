@@ -1,0 +1,5 @@
+[Unit]
+{% for path in docker_mount_wait_paths %}
+RequiresMountsFor={{ path }}
+ConditionPathIsMountPoint={{ path }}
+{% endfor %}

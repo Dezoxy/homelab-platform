@@ -1,0 +1,68 @@
+global:
+  scrape_interval: {{ observability_prometheus_scrape_interval }}
+  evaluation_interval: {{ observability_prometheus_scrape_interval }}
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:{{ observability_prometheus_port }}"]
+
+  - job_name: node-exporter
+    static_configs:
+      - targets:
+{% for target in observability_node_exporter_targets %}
+        - {{ target | to_json }}
+{% endfor %}
+
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+{% for target in observability_cadvisor_targets %}
+        - {{ target | to_json }}
+{% endfor %}
+
+  - job_name: cloudflared
+    metrics_path: /metrics
+    static_configs:
+      - targets: [{{ observability_cloudflared_metrics_target | to_json }}]
+
+  - job_name: traefik
+    metrics_path: /metrics
+    static_configs:
+      - targets: [{{ observability_traefik_metrics_target | to_json }}]
+
+{% if observability_adguard_exporter_enabled | default(false) %}
+  - job_name: adguard
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["adguard-exporter:{{ observability_adguard_exporter_port | default(9618) }}"]
+{% endif %}
+
+{% if observability_blackbox_exporter_enabled | default(false) %}
+  - job_name: blackbox
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+{% for target in observability_blackbox_probe_targets %}
+        - {{ target | to_json }}
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+{% endif %}
+
+  - job_name: loki
+    metrics_path: /metrics
+    static_configs:
+      - targets: [{{ observability_loki_metrics_target | to_json }}]
+
+  - job_name: tempo
+    metrics_path: /metrics
+    static_configs:
+      - targets: [{{ observability_tempo_metrics_target | to_json }}]

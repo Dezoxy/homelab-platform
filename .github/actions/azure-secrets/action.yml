@@ -1,0 +1,108 @@
+name: Load Azure Key Vault secrets
+description: Authenticate to Azure via GitHub OIDC and export Key Vault secrets into the job environment.
+
+inputs:
+  keyvault-name:
+    description: Azure Key Vault name.
+    required: true
+  client-id:
+    description: Entra application (client) ID with a GitHub OIDC federated credential.
+    required: true
+  tenant-id:
+    description: Entra tenant ID.
+    required: true
+  subscription-id:
+    description: Azure subscription ID containing the vault.
+    required: true
+  folder:
+    description: Folder tag, or comma-separated list of folder tags, to scope the fetch (empty = all secrets).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Azure configuration
+      shell: bash
+      env:
+        AZURE_KEYVAULT_NAME: ${{ inputs.keyvault-name }}
+        AZURE_CLIENT_ID: ${{ inputs.client-id }}
+        AZURE_TENANT_ID: ${{ inputs.tenant-id }}
+        AZURE_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+      run: |
+        set -euo pipefail
+        for var in AZURE_KEYVAULT_NAME AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+          if [ -z "${!var:-}" ]; then
+            echo "Missing required GitHub repository variable: ${var}" >&2
+            exit 1
+          fi
+        done
+
+    - name: Azure login (OIDC)
+      uses: azure/login@v3
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+
+    - name: Export Key Vault secrets into the job environment
+      shell: bash
+      env:
+        AZURE_KEYVAULT_NAME: ${{ inputs.keyvault-name }}
+        FOLDER: ${{ inputs.folder }}
+      run: |
+        set -euo pipefail
+
+        # FOLDER may be empty (all), one folder, or a comma-separated list.
+        if [ -z "${FOLDER}" ]; then
+          query="[].{id:name, envvar:tags.envvar}"
+        elif [[ "${FOLDER}" == *,* ]]; then
+          list=""
+          IFS=',' read -ra parts <<< "${FOLDER}"
+          for p in "${parts[@]}"; do
+            p="${p// /}"
+            [ -z "${p}" ] && continue
+            list="${list:+${list},}'${p}'"
+          done
+          query="[?contains([${list}], tags.folder)].{id:name, envvar:tags.envvar}"
+        else
+          query="[?tags.folder=='${FOLDER}'].{id:name, envvar:tags.envvar}"
+        fi
+
+        # List names + envvar tags (values fetched per-secret below).
+        rows="$(az keyvault secret list --vault-name "${AZURE_KEYVAULT_NAME}" --query "${query}" -o tsv)"
+        if [ -z "${rows}" ]; then
+          echo "No secrets found in vault '${AZURE_KEYVAULT_NAME}'${FOLDER:+ for folder '${FOLDER}'}" >&2
+          exit 1
+        fi
+
+        count=0
+        while IFS=$'\t' read -r kv_name env_name; do
+          [ -z "${kv_name}" ] && continue
+          if [ -z "${env_name}" ]; then
+            echo "WARNING: secret '${kv_name}' has no 'envvar' tag; skipping" >&2
+            continue
+          fi
+
+          value="$(az keyvault secret show --vault-name "${AZURE_KEYVAULT_NAME}" --name "${kv_name}" --query value -o tsv)"
+
+          # Mask before writing — mask each line so multiline secrets are covered.
+          while IFS= read -r line; do
+            [ -n "${line}" ] && echo "::add-mask::${line}"
+          done <<< "${value}"
+
+          # Write to GITHUB_ENV; heredoc form for multiline values.
+          if [[ "${value}" == *$'\n'* ]]; then
+            delim="EOF_$(openssl rand -hex 8)"
+            {
+              printf '%s<<%s\n' "${env_name}" "${delim}"
+              printf '%s\n' "${value}"
+              printf '%s\n' "${delim}"
+            } >> "${GITHUB_ENV}"
+          else
+            printf '%s=%s\n' "${env_name}" "${value}" >> "${GITHUB_ENV}"
+          fi
+          count=$((count + 1))
+        done <<< "${rows}"
+
+        echo "Loaded ${count} secret(s) from ${AZURE_KEYVAULT_NAME} into the job environment."

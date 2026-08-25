@@ -1,0 +1,11 @@
+[Unit]
+Description=Restic backup: appdata (timer)
+
+[Timer]
+OnCalendar={{ restic_appdata_on_calendar }}
+Persistent=true
+RandomizedDelaySec={{ restic_appdata_randomized_delay_sec }}
+Unit={{ restic_appdata_service_name }}.service
+
+[Install]
+WantedBy=timers.target

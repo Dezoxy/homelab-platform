@@ -1,0 +1,273 @@
+---
+- name: Prepare verified media state before VM replacement
+  hosts: 01-media-vm
+  become: true
+  gather_facts: false
+  vars:
+    media_rebuild_manifest_local: ""
+    media_rebuild_appdata_mount: /srv/appdata
+    media_rebuild_media_mount: /srv/media
+    media_rebuild_compose_service: homelab-compose.service
+    media_rebuild_compose_file: /opt/homelab/compose.yml
+    media_rebuild_local_backup_service: homelab-local-state-backup.service
+  tasks:
+    - name: Require a local rebuild manifest destination
+      ansible.builtin.assert:
+        that:
+          - (media_rebuild_manifest_local | trim) | length > 0
+        fail_msg: media_rebuild_manifest_local must be provided by the rebuild wrapper.
+
+    - name: Resolve required media VM mounts
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --noheadings
+          - --output
+          - TARGET
+          - --target
+          - "{{ item }}"
+      loop:
+        - "{{ media_rebuild_appdata_mount }}"
+        - "{{ media_rebuild_media_mount }}"
+      register: media_rebuild_mounts
+      changed_when: false
+
+    - name: Require persistent media VM mounts before replacement
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | trim) == item.item
+        fail_msg: >-
+          Refusing media VM rebuild: {{ item.item }} is not mounted at its
+          persistent VirtIO-FS target.
+      loop: "{{ media_rebuild_mounts.results }}"
+
+    - name: Gather media service state before quiescing
+      ansible.builtin.service_facts:
+
+    - name: Record whether compose was running before quiescing
+      ansible.builtin.set_fact:
+        media_rebuild_compose_was_running: >-
+          {{
+            media_rebuild_compose_service in ansible_facts.services
+            and ansible_facts.services[media_rebuild_compose_service].state == 'running'
+          }}
+
+    - name: Quiesce and mirror media state
+      block:
+        - name: Stop media compose services before final mirror
+          ansible.builtin.systemd:
+            name: "{{ media_rebuild_compose_service }}"
+            state: stopped
+
+        - name: Mirror final local state snapshot into persistent appdata
+          ansible.builtin.systemd:
+            name: "{{ media_rebuild_local_backup_service }}"
+            state: started
+
+        - name: Read final local state mirror result
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - "{{ media_rebuild_local_backup_service }}"
+              - --property=Result
+              - --value
+          register: media_rebuild_local_backup_result
+          changed_when: false
+
+        - name: Require successful final local state mirror
+          ansible.builtin.assert:
+            that:
+              - (media_rebuild_local_backup_result.stdout | trim) == "success"
+            fail_msg: >-
+              Refusing media VM rebuild: final local-state mirror did not
+              report success.
+
+        # Plex ships its own SQLite build, which is the only thing that can
+        # actually verify its databases -- see the validation task below.
+        # Resolved from the compose file rather than homelab_images, because
+        # this playbook runs standalone and never loads the media_stack role.
+        - name: Resolve the Plex image for database validation
+          ansible.builtin.command:
+            argv:
+              - awk
+              - '/^[[:space:]]*plex:/{f=1} f&&/image:/{print $2; exit}'
+              - "{{ media_rebuild_compose_file }}"
+          register: media_rebuild_plex_image
+          changed_when: false
+
+        - name: Require a resolvable Plex image
+          ansible.builtin.assert:
+            that:
+              - (media_rebuild_plex_image.stdout | trim) | length > 0
+            fail_msg: >-
+              Refusing media VM rebuild: could not resolve the Plex image from
+              {{ media_rebuild_compose_file }}, so the Plex databases cannot be
+              verified.
+
+        # Checked on a LOCAL ext4 copy, never in place.
+        #
+        # The mirrored copy lives on VirtIO-FS, which cannot provide the POSIX
+        # byte-range locks SQLite needs. Opening it there returns "disk I/O
+        # error" for EVERY database, healthy or corrupt -- so the previous
+        # in-place check could never pass, and this gate blocked every rebuild
+        # rather than guarding it. Measured 2026-08-24 across all ten mirrored
+        # databases; the same files verify fine once copied to ext4.
+        #
+        # Plex needs its own tool. Its schema declares FTS virtual tables with a
+        # custom tokenizer ("collating") that stock sqlite3 cannot instantiate,
+        # so quick_check AND integrity_check abort with "unknown tokenizer" --
+        # on ext4 too, not only VirtIO-FS. A structural probe (page_count,
+        # sqlite_master, per-table counts) is NOT an acceptable substitute: it
+        # was measured passing a deliberately corrupted Plex database, because
+        # count(*) is answered from an index without reading the damaged pages.
+        # `Plex SQLite` registers the tokenizer and runs a real quick_check --
+        # verified on 2026-08-24 to return ok for the live database and
+        # "database disk image is malformed" for a corrupted copy.
+        #
+        # docker run, not docker exec: compose is deliberately stopped by now.
+        - name: Validate mirrored SQLite restore inputs
+          ansible.builtin.shell: |
+            set -u
+            db={{ (item.0.backup_target ~ '/' ~ item.1) | quote }}
+            staging="$(mktemp /tmp/restore-check.XXXXXX.db)"
+            trap 'rm -f "${staging}"' EXIT
+            cp -p "${db}" "${staging}"
+
+            verdict="$(python3 - "${staging}" <<'PYEOF'
+            import sqlite3
+            import sys
+
+            conn = sqlite3.connect(sys.argv[1])
+            try:
+                print(conn.execute("PRAGMA quick_check;").fetchone()[0])
+            except sqlite3.DatabaseError as exc:
+                print("TOKENIZER" if "unknown tokenizer" in str(exc) else f"FAILED: {exc}")
+            finally:
+                conn.close()
+            PYEOF
+            )"
+
+            if [ "${verdict}" = "ok" ]; then
+              echo "ok"
+              exit 0
+            fi
+            if [ "${verdict}" != "TOKENIZER" ]; then
+              echo "quick_check failed for ${db}: ${verdict}" >&2
+              exit 1
+            fi
+
+            plex_verdict="$(docker run --rm -v /tmp:/t \
+              --entrypoint "/usr/lib/plexmediaserver/Plex SQLite" \
+              {{ media_rebuild_plex_image.stdout | trim | quote }} \
+              "/t/$(basename "${staging}")" "PRAGMA quick_check;" 2>&1 | tail -1)"
+            if [ "${plex_verdict}" != "ok" ]; then
+              echo "Plex SQLite quick_check failed for ${db}: ${plex_verdict}" >&2
+              exit 1
+            fi
+            echo "ok (Plex SQLite)"
+          args:
+            executable: /bin/bash
+          loop: "{{ homelab_local_state_paths | subelements('sqlite_backup_paths', skip_missing=True) }}"
+          changed_when: false
+          when:
+            - item.0.backup_target is defined
+            - (item.0.sqlite_quick_check | default(true)) | bool
+
+        - name: Record final local mirror time
+          ansible.builtin.command:
+            argv:
+              - date
+              - +%s
+          register: media_rebuild_prepared_epoch
+          changed_when: false
+      rescue:
+        - name: Restart media compose after local preparation failure
+          ansible.builtin.systemd:
+            name: "{{ media_rebuild_compose_service }}"
+            state: started
+          when: media_rebuild_compose_was_running | bool
+
+        - name: Abort failed media rebuild preparation
+          ansible.builtin.fail:
+            msg: >-
+              Media VM rebuild preparation failed. Compose was restored when
+              it had been running before the preflight.
+
+- name: Snapshot prepared media restore inputs offsite before replacement
+  hosts: 01-backup-lxc
+  become: true
+  gather_facts: false
+  vars:
+    media_rebuild_manifest_local: ""
+    media_rebuild_appdata_mount: /srv/appdata
+    media_rebuild_offsite_service: restic-appdata-backup.service
+  tasks:
+    - name: Resolve backup LXC appdata mount
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --noheadings
+          - --output
+          - TARGET
+          - --target
+          - "{{ media_rebuild_appdata_mount }}"
+      register: media_rebuild_backup_mount
+      changed_when: false
+
+    - name: Require mounted appdata in backup LXC
+      ansible.builtin.assert:
+        that:
+          - (media_rebuild_backup_mount.stdout | trim) == media_rebuild_appdata_mount
+        fail_msg: >-
+          Refusing media VM rebuild: the backup LXC does not see mounted appdata.
+
+    - name: Create final offsite appdata snapshot
+      ansible.builtin.systemd:
+        name: "{{ media_rebuild_offsite_service }}"
+        state: started
+
+    - name: Read final offsite snapshot result
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - "{{ media_rebuild_offsite_service }}"
+          - --property=Result
+          - --value
+      register: media_rebuild_offsite_result
+      changed_when: false
+
+    - name: Require successful final offsite snapshot
+      ansible.builtin.assert:
+        that:
+          - (media_rebuild_offsite_result.stdout | trim) == "success"
+        fail_msg: >-
+          Refusing media VM rebuild: restic appdata snapshot did not report success.
+
+    - name: Record final offsite snapshot time
+      ansible.builtin.command:
+        argv:
+          - date
+          - --utc
+          - --iso-8601=seconds
+      register: media_rebuild_offsite_completed_at
+      changed_when: false
+
+    - name: Write verified media rebuild manifest for wrapper
+      ansible.builtin.copy:
+        dest: "{{ media_rebuild_manifest_local }}"
+        mode: "0600"
+        content: |
+          {{
+            {
+              'status': 'verified',
+              'target': '01-media-vm',
+              'prepared_epoch': hostvars['01-media-vm'].media_rebuild_prepared_epoch.stdout | int,
+              'offsite_completed_at': media_rebuild_offsite_completed_at.stdout | trim,
+              'services_quiesced': true,
+              'appdata_mount': media_rebuild_appdata_mount
+            } | to_nice_json
+          }}
+      delegate_to: localhost
+      become: false

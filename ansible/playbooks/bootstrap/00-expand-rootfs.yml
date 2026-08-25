@@ -1,0 +1,223 @@
+- name: Expand root filesystem when possible
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Decide if root expansion should run on this host
+      ansible.builtin.set_fact:
+        rootfs_expand_candidate: >-
+          {{
+            (rootfs_expand_enabled | default(true) | bool)
+            and (
+              (ansible_facts['virtualization_type'] | default('unknown')) not in
+              (rootfs_expand_container_virtualization_types | default(['lxc', 'openvz', 'container', 'docker', 'containerd', 'podman', 'systemd-nspawn']))
+            )
+          }}
+
+    - name: Skip root expansion for containerized hosts
+      ansible.builtin.debug:
+        msg: >-
+          Skipping root expansion on {{ inventory_hostname }} because virtualization_type={{ ansible_facts['virtualization_type'] | default('unknown') }}.
+      when: not rootfs_expand_candidate
+
+    - name: Expand root filesystem
+      when: rootfs_expand_candidate
+      block:
+        - name: Determine current root source
+          ansible.builtin.command:
+            argv: [findmnt, -n, -o, SOURCE, /]
+          register: root_source_cmd
+          changed_when: false
+
+        - name: Record root LV path
+          ansible.builtin.set_fact:
+            root_lv_path: "{{ root_source_cmd.stdout | trim }}"
+            rootfs_expand_lvm_root: >-
+              {{
+                (root_source_cmd.stdout | trim).startswith('/dev/mapper/')
+                or (root_source_cmd.stdout | trim).startswith('/dev/dm-')
+              }}
+
+        - name: Skip root expansion when root is not on LVM
+          ansible.builtin.debug:
+            msg: "Skipping root expansion because / is on {{ root_lv_path }} (not an LVM logical volume)."
+          when: not rootfs_expand_lvm_root
+
+        - name: Ensure root expansion OS support
+          ansible.builtin.assert:
+            that:
+              - ansible_facts['os_family'] == 'Debian'
+            fail_msg: >-
+              Root expansion automation currently supports Debian/Ubuntu only.
+              Disable it with rootfs_expand_enabled=false on {{ inventory_hostname }} if needed.
+          when: rootfs_expand_lvm_root
+
+        - name: Install root expansion dependencies
+          ansible.builtin.apt:
+            name: "{{ rootfs_expand_packages | default(['cloud-guest-utils', 'lvm2', 'gdisk']) }}"
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+          when:
+            - rootfs_expand_lvm_root
+
+        - name: Resolve root VG/LV
+          ansible.builtin.command:
+            argv:
+              - lvs
+              - --noheadings
+              - --separator
+              - ':'
+              - -o
+              - vg_name,lv_name
+              - "{{ root_lv_path }}"
+          register: root_lv_meta_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Parse root VG/LV
+          ansible.builtin.set_fact:
+            root_lv_meta_fields: "{{ (root_lv_meta_cmd.stdout | trim).split(':') }}"
+          when: rootfs_expand_lvm_root
+
+        - name: Validate root VG/LV metadata
+          ansible.builtin.assert:
+            that:
+              - root_lv_meta_fields | length == 2
+              - (root_lv_meta_fields[0] | trim) | length > 0
+              - (root_lv_meta_fields[1] | trim) | length > 0
+            fail_msg: "Unable to resolve root VG/LV from {{ root_lv_path }}."
+          when: rootfs_expand_lvm_root
+
+        - name: Save root VG/LV names
+          ansible.builtin.set_fact:
+            root_vg_name: "{{ root_lv_meta_fields[0] | trim }}"
+            root_lv_name: "{{ root_lv_meta_fields[1] | trim }}"
+          when: rootfs_expand_lvm_root
+
+        - name: Find PVs for root VG
+          ansible.builtin.command:
+            argv:
+              - pvs
+              - --noheadings
+              - -o
+              - pv_name
+              - --select
+              - "vg_name={{ root_vg_name }}"
+          register: root_vg_pvs_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Collect root PV candidates
+          ansible.builtin.set_fact:
+            root_pv_candidates: >-
+              {{
+                root_vg_pvs_cmd.stdout_lines
+                | map('trim')
+                | reject('equalto', '')
+                | list
+              }}
+          when: rootfs_expand_lvm_root
+
+        - name: Validate root VG has exactly one PV
+          ansible.builtin.assert:
+            that:
+              - root_pv_candidates | length == 1
+            fail_msg: >-
+              Root VG {{ root_vg_name }} has {{ root_pv_candidates | length }} PVs ({{ root_pv_candidates | join(', ') }}).
+              Automatic partition growth supports a single-PV root VG only.
+          when: rootfs_expand_lvm_root
+
+        - name: Save root PV path
+          ansible.builtin.set_fact:
+            root_pv_path: "{{ root_pv_candidates[0] }}"
+          when: rootfs_expand_lvm_root
+
+        - name: Resolve parent disk name for root PV
+          ansible.builtin.command:
+            argv: [lsblk, -dno, PKNAME, "{{ root_pv_path }}"]
+          register: root_pkname_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Resolve partition number for root PV
+          ansible.builtin.command:
+            argv: [lsblk, -dno, PARTN, "{{ root_pv_path }}"]
+          register: root_partn_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Save root disk device and partition number
+          ansible.builtin.set_fact:
+            root_disk_device: "/dev/{{ root_pkname_cmd.stdout | trim }}"
+            root_partition_number: "{{ root_partn_cmd.stdout | trim }}"
+          when: rootfs_expand_lvm_root
+
+        - name: Validate root disk metadata
+          ansible.builtin.assert:
+            that:
+              - (root_pkname_cmd.stdout | trim) | length > 0
+              - (root_partn_cmd.stdout | trim) | length > 0
+            fail_msg: "Unable to determine root disk and partition from PV {{ root_pv_path }}."
+          when: rootfs_expand_lvm_root
+
+        - name: Detect partition table type
+          ansible.builtin.command:
+            argv: [lsblk, -dno, PTTYPE, "{{ root_disk_device }}"]
+          register: root_pttype_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Repair GPT backup header when applicable
+          ansible.builtin.command:
+            argv: [sgdisk, -e, "{{ root_disk_device }}"]
+          register: root_sgdisk_cmd
+          changed_when: false
+          when:
+            - rootfs_expand_lvm_root
+            - (root_pttype_cmd.stdout | trim) == 'gpt'
+
+        - name: Expand root PV partition
+          ansible.builtin.command:
+            argv: [growpart, "{{ root_disk_device }}", "{{ root_partition_number }}"]
+          register: root_growpart_cmd
+          failed_when: root_growpart_cmd.rc not in [0, 1]
+          changed_when: >-
+            'CHANGED:' in ((root_growpart_cmd.stdout | default('')) + (root_growpart_cmd.stderr | default('')))
+          when: rootfs_expand_lvm_root
+
+        - name: Resize root PV after partition expansion
+          ansible.builtin.command:
+            argv: [pvresize, "{{ root_pv_path }}"]
+          register: root_pvresize_cmd
+          changed_when: >-
+            'resized or updated / 0 physical volume(s) not resized' in ((root_pvresize_cmd.stdout | default('')) + (root_pvresize_cmd.stderr | default('')))
+          when: rootfs_expand_lvm_root
+
+        - name: Check free space in root VG
+          ansible.builtin.command:
+            argv: [vgs, --noheadings, --nosuffix, --units, b, -o, vg_free, "{{ root_vg_name }}"]
+          register: root_vg_free_cmd
+          changed_when: false
+          when: rootfs_expand_lvm_root
+
+        - name: Parse root VG free bytes
+          ansible.builtin.set_fact:
+            root_vg_free_bytes: "{{ ((root_vg_free_cmd.stdout | regex_replace('[^0-9.]', '')) | float) | int }}"
+          when: rootfs_expand_lvm_root
+
+        - name: Extend root LV to consume all free space
+          ansible.builtin.command:
+            argv: [lvextend, -r, -l, +100%FREE, "/dev/{{ root_vg_name }}/{{ root_lv_name }}"]
+          register: root_lvextend_cmd
+          changed_when: true
+          when:
+            - rootfs_expand_lvm_root
+            - root_vg_free_bytes > 0
+
+        - name: Display root expansion outcome
+          ansible.builtin.debug:
+            msg: >-
+              root_source={{ root_lv_path }}, pv={{ root_pv_path }}, disk={{ root_disk_device }} part={{ root_partition_number }},
+              growpart_changed={{ root_growpart_cmd is changed }}, vg_free_bytes={{ root_vg_free_bytes }}.
+          when: rootfs_expand_lvm_root

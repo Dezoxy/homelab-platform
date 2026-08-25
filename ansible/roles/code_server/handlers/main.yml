@@ -1,0 +1,14 @@
+---
+# `listen` rather than relying on the task name: roles/agent_cli notifies this
+# when it writes /etc/profile.d/agent-cli.sh, and a cross-role notify matched on
+# exact name is a silent no-op the moment either side is renamed.
+#
+# The restart is load-bearing, not cosmetic: code-server's integrated terminals
+# inherit ITS environment, so CLAUDE_CONFIG_DIR and CODEX_HOME only reach them
+# once the service itself has re-read the login profile.
+- name: Restart code-server
+  ansible.builtin.systemd_service:
+    name: code-server
+    state: restarted
+    daemon_reload: true
+  listen: restart code-server

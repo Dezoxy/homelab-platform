@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+
+"""Repair SRT files so they pass Lingarr's built-in subtitle validation."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+TIMESTAMP_RE = re.compile(
+    r"^\s*(?P<start>\d{1,3}:\d{1,2}:\d{1,2}[,.:]\d{1,3})\s*-->\s*"
+    r"(?P<end>\d{1,3}:\d{1,2}:\d{1,2}[,.:]\d{1,3})(?:\s+.*)?\s*$"
+)
+INDEX_RE = re.compile(r"^\s*\d+\s*$")
+SPACE_RE = re.compile(r"\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:])\s+")
+
+
+@dataclass
+class Cue:
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+def parse_timestamp(value: str) -> int:
+    hours, minutes, seconds, milliseconds = re.split(r"[:,.]", value.strip())
+    return (int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1000 + int(
+        milliseconds.ljust(3, "0")[:3]
+    )
+
+
+def format_timestamp(total_ms: int) -> str:
+    total_ms = max(total_ms, 0)
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, milliseconds = divmod(rem, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+
+def decode_subtitle(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1250", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def normalize_text(text: str) -> str:
+    return SPACE_RE.sub(" ", text.replace("\ufeff", "").replace("\r", " ").strip())
+
+
+def parse_cues(text: str) -> list[Cue]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    cues: list[Cue] = []
+    index = 0
+
+    while index < len(lines):
+        current = lines[index]
+        if not current.strip():
+            index += 1
+            continue
+
+        if (
+            INDEX_RE.match(current)
+            and index + 1 < len(lines)
+            and TIMESTAMP_RE.match(lines[index + 1])
+        ):
+            index += 1
+            current = lines[index]
+
+        timestamp_match = TIMESTAMP_RE.match(current)
+        if not timestamp_match:
+            index += 1
+            continue
+
+        start_ms = parse_timestamp(timestamp_match.group("start"))
+        end_ms = parse_timestamp(timestamp_match.group("end"))
+
+        index += 1
+        body_lines: list[str] = []
+
+        while index < len(lines):
+            candidate = lines[index]
+            if not candidate.strip():
+                index += 1
+                while index < len(lines) and not lines[index].strip():
+                    index += 1
+                break
+            if (
+                INDEX_RE.match(candidate)
+                and index + 1 < len(lines)
+                and TIMESTAMP_RE.match(lines[index + 1])
+            ):
+                break
+            if TIMESTAMP_RE.match(candidate):
+                break
+            body_lines.append(candidate)
+            index += 1
+
+        text_value = normalize_text(" ".join(body_lines))
+        if text_value:
+            cues.append(Cue(start_ms=start_ms, end_ms=end_ms, text=text_value))
+
+    return cues
+
+
+def split_words(text: str, max_length: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and len(candidate) > max_length:
+            chunks.append(" ".join(current))
+            current = [word]
+            continue
+        current.append(word)
+
+    if current:
+        chunks.append(" ".join(current))
+
+    normalized_chunks: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_length:
+            normalized_chunks.append(chunk)
+            continue
+        start = 0
+        while start < len(chunk):
+            normalized_chunks.append(chunk[start : start + max_length])
+            start += max_length
+    return normalized_chunks
+
+
+def pack_segments(segments: list[str], max_length: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    for segment in segments:
+        piece = normalize_text(segment)
+        if not piece:
+            continue
+        if len(piece) > max_length:
+            words = split_words(piece, max_length)
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(words)
+            continue
+
+        candidate = piece if not current else f"{current} {piece}"
+        if current and len(candidate) > max_length:
+            chunks.append(current)
+            current = piece
+            continue
+        current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def split_text(text: str, max_length: int) -> list[str]:
+    text = normalize_text(text)
+    if len(text) <= max_length:
+        return [text]
+
+    for splitter in (SENTENCE_SPLIT_RE, CLAUSE_SPLIT_RE):
+        pieces = [piece for piece in splitter.split(text) if piece]
+        if len(pieces) > 1:
+            chunks = pack_segments(pieces, max_length)
+            if chunks and max(len(chunk) for chunk in chunks) <= max_length:
+                return chunks
+
+    return split_words(text, max_length)
+
+
+def pad_short_text(text: str, min_length: int) -> str:
+    text = normalize_text(text)
+    if len(text) >= min_length:
+        return text
+    if not text:
+        return ".."[:min_length]
+    padded = text
+    while len(padded) < min_length:
+        padded += "."
+    return padded
+
+
+def split_cue(cue: Cue, max_length: int) -> list[Cue]:
+    chunks = split_text(cue.text, max_length)
+    if len(chunks) <= 1:
+        return [Cue(cue.start_ms, cue.end_ms, chunks[0] if chunks else cue.text)]
+
+    total_duration = max(cue.end_ms - cue.start_ms, len(chunks))
+    boundaries = [cue.start_ms]
+    consumed = 0
+    total_weight = sum(max(len(chunk), 1) for chunk in chunks)
+
+    for chunk in chunks[:-1]:
+        consumed += max(len(chunk), 1)
+        split_point = cue.start_ms + round(total_duration * consumed / total_weight)
+        boundaries.append(split_point)
+    boundaries.append(cue.start_ms + total_duration)
+
+    results: list[Cue] = []
+    for index, chunk in enumerate(chunks):
+        start_ms = boundaries[index]
+        end_ms = boundaries[index + 1]
+        if end_ms <= start_ms:
+            end_ms = start_ms + 1
+        results.append(Cue(start_ms=start_ms, end_ms=end_ms, text=chunk))
+    return results
+
+
+def clamp_max_duration(cues: list[Cue], max_duration_ms: int) -> None:
+    for cue in cues:
+        if cue.end_ms - cue.start_ms > max_duration_ms:
+            cue.end_ms = cue.start_ms + max_duration_ms
+
+
+def enforce_non_overlap(cues: list[Cue]) -> None:
+    previous_end = 0
+    for cue in cues:
+        cue.start_ms = max(cue.start_ms, previous_end)
+        if cue.end_ms <= cue.start_ms:
+            cue.end_ms = cue.start_ms + 1
+        previous_end = cue.end_ms
+
+
+def enforce_min_duration(cues: list[Cue], min_duration_ms: int) -> None:
+    for index, cue in enumerate(cues):
+        duration = cue.end_ms - cue.start_ms
+        if duration >= min_duration_ms:
+            continue
+
+        needed = min_duration_ms - duration
+        previous_end = cues[index - 1].end_ms if index else 0
+        next_start = cues[index + 1].start_ms if index + 1 < len(cues) else None
+
+        if next_start is None:
+            cue.end_ms += needed
+            continue
+
+        room_after = max(next_start - cue.end_ms, 0)
+        take_after = min(room_after, needed)
+        cue.end_ms += take_after
+        needed -= take_after
+
+        if needed:
+            room_before = max(cue.start_ms - previous_end, 0)
+            take_before = min(room_before, needed)
+            cue.start_ms -= take_before
+            needed -= take_before
+
+        if needed:
+            cue.end_ms += needed
+
+
+def repair_cues(
+    cues: list[Cue],
+    min_length: int,
+    max_length: int,
+    min_duration_ms: int,
+    max_duration_ms: int,
+) -> list[Cue]:
+    repaired: list[Cue] = []
+
+    for cue in cues:
+        split_cues = split_cue(cue, max_length)
+        for split_item in split_cues:
+            split_item.text = pad_short_text(split_item.text, min_length)
+            repaired.append(split_item)
+
+    clamp_max_duration(repaired, max_duration_ms)
+    enforce_non_overlap(repaired)
+    enforce_min_duration(repaired, min_duration_ms)
+    clamp_max_duration(repaired, max_duration_ms)
+    enforce_non_overlap(repaired)
+
+    for cue in repaired:
+        cue.text = pad_short_text(cue.text, min_length)
+
+    return repaired
+
+
+def validate_cues(
+    cues: list[Cue],
+    min_length: int,
+    max_length: int,
+    min_duration_ms: int,
+    max_duration_ms: int,
+) -> list[str]:
+    errors: list[str] = []
+    previous_end = 0
+
+    for index, cue in enumerate(cues, start=1):
+        text_length = len(cue.text)
+        duration = cue.end_ms - cue.start_ms
+
+        if cue.start_ms < previous_end:
+            errors.append(f"cue {index} overlaps previous cue")
+        if text_length < min_length:
+            errors.append(f"cue {index} text too short: {text_length}")
+        if text_length > max_length:
+            errors.append(f"cue {index} text too long: {text_length}")
+        if duration < min_duration_ms:
+            errors.append(f"cue {index} duration too short: {duration}")
+        if duration > max_duration_ms:
+            errors.append(f"cue {index} duration too long: {duration}")
+
+        previous_end = cue.end_ms
+
+    return errors
+
+
+def render_cues(cues: list[Cue]) -> str:
+    lines: list[str] = []
+    for number, cue in enumerate(cues, start=1):
+        lines.append(str(number))
+        lines.append(
+            f"{format_timestamp(cue.start_ms)} --> {format_timestamp(cue.end_ms)}"
+        )
+        lines.append(cue.text)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_backup(path: Path) -> None:
+    backup_path = path.with_name(f"{path.stem}.lingarrfixbak")
+    shutil.copy2(path, backup_path)
+
+
+def write_atomically(path: Path, content: str) -> None:
+    stat_result = path.stat()
+    fd, temp_path_raw = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temp_path = Path(temp_path_raw)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.chmod(temp_path, stat_result.st_mode)
+        if hasattr(os, "chown"):
+            os.chown(temp_path, stat_result.st_uid, stat_result.st_gid)
+
+        os.replace(temp_path, path)
+
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def summarize(
+    cues: list[Cue],
+    min_length: int,
+    max_length: int,
+    min_duration_ms: int,
+    max_duration_ms: int,
+) -> str:
+    short_text = sum(1 for cue in cues if len(cue.text) < min_length)
+    long_text = sum(1 for cue in cues if len(cue.text) > max_length)
+    short_duration = sum(
+        1 for cue in cues if cue.end_ms - cue.start_ms < min_duration_ms
+    )
+    long_duration = sum(
+        1 for cue in cues if cue.end_ms - cue.start_ms > max_duration_ms
+    )
+    return (
+        f"cues={len(cues)} short_text={short_text} long_text={long_text} "
+        f"short_duration={short_duration} long_duration={long_duration}"
+    )
+
+
+def repair_file(path: Path, args: argparse.Namespace) -> None:
+    original_text = decode_subtitle(path.read_bytes())
+    original_cues = parse_cues(original_text)
+    repaired_cues = repair_cues(
+        original_cues,
+        min_length=args.min_length,
+        max_length=args.max_length,
+        min_duration_ms=args.min_duration_ms,
+        max_duration_ms=args.max_duration_ms,
+    )
+
+    errors = validate_cues(
+        repaired_cues,
+        min_length=args.min_length,
+        max_length=args.max_length,
+        min_duration_ms=args.min_duration_ms,
+        max_duration_ms=args.max_duration_ms,
+    )
+    if errors:
+        raise ValueError("; ".join(errors[:10]))
+
+    print(
+        f"{path}: before {summarize(original_cues, args.min_length, args.max_length, args.min_duration_ms, args.max_duration_ms)}"
+    )
+    print(
+        f"{path}: after  {summarize(repaired_cues, args.min_length, args.max_length, args.min_duration_ms, args.max_duration_ms)}"
+    )
+
+    if args.dry_run:
+        return
+
+    if args.backup:
+        write_backup(path)
+
+    write_atomically(path, render_cues(repaired_cues))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="+", help="SRT files to repair")
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Write a .lingarrfixbak backup before modifying files",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the before/after stats without writing",
+    )
+    parser.add_argument("--min-length", type=int, default=2)
+    parser.add_argument("--max-length", type=int, default=120)
+    parser.add_argument("--min-duration-ms", type=int, default=1000)
+    parser.add_argument("--max-duration-ms", type=int, default=7000)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    for raw_path in args.paths:
+        repair_file(Path(raw_path), args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare DDNS update for {{ cloudflare_ddns_record_name }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile={{ cloudflare_ddns_env_file }}
+ExecStart={{ cloudflare_ddns_bin }}
+# Hardening: this only needs outbound HTTPS and one state file.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths={{ cloudflare_ddns_state_dir }}

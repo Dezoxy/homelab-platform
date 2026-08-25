@@ -1,0 +1,435 @@
+# --- Agent CLI pins ---
+# jobs-refresh builds its image with this Claude CLI version
+# (myapps_jobs_refresh_claude_cli_version derives from it). This is now the
+# only Claude CLI pin in the repo: 01-agent-lxc, which carried the codex and
+# gemini pins alongside it, was retired.
+claude_cli_version: 2.1.241
+
+# --- notification-digest ---
+# Enabled: the digest-* Key Vault secrets (folder=digest) exist as of
+# 2026-07-29. After the first deploy with this on, a ONE-TIME interactive
+# `claude` login into /srv/appdata/digest/claude-home is required — the
+# summarizer authenticates via the owner's subscription, not an API key, so
+# runs that collect items fail loudly until that login is done.
+myapps_digest_enabled: true
+# 15 Telegram supergroups/channels (news + crypto firehose). Each chat seeds
+# its cursor from "now" on first sight — adding or removing chats later never
+# backfills history and never re-sends anything already digested. Three ids
+# removed 2026-07-31 (-1001122587873, -1002498614160, -1002079918941): the
+# owner deleted those groups from his account, after which Telethon can no
+# longer resolve them from the dialog list and every run tripped the
+# partial-collection alert. They had produced zero items since being added,
+# so nothing was lost.
+myapps_digest_tg_chat_allowlist: "-1001358788312,-1001277327948,-1001994655615,-1001534592031,-1001993180528,-1001770853167,-1001683536966,-1001301968221,-1001220282322,-1001933319598,-1001700689119,-1002006131201,-1001556054753,-1002520657240,-1001963527562"
+# X collection: the digest-x-cookies Key Vault secret exists (validated live
+# against the account before enabling). Cookies are a session credential —
+# logging out of that browser session in X invalidates them and the collector
+# will fail loudly (auth errors never retry, by design, to avoid tripping X's
+# automation detection); refresh the secret and redeploy if that happens.
+myapps_digest_x_enabled: true
+# AI/robotics news feeds (8, each validated live 2026-07-31): tech-press AI
+# sections + robotics trade press + two curated high-signal sources (Simon
+# Willison for agentic tooling, Import AI weekly for research). Raw arXiv
+# cs.AI/cs.RO deliberately excluded: arXiv publishes one ~300-paper
+# announcement batch per weekday (all entries share a single 04:00 UTC
+# timestamp), which would flood whichever digest window catches it and
+# still be truncated arbitrarily by the collector's per-feed cap. The
+# interest filter that decides what earns prose lives in the app repo
+# (prompts/digest.md), not here — this list only decides what gets fetched.
+# Reddit is deliberately ABSENT from this list: the cookie-session
+# collector below (notification-digest PR #35) is the sole reddit path,
+# by owner decision (2026-08-07) — running both would double-report the
+# same post (DB dedupe is per (source, source_id) and doesn't cross
+# sources). The RSS-era reddit URLs (r/<sub>/top/.rss?t=day, PR #33's
+# 45s same-host pacing) remain the known-working fallback shape to
+# restore here if the cookie path ever proves unusable from this VM's
+# IP — cookie auth was NOT live-verified from production before this
+# cutover; the first post-deploy digest run is that verification, and
+# until it passes a failed reddit collect surfaces in the digest's
+# failure banner while reddit coverage is simply absent.
+# Feed mix (2026-08-17, notification-digest PR #75's source-diversity
+# pass): the original 8 AI/robotics feeds plus 7 general desks — world
+# wires (BBC World, Al Jazeera, AP), EU policy (POLITICO Europe),
+# Hungary (Telex, Portfolio — these two also feed the digest's widened
+# "## Hungary" standing rule, which keys on telex.hu/portfolio.hu URLs),
+# and global business (FT World). All 15 live-probed healthy from this
+# workstation on 2026-08-17; volumes measured at ~175 articles/24h
+# combined, inside the app's per-source "news" quota (60 of 250 items
+# per 6h window). Candidates probed and rejected: hvg/index/444
+# (overlapping HU domestic wire, ~142/day), euractiv/euobserver/g7/
+# Reuters (HTTP errors), phys.org (aggregator noise).
+myapps_digest_news_feeds: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,https://arstechnica.com/ai/feed/,https://techcrunch.com/category/artificial-intelligence/feed/,https://spectrum.ieee.org/feeds/topic/robotics.rss,https://the-decoder.com/feed/,https://simonwillison.net/atom/everything/,https://www.therobotreport.com/feed/,https://importai.substack.com/feed,https://feeds.bbci.co.uk/news/world/rss.xml,https://www.aljazeera.com/xml/rss/all.xml,https://feedx.net/rss/ap.xml,https://www.politico.eu/feed/,https://telex.hu/rss,https://www.portfolio.hu/rss/all.xml,https://www.ft.com/world?format=rss"
+# The owner's investment-tracking channels. Since the positions tracker
+# (notification-digest PR TBD) these are no longer a reserved lane INSIDE the
+# window briefing — they are claimed by `digest positions` and removed from
+# the window sweep entirely, so this var now decides which of the two RUNS
+# gets them, not merely how they are weighted within one.
+#
+# AGIPriceTalks was added at the same time. It was in the allowlist but not
+# here, so its ASI/FET material was still landing in the general briefing
+# while the other two moved out — the exact leak this feature exists to
+# close. All three are in myapps_digest_tg_chat_allowlist above; this var
+# only changes ROUTING, never what gets fetched.
+myapps_digest_positions_tg_channels: "ASI_Alliance,fetchunofficial,AGIPriceTalks"
+# Hacker News front-page desk (notification-digest PR #84): fills the gap
+# between AI press feeds and Reddit chatter with high-signal technical
+# discussion; 20-item quota lane app-side.
+myapps_digest_hackernews_enabled: true
+# Reddit cookie-session collection (notification-digest PR #35, image
+# 0.7.0+): authenticates as the owner's own account via the
+# digest-reddit-session Key Vault secret (the browser's reddit_session
+# cookie, expires 2027 — uploaded + length-verified 2026-08-07). Same
+# session-credential caveat as X above: logging out of that Reddit browser
+# session invalidates the cookie; the collector backs off on auth errors
+# (never retry-loops) and the digest reports the failure — refresh the
+# secret and redeploy if that happens. This is the ONLY reddit path (the
+# RSS fallback was dropped from NEWS_FEEDS above at the same time).
+myapps_digest_reddit_enabled: true
+myapps_digest_reddit_subreddits: "Futurology,LocalLLaMA,MachineLearning,news,hungary"
+# Polymarket collection: routed through the polymarket-proxy Worker
+# (toom-edge repo, workers/polymarket-proxy) because gamma-api.polymarket.com
+# is ISP-blocked from this network — the VM only ever talks to workers.dev.
+# The digest-polymarket-proxy-key Key Vault secret exists (set + hash-verified
+# 2026-08-05 against the Worker's own PROXY_KEY). A 403 from the proxy marks
+# the run failed loudly (collector never retries within a run); if the key is
+# ever rotated on the Worker side, update the vault secret and redeploy.
+myapps_digest_polymarket_enabled: true
+myapps_digest_polymarket_api_base: "https://polymarket-proxy.toomhorvath.workers.dev"
+# Multi-channel cutover (notification-digest PR #25): the site + Telegram
+# channels replace email. EMAIL stays off only because both replacements are
+# fully wired: the news-site Worker is live (toom-edge PR #63, custom domains
+# applied), its ingest key + reader base URL are in Key Vault
+# (digest-site-ingest-key / digest-site-public-base, the latter embedding the
+# capability token), and the TL;DR bot's token/chat/thread ids are in Key
+# Vault too (digest-telegram-notify-*, group -1004458368803 topic 3).
+# Ingest goes to the workers.dev URL (machine-to-machine; independent of the
+# custom-domain Terraform), while reader links use news.example.com.
+myapps_digest_email_enabled: false
+myapps_digest_site_publish_url: "https://news-site.toomhorvath.workers.dev"
+# Hungarian site translations (the /hu/ pages): one extra model call per
+# run, soft-failing to English-only. Telegram stays English by design.
+myapps_digest_translate_hu_enabled: true
+# Verified daily briefing (PLAN.md §11.4): the daily brief gets a second,
+# web-enabled pass that checks each story against independent reporting and
+# appends per-story corroboration status. Windows stay toolless. Turning
+# this ON is the owner decision §11.4 always reserved -- it opens this
+# pipeline's only live-web injection surface (PLAN.md §8) in exchange for
+# claims that are checked rather than merely relayed. Soft-fails to the
+# unverified draft plus a banner, so a bad run degrades, never blocks.
+myapps_digest_verify_daily_enabled: true
+# Arc background primers (PLAN.md §11.6): on the daily run, generate a
+# short durable primer for one arc that has recurred at least twice in the
+# trailing week and has none yet, rendered as a collapsed Background
+# disclosure on its arc page. max_per_run 1 rather than the role's default
+# 3, deliberately: this shares the daily execution with the verified
+# briefing above, and one extra call per night is the gentle way to let a
+# backlog drain while we learn what the combined run costs. Raise it once
+# the daily has run clean with both features on.
+myapps_digest_context_enabled: true
+myapps_digest_context_max_per_run: 1
+# Daily brief at 20:00 Europe/Budapest, synthesizing the day's window digests
+# into one evening read — its own Telegram topic (90) and the site's /daily/
+# view. App support ships in v0.5.0.
+myapps_digest_daily_enabled: true
+# Weekly brief, Sunday 21:00 Europe/Budapest, synthesizing the week's daily
+# briefs — its own Telegram topic ("Weekly Brief", thread 141) and a badge
+# on the site's All view. App support ships in v0.11.0.
+myapps_digest_weekly_enabled: true
+myapps_digest_telegram_weekly_thread_id: "141"
+
+# Patreon collector: polls one paid campaign hourly and posts each new post
+# to the "Crypto Recently" topic (317) as its own message. Deliberately NOT
+# a new topic -- 317 already exists and matches this creator's subject.
+#
+# App support ships in v0.20.0 (notification-digest #89) -- enabled in the
+# same PR that bumped myapps_digest_image to that tag, per the sequencing
+# the daily and weekly briefs used.
+#
+# The campaign id is the numeric id behind patreon.com/c/kriptovadasz,
+# resolved from /api/campaigns?filter[vanity]=kriptovadasz. Not a secret;
+# the session_id cookie that authorizes it IS, and comes from Key Vault
+# (DIGEST_PATREON_SESSION_COOKIE).
+myapps_digest_patreon_enabled: true
+myapps_digest_patreon_campaign_id: "7095842"
+myapps_digest_telegram_patreon_thread_id: "317"
+
+# Positions tracker: every 4 hours (01,05,09,13,17,21:25 UTC), the owner's
+# ASI/Fetch channels and X accounts summarized into the "The Long Game"
+# topic (354) as a project tracker, with a standing "Where it stands" block.
+# Silent by design when a window held only price chatter — most runs deliver
+# nothing, which is what makes a 4-hourly cadence readable.
+#
+# TWO-SIDED SWITCH: enabling this also REMOVES those channels and accounts
+# from the 6-hourly briefing, the daily and the weekly. That is the point of
+# the feature, not a side effect — but it means the general briefing gets
+# quieter the moment this flips.
+#
+# App support ships in v0.21.0 (notification-digest #90) -- enabled in the
+# same PR that bumped myapps_digest_image to that tag, per the sequencing
+# the daily, weekly and Patreon jobs all used.
+myapps_digest_positions_enabled: true
+myapps_digest_telegram_positions_thread_id: "354"
+# Public handles, not a credential — the X SESSION COOKIES are the secret
+# and already live in Key Vault (DIGEST_X_COOKIES).
+#
+# Verified against the live profiles 2026-08-22, and the owner confirms post
+# notifications (the bell) are on for all six. The bell is what makes them
+# work at all: the collector fetches an account's own timeline only when a
+# notification names it, so a handle without it silently never matches and
+# reads as a quiet account.
+#
+#   ASI_Alliance     Artificial Superintelligence Alliance (the alliance)
+#   Fetch_ai         Fetch.ai, founding member
+#   SingularityNET   founding member
+#   CUDOS_           ASI:Cloud / CUDOS, member
+#   HMsheikh4        Humayun Sheikh, founder
+#   ASI_Researchers  research account (MeTTa, agentic architectures)
+myapps_digest_positions_x_accounts: "ASI_Alliance,Fetch_ai,SingularityNET,CUDOS_,HMsheikh4,ASI_Researchers"
+
+# Content-based routing, on top of the channels and accounts above: these
+# claim the project's news out of the OTHER 12 Telegram channels, the news
+# feeds and Reddit, none of which are positions sources. Without this the
+# separation is only as complete as the dedicated-source list.
+#
+# Cashtags and proper names, deliberately — a bare ASI or FET would match
+# inside "basic", "Asia", "feta" and "fetching", pull those stories out of
+# the briefing, and on an immaterial window make them vanish from every
+# channel. The app enforces a 4-character floor; the discipline above that
+# is the operator's.
+myapps_digest_positions_keywords: "$FET,$ASI,Fetch.ai,SingularityNET,Artificial Superintelligence Alliance,ASI:One,ASI:Cloud,Ocean Protocol,CUDOS"
+
+# --- garmin-health (my-health-datas) ---
+# Personal Garmin pipeline: daily sync (fetch -> ingest -> verify) plus a
+# monthly Claude-written health report delivered to Telegram.
+#
+# Still DISABLED. Three things must be true before flipping this to true, and
+# none of them can be done by a deploy:
+#   1. The garmin-* Key Vault secrets exist (folder=garmin):
+#      garmin-ghcr-pull-token, garmin-telegram-bot-token, garmin-telegram-chat-id.
+#      The bot is a NEW, dedicated one -- health data does not ride the digest
+#      alert bot.
+#   2. A release exists: cut a `v*` tag in Dezoxy/my-health-datas so
+#      release.yml publishes the pinned image, then set the tag below. There
+#      is no `latest` to fall back on.
+#   3. Both one-time interactive logins have been run on the VM, into the
+#      /srv/appdata/garmin-health volume (see the app repo's
+#      docs/deployment.md):
+#        docker compose run --rm garmin-health fetch --login
+#        docker compose run --rm --entrypoint claude garmin-health login
+#      Neither can run unattended, which is exactly why neither is a secret.
+myapps_garmin_health_enabled: true
+
+# Pinned exactly; Renovate opens the bump PR when a new tag lands in GHCR.
+# Set this to the first real release tag when enabling.
+myapps_garmin_health_image: "ghcr.io/dezoxy/my-health-datas:0.8.0"
+
+# --- withings-sync (Withings scale -> Garmin Connect) ---
+# Weighing started on a Withings scale in August 2026; Garmin has no native
+# Withings integration, so this bridge uploads the readings to Garmin
+# Connect, where garmin-sync's body_composition fetch picks them up. No
+# Key Vault secret is involved. Enabled together with the first deploy --
+# until the one-time login below has been done the nightly run fails with
+# "no tokens" and alerts on the health bot, which is the correct signal.
+#
+# One-time logins on the VM (both write into /srv/appdata/withings-sync).
+#
+# WITHINGS half — run the container bare; it prints an authorization URL,
+# open it, approve, paste the code back within its 30-second window:
+#
+#   cd /opt/myapps
+#   docker compose run --rm withings-sync
+#
+# GARMIN half — do NOT use GARMIN_USERNAME/GARMIN_PASSWORD. The account has
+# MFA, and this image's garminconnect is 0.3.2 (a hard ceiling, see the image
+# pin comment in the role defaults), whose widget login cannot recognise the
+# MFA page — it fails with a misleading "401 Invalid Username or Password"
+# after burning the rate-limited mobile strategies. Observed live 2026-08-24.
+#
+# Instead, mint the tokens with the garmin-health image (garminconnect
+# 0.3.11, MFA-capable) straight into withings-sync's tokenstore. Same token
+# format; withings-sync is tokenstore-first, so with valid tokens present the
+# broken credential path is never touched:
+#
+#   cd /opt/myapps
+#   docker compose run --rm \
+#     -v /srv/appdata/withings-sync/.garmin_session:/wtokens \
+#     -e GARMINTOKENS=/wtokens \
+#     garmin-health fetch --login
+#
+# (The role pre-creates .garmin_session as uid 1000 — without that, Docker
+# auto-creates it root-owned on first mount and the dump fails.)
+# The two "mobile ... 429" warnings are expected; the widget strategy behind
+# them handles the MFA prompt. Deliberately a SEPARATE Garmin session from
+# garmin-health's own tokens: same account, but two containers refreshing one
+# session's tokens can race, and the loser is a mysterious auth failure weeks
+# later.
+#
+# Then verify end-to-end with a bare `docker compose run --rm withings-sync`.
+#
+# Backfill, if wanted:
+#   docker compose run --rm withings-sync --config-folder /config --fromdate 2026-08-23
+# (the explicit --config-folder is needed because extra arguments replace the
+# compose `command:`).
+myapps_withings_sync_enabled: true
+# Destination selector (see role defaults) — not a credential; login is
+# tokenstore-first. Both one-time logins done 2026-08-24 and verified live:
+# tokenstore auth succeeded and the day's weigh-in uploaded to Garmin Connect.
+myapps_withings_sync_garmin_username: "tom@example.com"
+
+# --- VirtIO-FS: the backup share ---
+# DIFFERENT MOUNTPOINT FROM EVERY OTHER GUEST, deliberately. 01-media-vm and
+# 01-unifi-vm mount homelab-appdata at /srv/appdata because on those hosts the
+# share IS their application storage. On THIS host /srv/appdata is a local
+# ext4 directory that predates the share and holds 1.7G of live state --
+# chromium's logged-in profile, digest's state.db, jobs-refresh's deploy keys
+# -- all of it bind-mounted into running containers. Mounting the share over
+# that path would shadow every one of them: chromium would boot to a blank
+# profile, digest would find no database, jobs-refresh no keys. Nothing would
+# be deleted, and everything would break.
+#
+# So the share gets its own path and carries only what is meant to leave this
+# host. Same split 01-unifi-vm documents: live database on local disk, backups
+# on the share.
+virtiofs_backup_mount: /srv/backup-share
+
+virtiofs_mounts:
+  - tag: homelab-appdata
+    path: "{{ virtiofs_backup_mount }}"
+
+# --- Local state mirrored to the share -----------------------------------------
+# This host keeps live state on LOCAL ext4 (/srv/appdata here is a local
+# directory, not the share) for the same reason 01-media-vm does: VirtIO-FS is
+# fine for regular files, but SQLite write/locking semantics break on it. So the
+# databases stay local and only snapshots cross the share, where
+# 01-backup-lxc's restic run sweeps them to B2.
+#
+# This list existed nowhere until 2026-08-25. garmin-health's own comment said
+# it was "covered by the existing /srv/appdata restic backup" -- true on media
+# and unifi, where /srv/appdata IS the share, and false here. 70 MB of raw
+# Garmin dumps and the OAuth tokens needed to re-fetch them had never been
+# backed up at all.
+homelab_local_state_root: /srv/appdata
+local_state_share_mount: "{{ virtiofs_backup_mount }}"
+
+# 04:45: after the Garmin ingest (03:30-03:45) and after digest-backup (04:15),
+# so the mirror copies a settled tree. restic runs 01:30 on 01-backup-lxc, so a
+# given day's ingest reaches B2 the following night -- roughly 21h offsite lag,
+# stated here rather than discovered later.
+homelab_local_state_backup_on_calendar: "*-*-* 04:45:00"
+
+homelab_local_state_paths:
+  # raw/ is the immutable source of truth; health.db is rebuilt from it by every
+  # ingest. Both are mirrored: restoring health.db too saves a full re-ingest.
+  # garmin-tokens/ and claude-home/ are one-time interactive logins that cannot
+  # be re-created unattended -- losing them alongside the data they fetch is the
+  # failure this list exists to prevent.
+  - name: garmin-health
+    service: garmin-health
+    source: "{{ virtiofs_backup_mount }}/garmin-health"
+    target: "{{ myapps_garmin_health_state_dir }}"
+    backup_target: "{{ virtiofs_backup_mount }}/garmin-health"
+    db_file: health.db
+    sqlite_backup_paths:
+      - health.db
+    owner: "1000"
+    group: "1000"
+    mode: "0750"
+
+  # 16K of OAuth tokens, no database. Same "cannot be re-created unattended"
+  # problem, which is why something this small is worth a list entry.
+  - name: withings-sync
+    service: withings-sync
+    source: "{{ virtiofs_backup_mount }}/withings-sync"
+    target: "{{ myapps_withings_sync_state_dir }}"
+    backup_target: "{{ virtiofs_backup_mount }}/withings-sync"
+    owner: "1000"
+    group: "1000"
+    mode: "0700"
+
+  # The KEYS only, not the clone: GitHub is the source of truth for the repo,
+  # so the checkout is disposable. The keys are not -- the role's own assert
+  # says they are "placed on this host out-of-band -- Ansible does not generate
+  # or fetch them".
+  - name: jobs-refresh-keys
+    service: jobs-refresh
+    source: "{{ virtiofs_backup_mount }}/jobs-refresh-keys"
+    target: "{{ myapps_jobs_refresh_ssh_key_dir }}"
+    backup_target: "{{ virtiofs_backup_mount }}/jobs-refresh-keys"
+    owner: "0"
+    group: "0"
+    mode: "0700"
+
+# Deliberately NOT mirrored:
+#   chromium/     1.1G browser profile cache; re-login is cheaper than carrying
+#                 it offsite nightly.
+#   jobs-refresh/ the clone itself -- GitHub holds it.
+#   digest/       already has its own marker-gated backup AND restore
+#                 (myapps_digest_offsite_backup_enabled / _state_restore_enabled).
+#                 Folding it into this mechanism is a follow-up, not something to
+#                 do in the change that introduces the mechanism.
+
+# Where digest's nightly SQLite snapshots are mirrored so restic (01:30 on
+# 01-backup-lxc, against this same volume) sweeps them to B2 under the
+# existing 7d/4w/6m retention.
+myapps_digest_offsite_backup_dir: "{{ virtiofs_backup_mount }}/myapps-digest"
+myapps_digest_offsite_backup_enabled: true
+
+# --- jobs-refresh ---
+# Enabled: both deploy keys are in place at /srv/appdata/jobs-refresh/keys
+# (write for Dezoxy/jobs-dashboard, read-only for Dezoxy/employee-cv —
+# enforced server-side by GitHub, not just by the mount). Ansible asserts
+# they exist, so a missing key fails the deploy rather than a 01:00 timer.
+#
+# Like digest, this needs a ONE-TIME interactive `claude` login, into
+# /srv/appdata/jobs-refresh/claude-home — its own home, not digest's:
+# sharing one credentials file races on OAuth refresh, since both would
+# spend the same single-use refresh token.
+myapps_jobs_refresh_enabled: true
+# The VM is now the publisher. Verified before flipping this: a full run
+# with all four browser sources produced a strict superset of the MacBook's
+# data — 641 jobs against 612, nothing dropped, all 170 Mentett rows kept,
+# and firstSeen unchanged on every pre-existing row.
+#
+# There must only ever be one publisher. publish.sh refuses to push when
+# behind (exit 6), so if the Mac ever writes jobs.json again the two sides
+# deadlock and a human has to resolve it by hand. The Claude desktop
+# schedule is off; the launchd publisher still needs booting out.
+myapps_jobs_refresh_publish_enabled: true
+# Tracker sync (2026-08-08): non-empty URL enables refresh-run.sh's step 2b —
+# the dashboard tracker's "Nem érdekel" verdicts reach the rejected-ids
+# ledger automatically each cycle. Credentials come from Key Vault
+# (folder=jobs-refresh, minted by cloudflare-terraform); the deploy-time
+# assert in the myapps role fails loudly if the URL is set but they are not.
+myapps_jobs_refresh_tracker_sync_url: "https://jobs.example.com/api/tracker"
+
+# Telegram digest sent from the VM (2026-08-21). Enabled together with
+# dropping the `push:` trigger from notify-telegram.yml in the jobs-dashboard
+# repo — exactly one sender may be live, or every refresh notifies twice.
+# Moved here because five digests were lost in two days to GitHub Actions
+# billing refusing to start the job at all, while the refresh itself
+# published normally and nothing noticed the silence.
+myapps_jobs_refresh_notify_enabled: true
+
+# --- chromium ---
+# Enabled: the chromium-ui-password Key Vault secret exists (folder=chromium,
+# which target_secret_folders.sh now fetches for this host). Reachable at
+# chrome.example.com through its own Access application — a 24h session,
+# hidden from the app launcher, deliberately stricter than the *.example.com
+# wildcard, because this is a browser someone can drive as me rather than a
+# read-only dashboard.
+#
+# After the first deploy a ONE-TIME interactive login is required, per portal:
+# LinkedIn, Profession.hu and No Fluff Jobs. Their sessions live in the
+# persistent profile at myapps_chromium_profile_dir and are what Phase 2b's
+# automation reuses. When one expires, the browser-bound sources stop being
+# collected — that must surface as a loud failure, never as an empty result.
+myapps_chromium_enabled: true
+
+# --- playwright MCP / browser collection ---
+# Enabled together: the MCP server is only useful to the browse step, and
+# the browse step has nothing to connect to without it (there is an assert
+# for that direction). The server attaches to the chromium container's CDP
+# port rather than launching its own browser, because that profile holds
+# the hand-authenticated LinkedIn / Profession / No Fluff Jobs sessions.
+myapps_playwright_mcp_enabled: true
+myapps_jobs_refresh_browser_enabled: true

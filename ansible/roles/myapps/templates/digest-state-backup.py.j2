@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Daily online snapshot of notification-digest's state.db.
+
+Installed by the myapps role to /usr/local/bin/digest-state-backup and run
+by digest-backup.timer (04:15 UTC). Uses sqlite3's online-backup API
+against the live database -- safe concurrently with a running digest
+because the app keeps state.db in WAL mode (v0.17.0+). Snapshots land in
+{{ myapps_digest_backup_dir }} and are aged out after 7 days by
+tmpfiles.d (digest-tmpfiles.conf) -- this script only ever creates.
+
+A real script file, not an ExecStart python -c one-liner: the first
+revision shipped as sh -c 'python3 -c "..."' and the systemd->shell
+quoting layers stripped the string quotes out of the python source
+(SyntaxError on first run, 2026-08-17). A file has no quoting layers.
+"""
+import datetime
+import sqlite3
+
+SRC = "{{ myapps_digest_state_dir }}/state.db"
+DST = "{{ myapps_digest_backup_dir }}/state-%s.db" % datetime.date.today().isoformat()
+
+src = sqlite3.connect(SRC)
+dst = sqlite3.connect(DST)
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+print("snapshot written: %s" % DST)
+
+{% if myapps_digest_offsite_backup_enabled | default(false) | bool %}
+# --- mirror to the VirtIO-FS share, so restic can reach it ---
+#
+# The snapshot above lives on the VM's own disk, which is not backed up by
+# anything: restic runs on 01-backup-lxc against the shared /srv/appdata
+# volume, and this VM's /srv/appdata is local storage with the same name.
+# Losing the disk therefore lost state.db AND all seven of its snapshots at
+# once. Copying the finished snapshot onto the share is what closes that.
+#
+# Copied, not moved: the local snapshots stay where they are, keeping their
+# fast same-host restore path and their tmpfiles.d ageing. This only adds a
+# second, offsite copy.
+#
+# The SNAPSHOT is copied rather than the live database, and that distinction
+# is load-bearing. state.db is WAL-mode SQLite under a running app; a plain
+# file copy of it can catch a torn write and restore as a corrupt database
+# that looks fine until it does not. DST is a consistent, quiescent artifact
+# of sqlite3's own backup API, so a plain copy of it is safe.
+#
+# A transient copy failure is REPORTED, never fatal: the local snapshot
+# already succeeded, and the job should not be marked failed because a share
+# was briefly unavailable.
+#
+# A MISSING MOUNT is fatal, because it is indistinguishable from success --
+# writing to the empty mountpoint underneath produces a file that looks like
+# a backup and never leaves this host. This used to warn and exit 0, so the
+# unit went green and nobody heard it; 01-myapps-vm has no pre-start mount
+# guard (its live state is local, so it is deliberately allowed to start
+# without the share), which makes this script the only thing standing
+# between a host storage fault and months of backups that were never taken.
+import os
+import shutil
+import subprocess
+import sys
+
+OFFSITE_DIR = "{{ myapps_digest_offsite_backup_dir }}"
+mount_root = "{{ virtiofs_backup_mount }}"
+
+try:
+    on_share = subprocess.run(
+        ["mountpoint", "-q", mount_root], check=False
+    ).returncode == 0
+    if not on_share:
+        # Fatal on purpose -- see the note above. The local snapshot is already
+        # on disk, so this loses nothing except a green light we had not earned.
+        print(
+            "ERROR: %s is not a mountpoint; refusing to write the offsite "
+            "copy to the VM's own disk (it would look like a backup and never "
+            "leave this host)" % mount_root,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        os.makedirs(OFFSITE_DIR, exist_ok=True)
+        offsite_dst = os.path.join(OFFSITE_DIR, os.path.basename(DST))
+        # Copy to a temp name in the same directory, then rename: restic runs
+        # at 01:30 and this at 04:15, but a rename is atomic and costs
+        # nothing, so a backup run can never catch a half-written file.
+        tmp_dst = offsite_dst + ".partial"
+        shutil.copyfile(DST, tmp_dst)
+        os.replace(tmp_dst, offsite_dst)
+        print("offsite copy written: %s" % offsite_dst)
+
+        # Retention. Nothing pruned these until 2026-08-25: ~15 MB/day of full
+        # database copies, each larger than the last, unbounded, and swept to
+        # B2 by restic every night. The local snapshots under
+        # myapps_digest_backup_dir had a 7d tmpfiles rule from the start; only
+        # the copy that crossed the share was missed.
+        #
+        # Pruned here rather than by tmpfiles: systemd-tmpfiles refuses this
+        # path ("unsafe path transition /srv/backup-share (owned by packer) ->
+        # .../myapps-digest (owned by root)") and satisfying it would mean
+        # chowning a directory on the share to weaken that guard. Here the
+        # prune also inherits the mountpoint check above for free -- it can
+        # never run against a phantom local directory.
+        #
+        # By COUNT, not age, deliberately. Age would mean that a timer stopped
+        # for a month deletes every snapshot on its next run, leaving one copy
+        # and no fallback -- and the fallback IS the design:
+        # digest-state-restore walks these newest-first and validates each,
+        # dropping to the previous when one is unreadable. Keeping a fixed
+        # number degrades to "fewer, older snapshots" instead of "none".
+        keep = {{ myapps_digest_offsite_backup_keep }}
+        snapshots = sorted(
+            f for f in os.listdir(OFFSITE_DIR)
+            if f.startswith("state-") and f.endswith(".db")
+        )
+        for stale in snapshots[:-keep] if len(snapshots) > keep else []:
+            os.unlink(os.path.join(OFFSITE_DIR, stale))
+            print("pruned offsite snapshot: %s" % stale)
+except Exception as exc:
+    print("WARNING: offsite copy failed: %s" % type(exc).__name__, file=sys.stderr)
+{% endif %}

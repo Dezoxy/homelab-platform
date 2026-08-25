@@ -1,0 +1,73 @@
+---
+# --- General ---
+observability_timezone: Europe/Budapest
+
+# --- Paths ---
+observability_compose_dir: /opt/observability
+observability_appdata_dir: /srv/appdata/observability
+
+# --- Grafana ---
+observability_grafana_admin_user: admin
+observability_grafana_alerting_provisioning_enabled: true
+
+# --- Ports ---
+observability_grafana_port: 3000
+observability_prometheus_port: 9090
+observability_loki_port: 3100
+observability_tempo_port: 3200
+observability_otlp_grpc_port: 4317
+observability_otlp_http_port: 4318
+
+# --- Container images ---
+observability_grafana_image: grafana/grafana-oss:13.0.2
+observability_prometheus_image: prom/prometheus:v3.14.0
+observability_loki_image: grafana/loki:3.7.6
+observability_tempo_image: grafana/tempo:3.0.3
+
+# --- Prometheus tuning ---
+observability_prometheus_retention_time: 15d
+observability_prometheus_scrape_interval: 15s
+
+# --- Tempo tuning ---
+observability_tempo_block_retention: 72h
+
+# --- Prometheus scrape targets ---
+observability_node_exporter_targets: []
+observability_cadvisor_targets: []
+observability_backup_node_exporter_target: null
+observability_cloudflared_metrics_target: null
+observability_traefik_metrics_target: null
+observability_loki_metrics_target: null
+observability_tempo_metrics_target: null
+
+# --- Grafana dashboards + alerts ---
+observability_grafana_template_dir: grafana
+observability_grafana_dashboard_templates: []
+observability_grafana_alert_rule_file: homelab-network-rules.yml
+observability_grafana_alert_contact_points_file: homelab-contact-points.yml
+observability_grafana_alert_policies_file: homelab-policies.yml
+observability_grafana_retired_alert_rule_uids:
+  - homelab_n8n_metrics_target_down
+
+# --- AdGuard exporter ---
+observability_adguard_exporter_enabled: false
+observability_adguard_exporter_image: ghcr.io/henrywhitaker3/adguard-exporter:v1.2.1
+observability_adguard_exporter_server: http://01-dns-lxc.home.arpa:3000
+observability_adguard_exporter_port: 9618
+
+# --- Blackbox exporter (HTTP synthetic probing) ---
+# PLAN.md D6 (toomhorvath-dashboard repo): the dashboard's health engine reads
+# probe_success/probe_duration_seconds from Prometheus instead of probing
+# services itself, so Grafana can alert on "service is down" too — a gap this
+# lab had no answer for before.
+observability_blackbox_exporter_enabled: false
+observability_blackbox_exporter_image: quay.io/prometheus/blackbox-exporter:v0.28.0
+observability_blackbox_exporter_port: 9115
+observability_blackbox_probe_targets: []
+
+# --- Service management ---
+observability_manage_services: true
+
+# --- Docker group users ---
+docker_group_users: []
+docker_mount_wait_paths: []

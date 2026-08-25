@@ -1,0 +1,40 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Auth (pick one method)
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+# proxmox_token_id = "root@pam!terraform"
+# proxmox_token_secret = "REPLACE_ME"
+
+template_vmid = 901
+
+vmid       = 152
+ip_address = "192.168.1.75/24"
+ip_gateway = "192.168.1.1"
+
+# UniFi OS Server documents ~20 GB for itself; 40 leaves room for its own
+# container images and in-place application updates.
+disk_gb              = 40
+memory_mb            = 4096
+memory_ballooning_mb = 2048
+
+# Storage lives on the Proxmox host and is exposed over VirtIO-FS, same
+# mapping 01-media-vm uses. This is what puts controller backups into the
+# tree 01-backup-lxc's restic job walks.
+enable_virtiofs_shares        = true
+virtiofs_appdata_mapping_name = "homelab-appdata"
+
+# Optional VirtIO-FS tuning
+# virtiofs_cache        = "auto"
+# virtiofs_direct_io    = false
+# virtiofs_expose_acl   = true
+# virtiofs_expose_xattr = true
+
+data_disks_gb = []
+
+# bootstrap_password is required (set via terraform.tfvars or export TF_VAR_bootstrap_password)
+# bootstrap_password = "REPLACE_ME"
+
+# Optional admin public key (defaults to keys/toomhorvath.pub)
+# admin_pubkey = "ssh-ed25519 AAAA..."

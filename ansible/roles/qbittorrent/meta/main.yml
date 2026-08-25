@@ -1,0 +1,10 @@
+---
+galaxy_info:
+  role_name: qbittorrent
+  author: toomhorvath
+  description: "Deploys qBittorrent via Docker Compose with staging SSD fstrim."
+  license: MIT
+  min_ansible_version: "2.14"
+
+dependencies:
+  - role: docker

@@ -1,0 +1,4 @@
+[Unit]
+RequiresMountsFor={{ restic_appdata_source_dir }}
+ConditionPathIsMountPoint={{ restic_appdata_source_dir }}
+ConditionPathExists={{ backup_smb_share_path_effective }}

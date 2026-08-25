@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: media_stack
+  author: toomhorvath
+  description: "Deploys the full media stack (Plex, *arr, Kometa) via Docker Compose."
+  license: MIT
+  min_ansible_version: "2.14"

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Restore notification-digest's state.db from the newest VALID offsite snapshot.
+
+Invoked by the myapps role only when {{ myapps_digest_state_marker }} is
+absent -- i.e. on a host that has never had state seeded. It is the read half
+of the nightly mirror in digest-state-backup: that puts snapshots on the
+VirtIO-FS share, this brings them back on a rebuilt VM. A backup nobody has
+ever restored is a hypothesis, not a backup.
+
+REFUSES to overwrite an existing state.db. The marker gate should already
+prevent that, but the marker is a file on the same disk the database lives on
+-- if that disk was restored from an image, or the file was removed by hand,
+the gate can be wrong while the database is fine. Losing a live dedup ledger
+to an over-eager restore would cause exactly the duplicate-delivery burst the
+ledger exists to prevent, so the check is made here too, against the thing
+that actually matters.
+
+Tries snapshots NEWEST FIRST and validates each with PRAGMA quick_check
+before accepting it, mirroring media_stack's own post-seed check. A snapshot
+can be corrupt for reasons that are invisible until read -- a torn copy, a
+truncated write, bit rot on the share -- and silently seeding a corrupt
+database is worse than starting empty, because the app would trust it.
+
+Exit 0 without restoring when there is nothing to restore FROM. A first-ever
+deploy has no snapshots and must not fail; starting empty is correct there.
+"""
+import glob
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+
+STATE_DB = "{{ myapps_digest_state_dir }}/state.db"
+SNAPSHOT_GLOB = "{{ myapps_digest_offsite_backup_dir }}/state-*.db"
+MOUNT_ROOT = "{{ virtiofs_backup_mount }}"
+
+
+def fail(message):
+    print("ERROR: %s" % message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+if os.path.exists(STATE_DB):
+    print("state.db already present at %s; refusing to overwrite" % STATE_DB)
+    raise SystemExit(0)
+
+if not os.path.ismount(MOUNT_ROOT):
+    # Distinguishable from "no snapshots": the share not being mounted means
+    # we cannot even LOOK, so reporting "nothing to restore" would be a lie
+    # that silently starts a rebuilt host with an empty ledger.
+    fail("%s is not mounted; cannot read snapshots to restore from" % MOUNT_ROOT)
+
+snapshots = sorted(glob.glob(SNAPSHOT_GLOB), reverse=True)
+if not snapshots:
+    print("no snapshots at %s; starting with empty state (first deploy)" % SNAPSHOT_GLOB)
+    raise SystemExit(0)
+
+for snapshot in snapshots:
+    # COPY FIRST, VALIDATE SECOND. SQLite cannot open a database sitting on the
+    # VirtIO-FS share at all -- "disk I/O error", and mode=ro does not help
+    # (verified on this host 2026-08-25: the identical file opens cleanly the
+    # moment it is copied to local ext4). Validating in place therefore skipped
+    # EVERY snapshot and made this script guaranteed to fail -- silently, and
+    # only at the moment it was actually needed.
+    #
+    # This is the same constraint the rest of the stack is built around, and the
+    # reason homelab_local_state_paths exists: SQLite lives on local ext4, the
+    # share carries copies. The temp file also lands in STATE_DB's own directory
+    # so the final os.replace is an atomic same-filesystem move -- a timer
+    # firing mid-restore sees either no database or a complete one.
+    os.makedirs(os.path.dirname(STATE_DB), exist_ok=True)
+    handle, tmp_path = tempfile.mkstemp(dir=os.path.dirname(STATE_DB), suffix=".restoring")
+    os.close(handle)
+
+    try:
+        shutil.copyfile(snapshot, tmp_path)
+    except OSError as exc:
+        os.unlink(tmp_path)
+        print("skipping %s: copy off the share failed (%s)" % (snapshot, type(exc).__name__),
+              file=sys.stderr)
+        continue
+
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % tmp_path, uri=True)
+        result = conn.execute("PRAGMA quick_check;").fetchone()
+        # Prove it is OUR schema, not merely a valid SQLite file: a readable
+        # database with no items table would restore "successfully" and leave
+        # the app to fail later, far from the cause.
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        conn.close()
+    except sqlite3.Error as exc:
+        os.unlink(tmp_path)
+        print("skipping %s: unreadable (%s)" % (snapshot, type(exc).__name__), file=sys.stderr)
+        continue
+
+    if result != ("ok",):
+        os.unlink(tmp_path)
+        print("skipping %s: quick_check said %r" % (snapshot, result), file=sys.stderr)
+        continue
+    missing = {"items", "digests"} - tables
+    if missing:
+        os.unlink(tmp_path)
+        print("skipping %s: not a digest database (missing %s)" % (snapshot, sorted(missing)),
+              file=sys.stderr)
+        continue
+
+    os.replace(tmp_path, STATE_DB)
+    print("restored %s -> %s (%d bytes)" % (snapshot, STATE_DB, os.path.getsize(STATE_DB)))
+    raise SystemExit(0)
+
+fail("all %d snapshot(s) failed validation; refusing to seed a corrupt database" % len(snapshots))

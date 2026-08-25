@@ -1,0 +1,27 @@
+proxmox_url  = "https://192.168.1.239:8006/api2/json"
+proxmox_node = "pve"
+
+# Privileged container with a bind mount -> needs root@pam, like torrent.
+proxmox_username = "root@pam"
+proxmox_password = "REPLACE_ME"
+
+code_lxc_vmid       = 176
+code_lxc_ip_address = "192.168.1.78/24"
+code_lxc_gateway    = "192.168.1.1"
+
+# Ceiling, not a reservation: the container costs the host only what it uses.
+code_lxc_memory_mb = 4096
+code_lxc_swap_mb   = 512
+code_lxc_cores     = 4
+code_lxc_disk_gb   = 16
+
+# Privileged: required so bind-mounted files stay readable by the restic job.
+code_lxc_unprivileged = false
+code_lxc_nesting      = true
+
+# Editor settings, extensions and codex/claude auth state live here so they
+# survive a rebuild and land in 01-backup-lxc's restic run.
+code_appdata_mount_volume = "/srv/appdata/code"
+code_appdata_mount_path   = "/srv/appdata/code"
+
+# code_lxc_password = "REPLACE_ME"

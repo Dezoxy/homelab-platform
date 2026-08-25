@@ -1,0 +1,21 @@
+[Unit]
+Description=notification-digest Patreon collector (timer)
+
+[Timer]
+# SERVER TIME (UTC), no Europe/Budapest suffix -- unlike the daily/weekly
+# briefs. Nobody reads this at a fixed local hour; the clock's only job is
+# to stay clear of the other timers' busy bands, and a DST shift would move
+# it INTO them twice a year. See myapps_digest_patreon_on_calendar for why
+# the minute is :50 rather than :00/:15/:30.
+OnCalendar={{ myapps_digest_patreon_on_calendar }}
+# Persistent, like every other digest timer: a missed hour after a reboot
+# should still run. It is cheap and idempotent -- the app dedups on the
+# items table, so a catch-up run finds nothing new and sends nothing.
+Persistent=true
+# Deliberately tighter than the window digest's 600s: this fires 24x a day,
+# and wide jitter would smear it back across the bands :50 exists to avoid.
+RandomizedDelaySec={{ myapps_digest_patreon_randomized_delay_sec }}
+Unit=digest-patreon.service
+
+[Install]
+WantedBy=timers.target

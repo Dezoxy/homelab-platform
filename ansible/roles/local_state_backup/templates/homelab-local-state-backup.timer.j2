@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily local homelab state snapshot for restic
+
+[Timer]
+OnCalendar={{ homelab_local_state_backup_on_calendar }}
+RandomizedDelaySec={{ homelab_local_state_backup_randomized_delay_sec }}
+Persistent=true
+Unit=homelab-local-state-backup.service
+
+[Install]
+WantedBy=timers.target

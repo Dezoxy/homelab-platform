@@ -1,0 +1,77 @@
+docker_repo_url_map:
+  Ubuntu: https://download.docker.com/linux/ubuntu
+  Debian: https://download.docker.com/linux/debian
+docker_repo_url: "{{ docker_repo_url_map.get(ansible_facts['distribution'], 'https://download.docker.com/linux/ubuntu') }}"
+docker_gpg_url: "{{ docker_repo_url }}/gpg"
+docker_apt_lock_timeout: 300
+
+# FALSE by default: playbooks/bootstrap/00-system-updates.yml owns
+# /etc/apt/sources.list.d/ubuntu.sources, and two owners is one too many.
+#
+# Both roles wrote that file on every deploy to a Docker host, with different
+# mirrors, so each run flipped it back and forth and four tasks reported
+# `changed` forever -- media-vm, myapps-vm, torrent-lxc, observability-lxc and
+# and guacamole-lxc were never idempotent. Aligning URIs would NOT have fixed
+# it: 00-system-updates writes a "Managed by Ansible" header this task does
+# not, so the files differ byte-for-byte regardless of the mirror.
+#
+# Set true only if you use this role somewhere that never runs
+# 00-system-updates.yml. Every current consumer (qbittorrent, media_stack,
+# observability_stack) is reached through a service playbook that imports it
+# first.
+docker_manage_ubuntu_sources: false
+
+# Used only when docker_manage_ubuntu_sources is true. Defers to the fleet-wide
+# values so a standalone run cannot silently disagree with the rest of the
+# fleet -- which is exactly how the flip-flop started.
+#
+# The old default here was de.archive.ubuntu.com, justified by a May 2026
+# measurement claiming hu was ~1 MB/s and de ~14 MB/s. Re-measured 2026-08-25
+# from three guests with scripts/dev/bench_apt_mirrors.sh; that result no
+# longer holds and is reversed by an order of magnitude. See apt_mirror_url in
+# group_vars/all.yml for the current numbers.
+docker_ubuntu_archive_uri: "{{ apt_mirror_url }}"
+docker_ubuntu_security_uri: "{{ apt_security_mirror_url }}"
+docker_ubuntu_sources_file: /etc/apt/sources.list.d/ubuntu.sources
+docker_ubuntu_legacy_sources_list: /etc/apt/sources.list
+docker_keyring_dir: /etc/apt/keyrings
+docker_keyring_asc: /etc/apt/keyrings/docker.asc
+docker_keyring_path: /etc/apt/keyrings/docker.gpg
+docker_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armhf
+docker_arch: "{{ docker_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+docker_base_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+docker_base_packages_extra: []
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_group_users: []
+docker_mount_wait_paths: []
+# Docker daemon settings, rendered to /etc/docker/daemon.json. A role that
+# needs its own keys REPLACES this dict wholesale (media_stack does, for DNS),
+# so any new default here has to be repeated there.
+#
+# live-restore keeps containers running across a dockerd restart. needrestart
+# restarts docker.service after a libc/openssl upgrade -- correctly, since the
+# daemon must not keep running unpatched libraries -- and without this every
+# container on the host dies with it. Deliberately NOT solved by blacklisting
+# docker.service in needrestart_never_restart_units: that would leave the
+# daemon on old libs, which is the exact thing needrestart exists to prevent.
+#
+# It does not rescue an attached `docker compose run` job: that client holds a
+# socket connection to the daemon and the run fails when the daemon goes away.
+# The job's next scheduled run picks it up, and the transaction rolls back
+# cleanly. What this protects is the long-running containers -- plex, netcheck,
+# qbittorrent, the observability stack -- which would otherwise drop on an
+# unrelated package upgrade.
+docker_daemon_config:
+  live-restore: true

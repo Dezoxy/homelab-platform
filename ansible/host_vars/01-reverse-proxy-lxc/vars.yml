@@ -1,0 +1,109 @@
+# --- Install ---
+traefik_version: 3.7.11
+
+# --- Dashboard ---
+traefik_dashboard_hosts:
+  - 01-reverse-proxy-lxc.home.arpa
+  - reverse-proxy.example.com
+  - reverse-proxy.example.net
+
+# --- TLS / ACME ---
+traefik_enable_tls: true
+traefik_acme_email: me@example.com
+traefik_tls_wildcard_domain: "*.example.com"
+traefik_tls_root_domain: example.com
+# Second wildcard for the dual-homed domain, on the same certificate. ACME uses
+# DNS-01 against Cloudflare, so the token in /etc/traefik/cloudflare.env needs
+# DNS edit rights on the example.net zone as well as example.com.
+traefik_tls_extra_domains:
+  - main: example.net
+    sans:
+      - "*.example.net"
+
+# --- Tracing (OTLP) ---
+traefik_otlp_grpc_endpoint: 01-observability-lxc.home.arpa:4317
+traefik_tracing_service_name: traefik-edge
+
+# --- Routes ---
+# Every app is dual-homed: it answers on both example.com and example.net.
+# Cloudflare sends both hostnames down the same Tunnel to this box (see the
+# toom-edge repo, local.homelab_alias_domains), and Traefik routes on the Host
+# header — so both names have to be listed here or the new domain 404s.
+#
+# Both domains are gated by their own Cloudflare Access app (*.example.com
+# and *.example.net). Adding a hostname here that has no matching Access app
+# would publish that app to the internet unauthenticated.
+traefik_routes:
+  # code-server on 01-code-lxc. Reinstates the hostname retired with
+  # 01-agent-lxc in #793, now that the editor has a home again.
+  - name: code
+    hosts:
+      - code.example.com
+      - code.example.net
+    url: http://01-code-lxc.home.arpa:8080
+  - name: netcheck
+    hosts:
+      - netcheck.example.com
+      - netcheck.example.net
+    url: http://01-myapps-vm.home.arpa:8787
+  - name: chrome
+    hosts:
+      - chrome.example.com
+      - chrome.example.net
+    url: http://01-myapps-vm.home.arpa:3990
+  - name: tautulli
+    hosts:
+      - tautulli.example.com
+      - tautulli.example.net
+    url: http://01-media-vm.home.arpa:8181
+  - name: qb
+    hosts:
+      - qb.example.com
+      - qb.example.net
+    url: http://01-torrent-lxc.home.arpa:8080
+  - name: prowlarr
+    hosts:
+      - prowlarr.example.com
+      - prowlarr.example.net
+    url: http://01-media-vm.home.arpa:9696
+  - name: radarr
+    hosts:
+      - radarr.example.com
+      - radarr.example.net
+    url: http://01-media-vm.home.arpa:7878
+  - name: sonarr
+    hosts:
+      - sonarr.example.com
+      - sonarr.example.net
+    url: http://01-media-vm.home.arpa:8989
+  - name: bazarr
+    hosts:
+      - bazarr.example.com
+      - bazarr.example.net
+    url: http://01-media-vm.home.arpa:6767
+  - name: lingarr
+    hosts:
+      - lingarr.example.com
+      - lingarr.example.net
+    url: http://01-media-vm.home.arpa:9876
+  - name: askme
+    hosts:
+      - askme.example.com
+      - askme.example.net
+    url: http://01-media-vm.home.arpa:5055
+  - name: grafana
+    hosts:
+      - grafana.example.com
+      - grafana.example.net
+    url: http://01-observability-lxc.home.arpa:3000
+  - name: dns
+    hosts:
+      - dns.example.com
+      - dns.example.net
+    url: http://01-dns-lxc.home.arpa:3000
+  - name: proxmox
+    hosts:
+      - proxmox.example.com
+      - proxmox.example.net
+    url: https://proxmox.home.arpa:8006
+    insecure_skip_verify: true

@@ -1,0 +1,56 @@
+---
+- name: Expand rootfs
+  ansible.builtin.import_playbook: ../bootstrap/00-expand-rootfs.yml
+
+- name: Run system updates
+  ansible.builtin.import_playbook: ../bootstrap/00-system-updates.yml
+
+- name: Install observability agents
+  ansible.builtin.import_playbook: ../bootstrap/00-observability-agents.yml
+
+- name: Install observability stack in 01-observability-lxc
+  hosts: 01-observability-lxc
+  become: true
+  vars:
+    docker_group_users:
+      - toomhorvath
+      - runner
+    docker_mount_wait_paths:
+      - "{{ observability_appdata_dir }}"
+    observability_adguard_exporter_username_effective: >-
+      {{
+        (observability_adguard_exporter_username | default('') | trim)
+        or (lookup('env', 'ADGUARD_USER') | default('', true) | trim)
+        or (hostvars['01-dns-lxc']['adguard_admin_user'] | default('') | trim)
+        or 'admin'
+      }}
+    observability_adguard_exporter_password_effective: >-
+      {{
+        (observability_adguard_exporter_password | default('') | trim)
+        or (lookup('env', 'ADGUARD_PW') | default('', true) | trim)
+        or (hostvars['01-dns-lxc']['adguard_admin_password'] | default('') | trim)
+        or (lookup('env', 'ADGUARD_EXPORTER_PASSWORD') | default('', true) | trim)
+        or (lookup('env', 'ADGUARD_ADMIN_PASSWORD') | default('', true) | trim)
+      }}
+    observability_grafana_admin_password_effective: >-
+      {{
+        (observability_grafana_admin_password | default('') | trim)
+        or (lookup('env', 'GRAFANA_ADMIN_PASSWORD') | default('', true) | trim)
+      }}
+    observability_grafana_alert_telegram_bot_token_effective: >-
+      {{
+        (observability_grafana_alert_telegram_bot_token | default('') | trim)
+        or (lookup('env', 'GRAFANA_ALERTS_TELEGRAM_BOT_TOKEN') | default('', true) | trim)
+        or (lookup('env', 'RESTIC_NOTIFY_TELEGRAM_BOT_TOKEN') | default('', true) | trim)
+      }}
+    observability_grafana_alert_telegram_chat_id_effective: >-
+      {{
+        (observability_grafana_alert_telegram_chat_id | default('') | trim)
+        or (lookup('env', 'GRAFANA_ALERTS_TELEGRAM_CHAT_ID') | default('', true) | trim)
+        or (lookup('env', 'RESTIC_NOTIFY_TELEGRAM_CHAT_ID') | default('', true) | trim)
+      }}
+
+  tasks:
+    - name: Import observability_stack role
+      ansible.builtin.import_role:
+        name: observability_stack

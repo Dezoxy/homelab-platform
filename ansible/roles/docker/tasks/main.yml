@@ -1,0 +1,155 @@
+- name: Assert Debian or Ubuntu
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] in ["Debian", "Ubuntu"]
+    fail_msg: "docker role expects Debian or Ubuntu."
+
+- name: Normalize Ubuntu apt sources to official mirrors
+  ansible.builtin.copy:
+    dest: "{{ docker_ubuntu_sources_file }}"
+    mode: "0644"
+    content: |
+      Types: deb
+      URIs: {{ docker_ubuntu_archive_uri }}
+      Suites: {{ ansible_facts['distribution_release'] }} {{ ansible_facts['distribution_release'] }}-updates {{ ansible_facts['distribution_release'] }}-backports
+      Components: main restricted universe multiverse
+      Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+      Types: deb
+      URIs: {{ docker_ubuntu_security_uri }}
+      Suites: {{ ansible_facts['distribution_release'] }}-security
+      Components: main restricted universe multiverse
+      Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+  register: docker_ubuntu_sources_copy
+  when:
+    - ansible_facts['distribution'] == "Ubuntu"
+    - docker_manage_ubuntu_sources | bool
+
+- name: Disable legacy Ubuntu apt sources.list entries
+  ansible.builtin.copy:
+    dest: "{{ docker_ubuntu_legacy_sources_list }}"
+    mode: "0644"
+    content: |
+      # Managed by Ansible.
+      # Ubuntu package sources are defined in {{ docker_ubuntu_sources_file }}.
+  register: docker_ubuntu_legacy_sources_copy
+  when:
+    - ansible_facts['distribution'] == "Ubuntu"
+    - docker_manage_ubuntu_sources | bool
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: >-
+      {{
+        0
+        if (
+          (docker_ubuntu_sources_copy is defined and docker_ubuntu_sources_copy is changed)
+          or (docker_ubuntu_legacy_sources_copy is defined and docker_ubuntu_legacy_sources_copy is changed)
+        )
+        else 3600
+      }}
+    lock_timeout: "{{ docker_apt_lock_timeout }}"
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ docker_base_packages + docker_base_packages_extra }}"
+    state: present
+    lock_timeout: "{{ docker_apt_lock_timeout }}"
+
+- name: Ensure Docker repo keyring directory
+  ansible.builtin.file:
+    path: "{{ docker_keyring_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download Docker GPG key (ASCII)
+  ansible.builtin.get_url:
+    url: "{{ docker_gpg_url }}"
+    dest: "{{ docker_keyring_asc }}"
+    mode: "0644"
+
+- name: Convert Docker GPG key to keyring
+  ansible.builtin.command:
+    cmd: "gpg --dearmor -o {{ docker_keyring_path }} {{ docker_keyring_asc }}"
+  args:
+    creates: "{{ docker_keyring_path }}"
+
+- name: Add Docker apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ docker_arch }} signed-by={{ docker_keyring_path }}] {{ docker_repo_url }} {{ ansible_facts['distribution_release'] }} stable"
+    filename: docker
+    state: present
+
+- name: Install Docker engine and plugins
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: true
+    lock_timeout: "{{ docker_apt_lock_timeout }}"
+
+- name: Ensure docker group exists
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+- name: Ensure /etc/docker exists
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: "0755"
+  when: (docker_daemon_config | default({}) | length) > 0
+
+- name: Configure Docker daemon
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    content: |
+      {{ docker_daemon_config | to_nice_json }}
+  register: docker_daemon_config_copy
+  when: (docker_daemon_config | default({}) | length) > 0
+
+- name: Check if docker group users exist
+  ansible.builtin.command: id -u "{{ item }}"
+  register: docker_group_users_check
+  loop: "{{ docker_group_users }}"
+  changed_when: false
+  failed_when: false
+  when: docker_group_users | length > 0
+
+- name: Add users to docker group
+  ansible.builtin.user:
+    name: "{{ item.item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_group_users_check.results | default([]) }}"
+  when: (docker_group_users | length > 0) and item.rc == 0
+
+- name: Ensure docker.service drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    mode: "0755"
+  when: docker_mount_wait_paths | length > 0
+
+- name: Configure docker.service to wait for storage mounts
+  ansible.builtin.template:
+    src: docker-override.conf.j2
+    dest: /etc/systemd/system/docker.service.d/override.conf
+    mode: "0644"
+  register: docker_service_override_copy
+  when: docker_mount_wait_paths | length > 0
+
+- name: Enable Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: >-
+      {{
+        'restarted'
+        if (
+          (docker_daemon_config_copy is defined and docker_daemon_config_copy.changed | default(false))
+          or (docker_service_override_copy is defined and docker_service_override_copy.changed | default(false))
+        )
+        else 'started'
+      }}
+    daemon_reload: true
